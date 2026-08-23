@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# unordered_dense is a required dependency of lru_cache. Consumers of an
+# installed package must make it discoverable via find_package(unordered_dense).
+find_dependency(unordered_dense)
+
+include("${CMAKE_CURRENT_LIST_DIR}/lru_cache-targets.cmake")
+
+check_required_components(lru_cache)

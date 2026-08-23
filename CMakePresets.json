@@ -1,0 +1,90 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "msys2-clang64-base",
+      "hidden": true,
+      "generator": "MinGW Makefiles",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      },
+      "environment": {
+        "PATH": "/clang64/bin:/usr/bin:$penv{PATH}"
+      }
+    },
+    {
+      "name": "msys2-clang64-debug",
+      "inherits": "msys2-clang64-base",
+      "displayName": "MSYS2 Clang64 Debug (tests)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LRU_BUILD_TESTS": "ON",
+        "LRU_BUILD_EXAMPLES": "OFF",
+        "LRU_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
+      "name": "msys2-clang64-asan",
+      "inherits": "msys2-clang64-base",
+      "displayName": "MSYS2 Clang64 AddressSanitizer",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LRU_BUILD_TESTS": "ON",
+        "LRU_BUILD_EXAMPLES": "OFF",
+        "LRU_BUILD_BENCHMARKS": "OFF",
+        "LRU_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "msys2-clang64-release-bench",
+      "inherits": "msys2-clang64-base",
+      "displayName": "MSYS2 Clang64 Release Benchmarks",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LRU_BUILD_TESTS": "OFF",
+        "LRU_BUILD_EXAMPLES": "OFF",
+        "LRU_BUILD_BENCHMARKS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "msys2-clang64-debug",
+      "configurePreset": "msys2-clang64-debug",
+      "jobs": 4
+    },
+    {
+      "name": "msys2-clang64-asan",
+      "configurePreset": "msys2-clang64-asan",
+      "jobs": 4
+    },
+    {
+      "name": "msys2-clang64-release-bench",
+      "configurePreset": "msys2-clang64-release-bench",
+      "jobs": 4
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "msys2-clang64-debug",
+      "configurePreset": "msys2-clang64-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "msys2-clang64-asan",
+      "configurePreset": "msys2-clang64-asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

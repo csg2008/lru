@@ -1,0 +1,309 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  # T-G14: Nightly soak run at 03:00 UTC (off-peak).
+  schedule:
+    - cron: "0 3 * * *"
+  # Allow manual dispatch for soak test on demand.
+  workflow_dispatch:
+
+jobs:
+  # T-G14: Long-running soak test (manual dispatch + nightly via schedule).
+  # Runs the 128-thread read-heavy soak test for 5 minutes to surface
+  # memory leaks, rare races, and scheduler-pathology issues that only
+  # appear under sustained load. Skipped on regular push/PR runs.
+  soak:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++
+          git clone --depth 1 https://github.com/martinus/unordered_dense.git ../unordered_dense
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DLRU_BUILD_TESTS=ON -DLRU_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build -j4
+
+      # LRU_STRESS_DURATION_MS=300000 → 5 minutes of 128-thread 99%-read
+      # load. Needs >=16 logical cores (GitHub ubuntu-latest has 4 vCPU,
+      # so the test will SKIP with a clear message — re-enable on a
+      # larger self-hosted runner when available).
+      - name: Run 128-thread soak
+        working-directory: build
+        run: ctest -R OneTwentyEight --output-on-failure --timeout 600
+        env:
+          LRU_STRESS_DURATION_MS: "300000"
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        build_type: [Debug, Release]
+        include:
+          # T-CI-2: UBSan (undefined behavior, all platforms)
+          - os: ubuntu-latest
+            build_type: Debug
+            sanitizer: ubsan
+          # T-CI-2: ASan + UBSan combined (Linux only; Clang64 on Windows
+          # is handled by the msys2-clang64 job below)
+          - os: ubuntu-latest
+            build_type: Debug
+            sanitizer: asan-ubsan
+          - os: ubuntu-latest
+            build_type: Debug
+            sanitizer: asan
+          - os: ubuntu-latest
+            build_type: Debug
+            sanitizer: tsan
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++
+          # Clone ankerl/unordered_dense as a sibling directory for CMake fallback
+          git clone --depth 1 https://github.com/martinus/unordered_dense.git ../unordered_dense
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          git clone --depth 1 https://github.com/martinus/unordered_dense.git ../unordered_dense
+
+      - name: Configure
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DLRU_BUILD_TESTS=ON -DLRU_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build -j4
+
+      # T-CI-3: --repeat until-pass:3 for concurrent test flaky tolerance
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure --repeat until-pass:3 --timeout 300
+
+      # --- Sanitizer builds (Linux only for asan/tsan; ubsan on all) ---
+
+      - name: Configure with ASan
+        if: matrix.sanitizer == 'asan'
+        run: |
+          cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DLRU_BUILD_TESTS=ON -DLRU_BUILD_EXAMPLES=OFF -DLRU_ENABLE_ASAN=ON
+
+      - name: Build with ASan
+        if: matrix.sanitizer == 'asan'
+        run: cmake --build build-asan -j4
+
+      - name: Test with ASan
+        if: matrix.sanitizer == 'asan'
+        working-directory: build-asan
+        run: ctest --output-on-failure --repeat until-pass:3 --timeout 300
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:halt_on_error=0:print_stacktrace=1
+
+      - name: Configure with TSan
+        if: matrix.sanitizer == 'tsan'
+        run: |
+          cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DLRU_BUILD_TESTS=ON -DLRU_BUILD_EXAMPLES=OFF -DLRU_ENABLE_TSAN=ON
+
+      - name: Build with TSan
+        if: matrix.sanitizer == 'tsan'
+        run: cmake --build build-tsan -j4
+
+      - name: Test with TSan
+        if: matrix.sanitizer == 'tsan'
+        working-directory: build-tsan
+        run: ctest --output-on-failure --repeat until-pass:3 --timeout 300
+        env:
+          TSAN_OPTIONS: halt_on_error=0:second_deadlock_stack=1:report_bugs=1
+
+      # T-CI-2: UBSan profile
+      - name: Configure with UBSan
+        if: matrix.sanitizer == 'ubsan'
+        run: |
+          cmake -B build-ubsan -DCMAKE_BUILD_TYPE=Debug -DLRU_BUILD_TESTS=ON -DLRU_BUILD_EXAMPLES=OFF -DLRU_ENABLE_UBSAN=ON
+
+      - name: Build with UBSan
+        if: matrix.sanitizer == 'ubsan'
+        run: cmake --build build-ubsan -j4
+
+      - name: Test with UBSan
+        if: matrix.sanitizer == 'ubsan'
+        working-directory: build-ubsan
+        run: ctest --output-on-failure --repeat until-pass:3 --timeout 300
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
+
+      # T-CI-2: ASan + UBSan combined profile
+      - name: Configure with ASan+UBSan
+        if: matrix.sanitizer == 'asan-ubsan'
+        run: |
+          cmake -B build-asan-ubsan -DCMAKE_BUILD_TYPE=Debug -DLRU_BUILD_TESTS=ON -DLRU_BUILD_EXAMPLES=OFF -DLRU_ENABLE_ASAN=ON -DLRU_ENABLE_UBSAN=ON
+
+      - name: Build with ASan+UBSan
+        if: matrix.sanitizer == 'asan-ubsan'
+        run: cmake --build build-asan-ubsan -j4
+
+      - name: Test with ASan+UBSan
+        if: matrix.sanitizer == 'asan-ubsan'
+        working-directory: build-asan-ubsan
+        run: ctest --output-on-failure --repeat until-pass:3 --timeout 300
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:halt_on_error=0:print_stacktrace=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
+
+  # T-CI-1: Windows MSYS2 Clang64 toolchain (matches AGENTS.md requirement).
+  # The default windows-latest image uses MSVC, which lacks ASan support
+  # and doesn't match the documented development workflow. This job uses
+  # MSYS2 Clang64 for full sanitizer coverage on Windows.
+  msys2-clang64:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, asan, ubsan, asan-ubsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-ccache
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            git
+
+      - name: Clone unordered_dense
+        shell: msys2 {0}
+        run: git clone --depth 1 https://github.com/martinus/unordered_dense.git ../unordered_dense
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          export PATH=/clang64/bin:/usr/bin:$PATH
+          SAN_FLAGS=""
+          case "${{ matrix.sanitizer }}" in
+            asan)        SAN_FLAGS="-DLRU_ENABLE_ASAN=ON" ;;
+            ubsan)       SAN_FLAGS="-DLRU_ENABLE_UBSAN=ON" ;;
+            asan-ubsan)  SAN_FLAGS="-DLRU_ENABLE_ASAN=ON -DLRU_ENABLE_UBSAN=ON" ;;
+          esac
+          # Bypass ccache for sanitizer builds (ASan runtime symbol resolution)
+          CC=clang CXX=clang++ cmake -B build -G "MinGW Makefiles" \
+            -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DLRU_BUILD_TESTS=ON -DLRU_BUILD_EXAMPLES=OFF \
+            -DCMAKE_CXX_COMPILER_LAUNCHER= -DCMAKE_C_COMPILER_LAUNCHER= \
+            $SAN_FLAGS
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          export PATH=/clang64/bin:/usr/bin:$PATH
+          mingw32-make -C build -j2
+
+      - name: Test
+        shell: msys2 {0}
+        working-directory: build
+        run: |
+          export PATH=/clang64/bin:/usr/bin:$PATH
+          ctest --output-on-failure --repeat until-pass:3 --timeout 300
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:halt_on_error=0:print_stacktrace=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
+
+  benchmark:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++
+          git clone --depth 1 https://github.com/martinus/unordered_dense.git ../unordered_dense
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLRU_BUILD_TESTS=OFF -DLRU_BUILD_EXAMPLES=OFF -DLRU_BUILD_BENCHMARKS=ON
+
+      - name: Build benchmark
+        run: cmake --build build -j4
+
+      # T-CI-4: Performance regression gate. Run benchmark and save JSON
+      # output (machine-parseable) alongside a human-readable dump. The
+      # benchmark emits p50/p95/p99_last_ns and p50/p95/p99_max_ns custom
+      # counters for safe_cache / striped_cache / read_heavy_striped_cache.
+      - name: Run benchmark
+        run: |
+          ./build/benchmarks/lru_concurrent_read_benchmark \
+              --benchmark_format=json \
+              --benchmark_out=current.json \
+              --benchmark_counters_tabular=true > benchmark_results.txt 2>&1
+          cat benchmark_results.txt
+
+      - name: Upload benchmark results (per-sha, retained 30d)
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            current.json
+            benchmark_results.txt
+          retention-days: 30
+
+      # T-CI-4: Refresh the "latest" baseline artifact on every run so the
+      # next run (on any branch) can diff against the most recent results.
+      # upload-artifact@v4 requires `overwrite: true` to reuse a name.
+      - name: Upload benchmark results (latest baseline)
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-latest
+          path: current.json
+          retention-days: 30
+          overwrite: true
+
+      # T-CI-4: For PRs, fetch the baseline from main branch's latest
+      # successful run. dawidd6/action-download-artifact@v3 cross-references
+      # runs by branch and workflow, which stock actions/download-artifact
+      # cannot do for arbitrary prior runs.
+      - name: Download baseline (from main)
+        if: github.ref != 'refs/heads/main'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: benchmark-results-latest
+          branch: main
+          workflow: ci.yml
+          path: baseline
+          if_no_artifact_found: warn
+
+      # T-CI-4: Automated P99 regression check. Fails the job if any
+      # benchmark's p99_max_ns regresses by more than
+      # REGRESSION_THRESHOLD_PCT (default 20%). Skips gracefully on first
+      # run (no baseline) or when jq is unavailable.
+      - name: Compare P99 with baseline
+        if: success() || failure()
+        run: |
+          if [ ! -f baseline/current.json ]; then
+            echo "No baseline JSON found — skipping regression check (first run or no main baseline)."
+            exit 0
+          fi
+          ./scripts/ci/check_benchmark_regression.sh \
+              --baseline baseline/current.json \
+              --current  current.json
+        env:
+          REGRESSION_THRESHOLD_PCT: "20"
