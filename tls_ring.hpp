@@ -36,6 +36,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -48,6 +49,42 @@
 #include "event_types.hpp"
 
 namespace lru {
+
+// ============================================================================
+// Process-exit guard (T-EXIT)
+// ============================================================================
+// During static-destruction (program exit) the main thread's thread_local
+// objects have already been destroyed. Re-constructing a `thread_local` at
+// that point is unsafe on MinGW (the TLS block allocation is gone), which
+// manifests as heap corruption / unique_ptr assertions when a global cache's
+// destructor flushes its TLS callback rings. This guard routes TLS access to
+// a static heap fallback once process teardown begins (set via atexit, which
+// the standard guarantees runs before static destructors).
+namespace detail {
+inline std::atomic<bool>& process_exiting_flag() {
+    static std::atomic<bool> flag{false};
+    return flag;
+}
+inline void mark_process_exiting() noexcept {
+    process_exiting_flag().store(true, std::memory_order_relaxed);
+}
+inline bool is_process_exiting() noexcept {
+    return process_exiting_flag().load(std::memory_order_relaxed);
+}
+/// Ensure the atexit hook is registered. Called on the first TLS-ring
+/// access (which happens during normal operation, well before teardown).
+/// atexit fires before static destructors, so by the time a global cache is
+/// torn down the flag is guaranteed set. A function-local `static` here is
+/// more reliable than an inline-variable constructor, which the compiler may
+/// elide if the variable is never odr-used.
+inline void ensure_process_exit_hook() noexcept {
+    static const bool registered = [] {
+        std::atexit(mark_process_exiting);
+        return true;
+    }();
+    (void)registered;
+}
+} // namespace detail
 
 // ============================================================================
 // TLS Callback Ring — Zero-allocation callback event collector
@@ -537,16 +574,16 @@ public:
     /// Note: This only drains the calling thread's TLS data. Other threads'
     /// data remains in their TLS and cannot be accessed from here.
     static void flush_all_registered() {
-        std::vector<tls_callback_ring*> instances;
-        {
-            std::lock_guard<std::mutex> lock(registry_mutex_);
-            instances.reserve(registry_.size());
-            for (auto& e : registry_) {
-                instances.push_back(e.instance_ptr);
-            }
-        }
-        for (auto* inst : instances) {
-            (void)inst->drain();
+        // Drain while holding the registry mutex so no registered instance
+        // can be destroyed mid-iteration (its destructor needs the same
+        // lock to unregister). drain() never takes registry_mutex_, so this
+        // cannot deadlock. This also closes the TOCTOU window where a
+        // snapshot taken under the lock is drained after a concurrent
+        // thread-local instance has already been destroyed — the cause of
+        // the process-exit use-after-free in tls_callback_ring.
+        std::lock_guard<std::mutex> lock(registry_mutex_);
+        for (auto& e : registry_) {
+            (void)e.instance_ptr->drain();
         }
     }
 
@@ -606,6 +643,17 @@ private:
     };
 
     static thread_data& get_thread_data() {
+        // Register the process-exit atexit hook on first access (idempotent).
+        detail::ensure_process_exit_hook();
+        // During process teardown the calling thread's thread_local has
+        // already been destroyed; re-constructing it is unsafe on MinGW
+        // (TLS block gone) and corrupts the heap. Route to a static heap
+        // fallback instead — events collected here are discarded, which is
+        // correct because nobody consumes them at process exit.
+        if (detail::is_process_exiting()) {
+            static thread_data* fallback = new thread_data();
+            return *fallback;
+        }
         thread_local thread_data td;
         return td;
     }
@@ -885,20 +933,21 @@ public:
     /// the backup).
     static drain_result flush_all_registered() {
         drain_result result;
-        std::vector<tls_event_ring*> instances;
         {
+            // Drain while holding the registry mutex so no registered
+            // instance can be destroyed mid-iteration (its destructor needs
+            // the same lock to unregister). drain() never takes
+            // registry_mutex_, so this cannot deadlock. This closes the
+            // TOCTOU window where a snapshot is drained after a concurrent
+            // thread-local instance has already been destroyed.
             std::lock_guard<std::mutex> lock(registry_mutex_);
-            instances.reserve(registry_.size());
             for (auto& e : registry_) {
-                instances.push_back(e.instance_ptr);
-            }
-        }
-        for (auto* inst : instances) {
-            auto drained = inst->drain();
-            if (!drained.entries.empty()) {
-                result.entries.insert(result.entries.end(),
-                                      std::make_move_iterator(drained.entries.begin()),
-                                      std::make_move_iterator(drained.entries.end()));
+                auto drained = e.instance_ptr->drain();
+                if (!drained.entries.empty()) {
+                    result.entries.insert(result.entries.end(),
+                                          std::make_move_iterator(drained.entries.begin()),
+                                          std::make_move_iterator(drained.entries.end()));
+                }
             }
         }
         // T20.3: Drain the backup buffer (events from exited threads).
@@ -1034,6 +1083,17 @@ private:
     };
 
     static thread_data& get_thread_data() {
+        // Register the process-exit atexit hook on first access (idempotent).
+        detail::ensure_process_exit_hook();
+        // During process teardown the calling thread's thread_local has
+        // already been destroyed; re-constructing it is unsafe on MinGW
+        // (TLS block gone) and corrupts the heap. Route to a static heap
+        // fallback instead — events collected here are discarded, which is
+        // correct because nobody consumes them at process exit.
+        if (detail::is_process_exiting()) {
+            static thread_data* fallback = new thread_data();
+            return *fallback;
+        }
         thread_local thread_data td;
         return td;
     }
@@ -1113,12 +1173,17 @@ private:
         std::vector<event_entry> entries;
     };
 
-    /// Meyers singleton for the backup buffer — one per Key/Hash/N
-    /// specialization. Returned by reference so it lives across calls
-    /// and is destroyed at program exit.
+    /// Backup buffer singleton — one per Key/Hash/N specialization.
+    /// Heap-allocated and intentionally never freed: a static cache's
+    /// destructor may drain the backup during program exit, at which point
+    /// a function-local `static` would already have been destroyed (static
+    /// destruction order is the reverse of construction, and the backup is
+    /// first touched at runtime, so it would die BEFORE an earlier-constructed
+    /// global cache). Leaking one small buffer per specialization at process
+    /// exit is harmless and keeps the teardown path memory-safe.
     static backup_storage& backup_buffer() {
-        static backup_storage storage;
-        return storage;
+        static backup_storage* storage = new backup_storage();
+        return *storage;
     }
 
     /// Thread-exit sentinel: unregisters this thread's ring_data entries
@@ -2298,6 +2363,16 @@ public:
     /// remaining keys to the global backup buffer when the thread exits,
     /// and to unregister the ring from the cross-thread registry.
     static tls_access_ring& instance() {
+        // Register the process-exit atexit hook on first access (idempotent).
+        detail::ensure_process_exit_hook();
+        // Process teardown: thread_local ring/sentinel are already
+        // destroyed and must not be re-constructed (MinGW TLS block gone).
+        // Return a static heap fallback — draining it yields nothing, which
+        // is correct since no one consumes promotions at process exit.
+        if (detail::is_process_exiting()) {
+            static tls_access_ring* fallback = new tls_access_ring();
+            return *fallback;
+        }
         auto& ring = get_tl_ring();
         // Install the thread-exit sentinel on first access.
         // The sentinel's destructor fires when this thread exits,
@@ -2624,10 +2699,14 @@ private:
         std::vector<Key> keys;
     };
 
-    /// Meyers singleton for the backup buffer — one per Key/N specialization.
+    /// Backup buffer singleton — one per Key/N specialization.
+    /// Heap-allocated and intentionally never freed (same rationale as
+    /// tls_event_ring::backup_buffer): a global cache's destructor drains
+    /// this buffer at program exit, when a function-local `static` would
+    /// already be destroyed. Leaking one small buffer at exit is harmless.
     static backup_storage& backup_buffer() {
-        static backup_storage storage;
-        return storage;
+        static backup_storage* storage = new backup_storage();
+        return *storage;
     }
 
     // ----------------------------------------------------------------
@@ -2934,6 +3013,17 @@ private:
     };
 
     static thread_data& get_thread_data() {
+        // Register the process-exit atexit hook on first access (idempotent).
+        detail::ensure_process_exit_hook();
+        // During process teardown the calling thread's thread_local has
+        // already been destroyed; re-constructing it is unsafe on MinGW
+        // (TLS block gone) and corrupts the heap. Route to a static heap
+        // fallback instead — events collected here are discarded, which is
+        // correct because nobody consumes them at process exit.
+        if (detail::is_process_exiting()) {
+            static thread_data* fallback = new thread_data();
+            return *fallback;
+        }
         thread_local thread_data td;
         return td;
     }
