@@ -187,27 +187,39 @@ private:
     static bool probe() {
 #if LRU_NATIVE_HAS_WIN32
         // On Windows, dynamically resolve WaitOnAddress family.
-        // These live in kernel32.dll (forwarded from api-ms-win-core-synch).
-        HMODULE mod = GetModuleHandleW(L"kernel32.dll");
-        if (!mod) mod = LoadLibraryW(L"api-ms-win-core-synch-l1-2-0.dll");
-        if (!mod) return false;
+        // These live in kernel32.dll on Windows 8/8.1, but moved to
+        // KERNELBASE.dll (via the api-ms-win-core-synch-l1-2-0.dll API set)
+        // on modern Windows 10/11 — kernel32 no longer exports them there.
+        // Try kernel32 first, then KERNELBASE, then the API-set DLL, so the
+        // first module resolving the full family wins.
+        const wchar_t* kModules[] = {
+            L"kernel32.dll",
+            L"KERNELBASE.dll",
+            L"api-ms-win-core-synch-l1-2-0.dll",
+        };
+        for (const wchar_t* name : kModules) {
+            HMODULE mod = GetModuleHandleW(name);
+            if (!mod) mod = LoadLibraryW(name);
+            if (!mod) continue;
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcast-function-type"
-        auto pWait = reinterpret_cast<WaitOnAddress_fn>(
-            GetProcAddress(mod, "WaitOnAddress"));
-        auto pWakeOne = reinterpret_cast<WakeByAddressSingle_fn>(
-            GetProcAddress(mod, "WakeByAddressSingle"));
-        auto pWakeAll = reinterpret_cast<WakeByAddressAll_fn>(
-            GetProcAddress(mod, "WakeByAddressAll"));
+            auto pWait = reinterpret_cast<WaitOnAddress_fn>(
+                GetProcAddress(mod, "WaitOnAddress"));
+            auto pWakeOne = reinterpret_cast<WakeByAddressSingle_fn>(
+                GetProcAddress(mod, "WakeByAddressSingle"));
+            auto pWakeAll = reinterpret_cast<WakeByAddressAll_fn>(
+                GetProcAddress(mod, "WakeByAddressAll"));
 #pragma GCC diagnostic pop
 
-        if (!pWait || !pWakeOne || !pWakeAll) return false;
+            if (!pWait || !pWakeOne || !pWakeAll) continue;
 
-        s_WaitOnAddress      = pWait;
-        s_WakeByAddressSingle = pWakeOne;
-        s_WakeByAddressAll   = pWakeAll;
-        return true;
+            s_WaitOnAddress      = pWait;
+            s_WakeByAddressSingle = pWakeOne;
+            s_WakeByAddressAll   = pWakeAll;
+            return true;
+        }
+        return false;
 #elif LRU_NATIVE_HAS_FUTEX
         return true; // futex is always available on Linux
 #elif LRU_NATIVE_HAS_ULOCK

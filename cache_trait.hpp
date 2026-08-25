@@ -8483,7 +8483,18 @@ public:
     /// reclaim worker must still be alive to drain. Stopping in this
     /// order bounds the residual pending list to one reclaim tick's
     /// worth (≤250ms).
+    ///
+    /// P1-8: Only reset the global drain_started flag when THIS cache
+    /// actually started a drain worker. The flag is process-global
+    /// (default hazptr domain), but ordinary single-threaded caches
+    /// (e.g. block_cache_layer's mm_lru) never call start_event_drain()
+    /// — they only call stop_event_drain() during shutdown. Unconditionally
+    /// clearing the flag here would wipe out the drain state of another
+    /// cache whose worker is still running, causing spurious
+    /// "retire_obj() called before start_event_drain()" warnings.
     void stop_event_drain() {
+        const bool had_drain_worker =
+            reclaim_drain_worker_ != nullptr || callback_drain_worker_ != nullptr;
         if (callback_drain_worker_) {
             callback_drain_worker_->stop();
             callback_drain_worker_.reset();
@@ -8492,11 +8503,14 @@ public:
             reclaim_drain_worker_->stop();
             reclaim_drain_worker_.reset();
         }
-        // P1-3: clear drain_started so a fresh start_event_drain()
-        // call from another cache re-arms the state correctly. The
-        // drain_warn_emitted_ CAS flag in hazptr_domain is NOT reset,
-        // so the warning never fires twice per process.
-        detail::hazptr_domain::default_domain().set_drain_started(false);
+        // P1-3: clear drain_started only if this cache started a worker;
+        // otherwise a fresh start_event_drain() call from another cache
+        // re-arms the state correctly. The drain_warn_emitted_ CAS flag
+        // in hazptr_domain is NOT reset, so the warning never fires twice
+        // per process.
+        if (had_drain_worker) {
+            detail::hazptr_domain::default_domain().set_drain_started(false);
+        }
     }
 
     /// Check if either background drain worker (reclaim or callback) is
