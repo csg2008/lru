@@ -84,6 +84,28 @@ inline void ensure_process_exit_hook() noexcept {
     }();
     (void)registered;
 }
+
+/// Process-lifetime storage: never destroyed, memory reclaimed by the OS at exit.
+///
+/// The cross-thread registries in this header are `static inline` members. They
+/// are first touched during normal operation — i.e. *after* any namespace-scope
+/// cache that later uses them — so by the reverse-order rule of static
+/// destruction they are destroyed *before* that cache's destructor runs.
+/// `drain_all_threads()` called from the cache destructor would then walk a
+/// destroyed std::vector (use-after-free at process exit, visible only under
+/// high churn).
+///
+/// Skipping destruction removes the ordering dependency entirely. This mirrors
+/// the strategy `tls_event_ring::backup_buffer()` already uses for the same
+/// reason.
+template <class Container>
+struct process_lifetime : Container {
+    template <class... Args>
+    explicit process_lifetime(Args&&... args)
+        : Container(std::forward<Args>(args)...) {}
+
+    ~process_lifetime() { /* deliberately does not destroy the container */ }
+};
 } // namespace detail
 
 // ============================================================================
@@ -674,11 +696,18 @@ private:
     // Global registry for cross-thread drain support
     struct instance_registry_entry {
         uint64_t instance_id;
+        /// 裸指针在这里是安全的：注册发生在构造函数、注销发生在析构函数，
+        /// 因此条目不会比实例活得更久（区别于线程 ring 注册表 —— 那里的注销
+        /// 依赖独立的 sentinel，所以那里必须用 weak_ptr）。
         tls_callback_ring* instance_ptr;
     };
 
     static inline std::mutex registry_mutex_;
-    static inline std::vector<instance_registry_entry> registry_;
+    /// 进程生命周期存储（见 detail::process_lifetime）：本容器运行期才首次
+    /// 触及，会在使用它的全局缓存之前析构；而缓存的析构函数正要拿它来注销，
+    /// 退出期的 flush_all_registered() 也要遍历它 —— 容器先死即 UB。
+    static inline detail::process_lifetime<std::vector<instance_registry_entry>>
+        registry_;
 };
 
 // ============================================================================
@@ -992,17 +1021,20 @@ public:
         if (!backup.entries.empty()) {
             result.entries = std::move(backup.entries);
         }
-        std::vector<ring_data*> rings_to_drain;
+        // 持有 shared_ptr：弱引用取到即保证 ring_data 在本轮遍历期间存活
+        // （裸指针版本在线程退出后会悬空）。
+        std::vector<std::shared_ptr<ring_data>> rings_to_drain;
         {
             std::lock_guard<std::mutex> lock(thread_ring_registry_mutex_);
             rings_to_drain.reserve(thread_ring_registry_.size());
             for (const auto& e : thread_ring_registry_) {
-                if (e.instance_id == instance_id_) {
-                    rings_to_drain.push_back(e.ring_ptr);
+                if (e.instance_id != instance_id_) continue;
+                if (auto rd = e.ring.lock()) {
+                    rings_to_drain.push_back(std::move(rd));
                 }
             }
         }
-        for (auto* rd : rings_to_drain) {
+        for (auto& rd : rings_to_drain) {
             if (!rd) continue;
             std::size_t head = rd->head.load(std::memory_order_relaxed);
             std::size_t tail = rd->tail.load(std::memory_order_relaxed);
@@ -1079,7 +1111,9 @@ private:
     };
 
     struct thread_data {
-        ankerl::unordered_dense::map<uint64_t, std::unique_ptr<ring_data>> rings;
+        // shared_ptr：跨线程注册表通过 weak_ptr 观察它，因此本线程退出（TLS
+        // 析构）后，其它线程的 lock() 会失败而不是拿到悬空指针。
+        ankerl::unordered_dense::map<uint64_t, std::shared_ptr<ring_data>> rings;
     };
 
     static thread_data& get_thread_data() {
@@ -1102,14 +1136,14 @@ private:
         auto& td = get_thread_data();
         auto it = td.rings.find(instance_id_);
         if (it == td.rings.end()) {
-            auto [insert_it, _] = td.rings.emplace(instance_id_, std::make_unique<ring_data>());
+            auto [insert_it, _] = td.rings.emplace(instance_id_, std::make_shared<ring_data>());
             // P2-3: Register this thread's ring in the cross-thread registry
-            // so drain_all_threads() can find and drain it.
-            ring_data* ptr = insert_it->second.get();
+            // so drain_all_threads() can find and drain it. 存 weak_ptr：
+            // 线程退出后 lock() 会失败，不会留下悬空指针。
             {
                 std::lock_guard<std::mutex> lock(thread_ring_registry_mutex_);
-                thread_ring_registry_.push_back(
-                    thread_ring_registry_entry{instance_id_, std::this_thread::get_id(), ptr});
+                thread_ring_registry_.push_back(thread_ring_registry_entry{
+                    instance_id_, std::this_thread::get_id(), insert_it->second});
             }
             // Install the thread-exit sentinel on first access. The sentinel
             // is thread_local: constructed once per thread per template
@@ -1142,11 +1176,16 @@ private:
     // Global registry for cross-thread drain support (instance-level)
     struct instance_registry_entry {
         uint64_t instance_id;
+        /// 裸指针在这里是安全的：注册在构造函数、注销在析构函数，条目不会比
+        /// 实例活得更久（区别于 thread_ring_registry_ —— 那里的注销依赖独立的
+        /// sentinel，所以那里必须用 weak_ptr）。
         tls_event_ring* instance_ptr;
     };
 
     static inline std::mutex registry_mutex_;
-    static inline std::vector<instance_registry_entry> registry_;
+    /// 进程生命周期存储（见 detail::process_lifetime）：同 tls_callback_ring。
+    static inline detail::process_lifetime<std::vector<instance_registry_entry>>
+        registry_;
 
     // --------------------------------------------------------------------
     // P2-3: Per-thread ring registry — tracks every (instance, thread) pair
@@ -1157,11 +1196,17 @@ private:
     struct thread_ring_registry_entry {
         uint64_t instance_id;
         std::thread::id tid;
-        ring_data* ring_ptr;
+        /// 弱引用而非裸指针：ring_data 由线程的 thread_data 拥有，其它线程只能
+        /// 通过弱引用观察它。lock() 失败即表示该线程已退出并回收，跳过即可；
+        /// 裸指针在那种情况下已悬空，而 drain_all_threads() 会解引用它。
+        std::weak_ptr<ring_data> ring;
     };
 
     static inline std::mutex thread_ring_registry_mutex_;
-    static inline std::vector<thread_ring_registry_entry> thread_ring_registry_;
+    /// 进程生命周期存储（见 detail::process_lifetime）：本容器运行期才首次
+    /// 触及，会在使用它的全局缓存之前析构，而那正是要遍历它的时刻。
+    static inline detail::process_lifetime<std::vector<thread_ring_registry_entry>>
+        thread_ring_registry_;
 
     // --------------------------------------------------------------------
     // T20: Global backup buffer storage — one per (Key, Hash, N) template
@@ -1204,12 +1249,15 @@ private:
             // BEFORE removing them from the registry. We need to hold the
             // lock during both the snapshot and the erase to prevent
             // drain_all_threads() from observing a half-removed state.
-            std::vector<std::pair<uint64_t, ring_data*>> to_flush;
+            // 持有 shared_ptr：离开注册表锁之后仍要访问这些 ring_data，
+            // 弱引用取到即保证它们在 flush 期间存活。
+            std::vector<std::pair<uint64_t, std::shared_ptr<ring_data>>> to_flush;
             {
                 std::lock_guard<std::mutex> lock(thread_ring_registry_mutex_);
                 for (const auto& e : thread_ring_registry_) {
-                    if (e.tid == tid) {
-                        to_flush.emplace_back(e.instance_id, e.ring_ptr);
+                    if (e.tid != tid) continue;
+                    if (auto rd = e.ring.lock()) {
+                        to_flush.emplace_back(e.instance_id, std::move(rd));
                     }
                 }
                 thread_ring_registry_.erase(
@@ -1974,8 +2022,11 @@ public:
                 // transition the flag from false to true. This prevents
                 // double-counting when drain_all_threads() is called
                 // repeatedly while a previous request is still pending.
+                // 弱引用取到才操作；取不到说明该线程的 ring 已销毁。
+                auto target = entry.ring.lock();
+                if (!target) continue;
                 bool expected = false;
-                if (entry.ring_ptr->needs_flush_.compare_exchange_strong(
+                if (target->needs_flush_.compare_exchange_strong(
                         expected, true, std::memory_order_acq_rel)) {
                     pending_drain_count_.fetch_add(1, std::memory_order_release);
                 }
@@ -2096,7 +2147,9 @@ public:
                 // via the normal path.
                 if (entry.tid == std::this_thread::get_id()) continue;
 
-                auto* ring = entry.ring_ptr;
+                // 弱引用取到才操作；取不到说明该线程的 ring 已销毁。
+                auto ring = entry.ring.lock();
+                if (!ring) continue;
                 const std::uint64_t last_activity =
                     ring->last_activity_ns_.load(std::memory_order_acquire);
 
@@ -2387,7 +2440,7 @@ public:
         thread_local bool registered = []() {
             std::lock_guard<std::mutex> lock(ring_registry_mutex_);
             ring_registry_.push_back(
-                ring_registry_entry{std::this_thread::get_id(), &get_tl_ring()});
+                ring_registry_entry{std::this_thread::get_id(), get_tl_ring_sp()});
             return true;
         }();
         (void)registered;
@@ -2716,11 +2769,21 @@ private:
 
     struct ring_registry_entry {
         std::thread::id tid;
-        tls_access_ring* ring_ptr;
+        /// 弱引用而非裸指针：ring 是本线程的 thread_local 对象，其它线程只能
+        /// 通过弱引用观察它。lock() 失败即表示该线程的 ring 已销毁，跳过即可。
+        ///
+        /// 原先是 `tls_access_ring* ring_ptr`：线程 TLS 销毁后该指针悬空，而
+        /// drain_all_threads() 会解引用 `ring_ptr->needs_flush_` —— 这正是
+        /// "全部测试通过后进程退出 139" 的元凶（只在高压使用下偶发，gdb 下
+        /// 因析构顺序不同通常不复现）。
+        std::weak_ptr<tls_access_ring> ring;
     };
 
     static inline std::mutex ring_registry_mutex_;
-    static inline std::vector<ring_registry_entry> ring_registry_;
+    /// 进程生命周期存储（见 detail::process_lifetime）：本容器在运行期才首次
+    /// 触及，会在使用它的全局缓存之前析构，而那正是要遍历它的时刻。
+    static inline detail::process_lifetime<std::vector<ring_registry_entry>>
+        ring_registry_;
 
     // ----------------------------------------------------------------
     // Thread-exit sentinel — pushes remaining TLS keys to backup and
@@ -2774,10 +2837,17 @@ private:
     /// The single source of truth for the thread-local ring.
     /// Both instance() and thread_exit_sentinel use this to ensure
     /// they reference the same ring object.
-    static tls_access_ring& get_tl_ring() {
-        thread_local tls_access_ring ring;
+    ///
+    /// 堆分配 + shared_ptr 持有：跨线程注册表存的是它的 weak_ptr，因此其它线程
+    /// 永远只会观察到"存活或已失效"，不会拿到悬空指针（裸指针在线程 TLS 销毁
+    /// 后即悬空，而 drain 路径会解引用它）。
+    static std::shared_ptr<tls_access_ring>& get_tl_ring_sp() {
+        thread_local std::shared_ptr<tls_access_ring> ring =
+            std::make_shared<tls_access_ring>();
         return ring;
     }
+
+    static tls_access_ring& get_tl_ring() { return *get_tl_ring_sp(); }
 };
 
 // ============================================================================
@@ -3044,11 +3114,15 @@ private:
     // Global registry for cross-thread drain support
     struct instance_registry_entry {
         uint64_t instance_id;
+        /// 裸指针在这里是安全的：注册在构造函数、注销在析构函数，条目不会比
+        /// 实例活得更久。
         tls_active_item_ring* instance_ptr;
     };
 
     static inline std::mutex registry_mutex_;
-    static inline std::vector<instance_registry_entry> registry_;
+    /// 进程生命周期存储（见 detail::process_lifetime）：同 tls_callback_ring。
+    static inline detail::process_lifetime<std::vector<instance_registry_entry>>
+        registry_;
 };
 
 // ============================================================================
