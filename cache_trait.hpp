@@ -256,7 +256,7 @@ struct cache_trait {
     static constexpr bool uses_compressed_hook =
         std::is_same_v<Hook, ::lru::compressed_intrusive_hook>;
 
-    /// Task 9: When true, unified_cache auto-starts the event_drain_worker
+    /// Task 9: When true, unified_cache auto-starts the event drain worker
     /// in the constructor. Production/read-heavy aliases set this to true;
     /// regular aliases (cache, safe_cache) keep the default (false).
     static constexpr bool auto_start_drain = false;
@@ -652,7 +652,7 @@ struct segmented_sharded_lru_trait : cache_trait<sharded_mm_lru, LockPolicy, det
 
 /// Task 9/14: Production-optimized segmented sharded LRU trait.
 /// Inherits all settings from segmented_sharded_lru_trait but enables:
-///   - auto_start_drain: event_drain_worker starts automatically on construction
+///   - auto_start_drain: event drain worker starts automatically on construction
 ///   - auto_enable_ebr: EBR (Epoch-Based Reclamation) enabled by default.
 ///     EBR's read path is significantly faster than hazptr under sustained
 ///     read contention (32+ threads, 99%+ reads) — TLS epoch guard vs.
@@ -1060,7 +1060,7 @@ public:
     /// check_memory_pressure(). Carries the snapshot of memory usage at
     /// the moment the cache entered critical mode. The event is produced
     /// inside the write lock but the handler is invoked *outside* the
-    /// lock (synchronously) or by the event_drain_worker (asynchronously),
+    /// lock (synchronously) or by the event drain worker (asynchronously),
     /// so the handler is free to call cache methods (flush/remove/set)
     /// without deadlocking.
     struct oom_event {
@@ -5399,7 +5399,7 @@ public:
     /// P2-4 (T2.4): Drain pending overload events from every shard's hash
     /// table and dispatch the registered callback for each. Returns the
     /// total number of events drained across all shards. Designed to be
-    /// called from a background worker (the `event_drain_worker` invokes
+    /// called from a background worker (the event drain worker invokes
     /// this automatically when `start_event_drain()` has been called).
     std::size_t drain_overload_callbacks() {
         std::size_t total = 0;
@@ -6287,16 +6287,17 @@ public:
     /// IMPORTANT — what `memory_usage` measures. It is
     /// `sum(item_overhead + key_size_fn(key) * 2 + value_size_fn(value))`,
     /// i.e. the per-item struct overhead plus whatever size hooks the caller
-    /// registered via `mm_lru_config::key_size_fn` / `value_size_fn`. It is
-    /// NOT RSS and NOT the real byte size of the stored data:
+    /// registered via `set_key_size_calculator()` / `set_value_size_calculator()`
+    /// on the MM config. It is NOT RSS and NOT the real byte size of the
+    /// stored data:
     ///
     ///   - with no size hooks registered, a `std::string` contributes
     ///     `sizeof(std::string)` (32 on most ABIs), not its length, so a
     ///     shard holding 4096-byte strings is not ranked above a shard
     ///     holding 8-byte strings;
     ///   - slab allocator internal fragmentation is not included, so a
-    ///     `value_size_fn` that returns the true payload size still
-    ///     under-reports what the allocator actually reserved.
+    ///     `set_value_size_calculator()` hook that returns the true payload
+    ///     size still under-reports what the allocator actually reserved.
     ///
     /// It is a reliable ranking signal only when the caller registers size
     /// hooks that reflect the real payload. The returned vector otherwise
@@ -6677,7 +6678,7 @@ public:
     /// critical memory mode. The handler receives (current_memory, max_memory).
     ///
     /// P-HIGH-2 (T-H1): The handler is now invoked *outside* the write lock
-    /// (synchronous mode, the default) or by the event_drain_worker
+    /// (synchronous mode, the default) or by the event drain worker
     /// (asynchronous mode, see `set_async_oom_handler(true)`). This means
     /// the handler is free to call cache methods (flush/remove/set) without
     /// deadlocking — previously it was invoked inside the write lock and
@@ -6686,7 +6687,7 @@ public:
     /// In synchronous mode the handler is called immediately after the
     /// write lock is released by the triggering set() / set_prehashed()
     /// call, on the same thread. In asynchronous mode the event is
-    /// enqueued and dispatched by the event_drain_worker (default interval
+    /// enqueued and dispatched by the event drain worker (default interval
     /// 1s; 500ms when live read_handles exist), reducing set() tail
     /// latency when the handler performs IO (logging, alerting, external
     /// GC triggers).
@@ -6699,7 +6700,7 @@ public:
     /// P-HIGH-2 (T-H1): Toggle asynchronous OOM handler dispatch.
     ///
     /// When enabled, OOM events are enqueued on a lock-free MPSC queue
-    /// and dispatched by the event_drain_worker (must be started via
+    /// and dispatched by the event drain worker (must be started via
     /// `start_event_drain()`). This keeps the set() hot path free of
     /// user-handler latency. When disabled (the default), the handler
     /// is invoked synchronously on the set() caller thread, immediately
@@ -6720,7 +6721,7 @@ public:
     }
 
     /// P-HIGH-2 (T-H1): Drain pending OOM events and invoke the handler
-    /// for each. Called by the event_drain_worker when async mode is
+    /// for each. Called by the event drain worker when async mode is
     /// enabled. Returns the number of events dispatched.
     /// Safe to call from any thread; no-op if no events are pending.
     std::size_t drain_oom_events() {
@@ -6809,7 +6810,7 @@ public:
     ///
     /// - In synchronous mode (default): invokes `oom_handler_` inline.
     /// - In asynchronous mode (`set_async_oom_handler(true)`): enqueues
-    ///   the event for the event_drain_worker. Events are coalesced —
+    ///   the event for the event drain worker. Events are coalesced —
     ///   only the latest event is retained.
     ///
     /// No-op if `evt` is std::nullopt or no handler is registered.
@@ -7829,7 +7830,8 @@ public:
     // The output is multi-line text terminated by '\n'. For sharded caches,
     // counters are aggregated across shards.
     //
-    // P2-E: When metrics caching is enabled via `set_metrics_cache_ttl()`,
+    // P2-E: When metrics caching is enabled via `set_metrics_cache_enabled()`
+    // (with `start_metrics_cache_worker()` driving the periodic rebuild),
     // callers scraping at high frequency (e.g. Prometheus every 5s) hit a
     // pre-built snapshot + pre-formatted string instead of recomputing
     // hash-table diagnostics and rebuilding the Prometheus text on every
@@ -8940,12 +8942,6 @@ public:
     }
 
     /// Stop both background drain workers (reclaim + callback) if running.
-    /// P1-3: Also clears the hazptr domain's drain_started flag so that
-    /// subsequent retire_obj() calls (e.g. from another cache sharing
-    /// the default domain) emit the warning again — but the warning's
-    /// CAS flag is NOT reset, so the message fires at most once per
-    /// process lifetime (operators who saw it once will not see it
-    /// again even after stop/start cycles).
     ///
     /// Stop order: callback worker first, then reclaim worker. The
     /// callback worker may trigger evictions during its final tick
@@ -8955,7 +8951,7 @@ public:
     /// order bounds the residual pending list to one reclaim tick's
     /// worth (≤250ms).
     ///
-    /// The domain-global `drain_started` flag is deliberately NOT cleared
+    /// The domain-global `drain_started_` flag is deliberately NOT cleared
     /// here. It gates a one-shot stderr warning that tells operators they
     /// never started a reclaim worker, and the failure it warns about
     /// (retired objects accumulating without bound) is a property of the
@@ -9016,7 +9012,7 @@ public:
     /// "is reclamation happening now for this cache", not "was a worker
     /// ever started somewhere in the process".
     ///
-    /// The hazptr domain's `drain_started` flag is process-global and, by
+    /// The hazptr domain's `drain_started_` flag is process-global and, by
     /// design, monotonic (see `stop_event_drain()`), so it cannot answer
     /// the per-cache question. The cache's own worker handles can.
     bool is_drain_worker_started() const noexcept {
@@ -9133,7 +9129,7 @@ public:
     //
     // event_tracker records item lifecycle events (insert/hit/evict) into
     // a lock-free TLS ring buffer, drained periodically by the cache's
-    // event_drain_worker. Enable tracking during cache setup, then query
+    // event drain worker. Enable tracking during cache setup, then query
     // the tracker (top_keys, generate_report, etc.) at runtime.
     //
     // The tracker is stored as std::atomic<std::shared_ptr<...>> so the
@@ -9226,7 +9222,7 @@ public:
     // of retired cache items until no reader can observe them. Without
     // periodic invocation of try_reclaim(), retired items accumulate in
     // the global pending list, causing unbounded memory growth under
-    // high-churn workloads. The background event_drain_worker invokes
+    // high-churn workloads. The background event drain worker invokes
     // try_reclaim() on each tick; users may also trigger it manually.
 
     /// Trigger an immediate reclamation pass on both the hazptr and EBR
@@ -9239,7 +9235,7 @@ public:
     ///        by explicit user-initiated full reclaim). When > 0, at
     ///        most `batch_size` objects are inspected per domain; any
     ///        unprocessed or still-protected objects remain pending for
-    ///        the next call. The background `event_drain_worker` uses
+    ///        the next call. The background event drain worker uses
     ///        `try_reclaim_now(kIncrementalReclaimBatch)` to bound the
     ///        worst-case latency of each tick — eliminating the spikes
     ///        seen when a large pending list (e.g., after a burst of
@@ -9281,7 +9277,7 @@ public:
     }
 
     /// T-P2-3 (R-7): Default batch size for incremental reclaim used by
-    /// the background `event_drain_worker`. Each tick processes at most
+    /// the background event drain worker. Each tick processes at most
     /// this many objects per reclamation domain (hazptr + EBR), bounding
     /// tick latency. With 1024 objects per tick and a 500ms–1s tick
     /// interval, steady-state reclaim throughput is 1024–2048 objects/s
@@ -9527,10 +9523,10 @@ public:
         return evict_expired_impl(/*round_robin=*/false);
     }
 
-    /// Refresh the internal cached time used for TTL checks.
-    /// This forces the next TTL check to use the current real time,
-    /// which is useful when the cache has been idle for a while and
-    /// the cached time may be stale.
+    /// Refresh the internal cached time published for TTL monitoring.
+    /// Kept for compatibility with callers that scheduled a refresh before
+    /// TTL-sensitive operations; expiry decisions themselves use
+    /// `check_expiry()`, which always reads the real clock.
     void refresh_cached_now() {
         if constexpr (is_striped) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -10550,7 +10546,7 @@ private:
     std::function<void(size_type current, size_type max)> oom_handler_;
 
     /// P-HIGH-2 (T-H1): When true, OOM events are enqueued on
-    /// pending_oom_event_ and dispatched by the event_drain_worker
+    /// pending_oom_event_ and dispatched by the event drain worker
     /// (see drain_oom_events()). When false (default), the handler
     /// is invoked synchronously outside the write lock.
     std::atomic<bool> async_oom_handler_{false};

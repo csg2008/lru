@@ -1303,7 +1303,7 @@ private:
     alignas(64) std::atomic<std::size_t> reclaim_total_{0};
 
     // P1-3 (T1.4): Auto-reclaim threshold and stampede guard.
-    // When `pending_count_` exceeds `reclaim_threshold_`, the next
+    // When `pending_count()` exceeds `reclaim_threshold_`, the next
     // push_pending() synchronously invokes try_reclaim(). The
     // `reclaim_in_progress_` CAS flag ensures at most one thread at a
     // time performs the synchronous reclaim — concurrent callers
@@ -1346,8 +1346,9 @@ private:
 
     // P1-3: CAS flag ensuring the drain-not-started warning fires at
     // most once per domain. Stored separately from `drain_started_` so
-    // that calling `set_drain_started(false)` (e.g. on shutdown) does
-    // not re-arm the warning.
+    // that a later `set_drain_started(false)` (e.g. on shutdown) does
+    // not re-arm the warning. No in-tree caller resets it today, but
+    // keeping it independent makes that safe to add.
     alignas(64) std::atomic<bool> drain_warn_emitted_{false};
 };
 

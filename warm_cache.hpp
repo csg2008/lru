@@ -307,9 +307,10 @@ public:
     // on warm restart.
     //
     // Delta tracking hooks on_insert / on_evict on the live cache. The
-    // hooks append to `delta_map_` (key → optional<value>; nullopt means
-    // the key was removed). Multiple updates to the same key coalesce
-    // into a single entry, so delta_map_.size() <= unique mutated keys.
+    // hooks append to `delta_shards_` (key → optional<value>; nullopt
+    // means the key was removed). Multiple updates to the same key
+    // coalesce into a single entry, so the summed shard sizes are <=
+    // unique mutated keys.
     //
     // If the live cache is swapped out (via swap_when_ready()), delta
     // callbacks are automatically re-attached to the new cache (G9).
@@ -328,7 +329,7 @@ public:
     };
 
     /// Enable delta tracking on the current live cache.
-    /// Hooks on_insert / on_update / on_evict to populate `delta_map_`.
+    /// Hooks on_insert / on_update / on_evict to populate `delta_shards_`.
     /// Idempotent: calling twice on the same cache is a no-op (the second
     /// call sees `delta_callbacks_attached_` is true and returns early).
     ///

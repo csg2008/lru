@@ -892,8 +892,8 @@ public:
     /// in-memory cache. This decouples attach() from any specific cache
     /// type (unified_cache, striped_cache, etc.).
     ///
-    /// T5.2: Acquires `cross_process_mutex_` so a concurrent save() in
-    /// another process cannot interleave with this attach.
+    /// T5.2: Acquires `mutex_` (a `cross_process_mutex`) so a concurrent
+    /// save() in another process cannot interleave with this attach.
     /// T5.3: Verifies the CRC32 of the data region before deserializing.
     /// If the CRC does not match (torn write, partial flush, corruption),
     /// attach() returns 0 and the header's data_size_bytes is reset.
@@ -1059,8 +1059,9 @@ public:
     /// at the last item that fits and the header's item_count is updated
     /// to reflect the actual count persisted.
     ///
-    /// T5.2: Acquires `cross_process_mutex_` before writing, so concurrent
-    /// save() / attach() calls from different processes cannot interleave.
+    /// T5.2: Acquires `mutex_` (a `cross_process_mutex`) before writing, so
+    /// concurrent save() / attach() calls from different processes cannot
+    /// interleave.
     /// T5.3: Computes CRC32 of the written data region and stores it in
     /// the header along with `data_size_bytes` for attach()-time
     /// integrity verification.

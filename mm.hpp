@@ -670,9 +670,10 @@ public:
     /// is released. Satisfies the SFINAE check in
     /// `unified_cache::evict_expired_impl()`.
     ///
-    /// Force-refresh the cached now_ns value used by the TTL hot path.
-    /// Called by background TTL cleaner to keep the cache reasonably fresh,
-    /// or manually before TTL-sensitive operations.
+    /// Force-refresh the published cached-now value.
+    /// Called by the background TTL cleaner, or manually before
+    /// TTL-sensitive operations. Note the value is informational only:
+    /// expiry checks call `check_expiry()`, which reads the clock directly.
     void refresh_cached_now() const {
         auto now_ns = static_cast<std::uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count());
@@ -802,9 +803,9 @@ public:
                 detail::expiry_check_result::kExpired) {
                 return {};
             }
-            // The item is live: refresh the cached-now lower bound so the next
-            // read can settle the common "long expired" case without a clock
-            // read (P1-8 keeps `cached_now_ns_` meaningful for the cleaner).
+            // The item is live: publish the current time so the background
+            // cleaner sees a fresh value (P1-8). Expiry itself is decided by
+            // `check_expiry()`, which reads the clock directly.
             cached_now_ns_.store(
                 static_cast<std::uint64_t>(
                     std::chrono::steady_clock::now().time_since_epoch().count()),
@@ -1403,7 +1404,7 @@ public:
     /// P2-4 (T2.4): Drain pending overload events from the underlying
     /// hash table and dispatch the registered callback for each. Returns
     /// the number of events drained. Designed to be called from a
-    /// background worker (e.g. the `event_drain_worker` in `unified_cache`).
+    /// background worker (e.g. the event drain worker in `unified_cache`).
     std::size_t drain_overload_callbacks() {
         return map_.drain_overload_callbacks();
     }
@@ -1702,18 +1703,19 @@ private:
     // eviction strategy instead of only this one.
     // (The index itself — `index_` — is owned by the mixin base above.)
 
-    // P1-8: Cached current time for TTL hot path. Avoids steady_clock::now()
-    // on every TTL get. Updated lazily when the drift exceeds max_drift,
-    // or when refresh_cached_now() is called (e.g. from background cleaner).
+    // P1-8: Cached current time for the TTL hot path. Written on every TTL
+    // cache hit and by `refresh_cached_now()` (e.g. from the background
+    // cleaner). NOTE: expiry decisions no longer consult this value — the
+    // shared `detail::check_expiry()` reads `steady_clock::now()` directly
+    // (P1-32), so `cached_now_ns_` is currently published but never read.
     //
-    // P2-B: `cached_now_ns_` is on the TTL get hot path (read on every
-    // TTL-aware lookup) and is written by both the get path (lazy refresh)
-    // and the background cleaner. Without isolation, it shares a cache
-    // line with `ttl_heap_` (whose data pointer / size / capacity mutate
-    // on every TTL insert / heap pop) — every TTL get that refreshes the
-    // cached time would invalidate the cache line for threads reading
-    // `ttl_heap_`, and vice versa. Pin it to its own 64-byte line to
-    // eliminate the false sharing.
+    // P2-B: `cached_now_ns_` is written on every TTL cache hit and by the
+    // background cleaner. Without isolation it would share a cache line
+    // with the shared TTL index (`detail::mm_ttl_index_mixin::index_`,
+    // whose heap storage mutates on every TTL insert / heap pop) — every
+    // TTL hit that refreshes the cached time would invalidate the cache
+    // line for threads touching the index, and vice versa. Pin it to its
+    // own 64-byte line to eliminate the false sharing.
     alignas(64) mutable std::atomic<std::uint64_t> cached_now_ns_{0};
 
     // ====================================================================
@@ -3173,7 +3175,7 @@ public:
     /// P2-4 (T2.4): Drain pending overload events from the underlying
     /// hash table and dispatch the registered callback for each. Returns
     /// the number of events drained. Designed to be called from a
-    /// background worker (e.g. the `event_drain_worker` in `unified_cache`).
+    /// background worker (e.g. the event drain worker in `unified_cache`).
     std::size_t drain_overload_callbacks() {
         return map_.drain_overload_callbacks();
     }
@@ -4399,7 +4401,7 @@ public:
     /// P2-4 (T2.4): Drain pending overload events from the underlying
     /// hash table and dispatch the registered callback for each. Returns
     /// the number of events drained. Designed to be called from a
-    /// background worker (e.g. the `event_drain_worker` in `unified_cache`).
+    /// background worker (e.g. the event drain worker in `unified_cache`).
     std::size_t drain_overload_callbacks() {
         return map_.drain_overload_callbacks();
     }
@@ -6221,7 +6223,7 @@ public:
     /// P2-4 (T2.4): Drain pending overload events from the underlying
     /// hash table and dispatch the registered callback for each. Returns
     /// the number of events drained. Designed to be called from a
-    /// background worker (e.g. the `event_drain_worker` in `unified_cache`).
+    /// background worker (e.g. the event drain worker in `unified_cache`).
     std::size_t drain_overload_callbacks() {
         return map_.drain_overload_callbacks();
     }
@@ -7828,7 +7830,7 @@ public:
     /// P2-4 (T2.4): Drain pending overload events from the underlying
     /// hash table and dispatch the registered callback for each. Returns
     /// the number of events drained. Designed to be called from a
-    /// background worker (e.g. the `event_drain_worker` in `unified_cache`).
+    /// background worker (e.g. the event drain worker in `unified_cache`).
     std::size_t drain_overload_callbacks() {
         return map_.drain_overload_callbacks();
     }

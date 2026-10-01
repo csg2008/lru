@@ -2642,8 +2642,8 @@ private:
 
     /// T10.3: Global counter of auto-drain invocations. Read via
     /// `tls_ring_flush_count()` and atomically drained via
-    /// `drain_flush_count()`. Used to compute flushes/sec for the
-    /// `tls_ring_flush_per_sec` monitoring metric.
+    /// `drain_flush_count()`. Accumulated into the
+    /// `lru_cache_tls_ring_flush_total` Prometheus counter.
     alignas(64) static inline std::atomic<std::size_t> tls_ring_flush_count_{0};
 
     /// P1-B: Fast-path flag for `has_backup_keys()`. Set to true under

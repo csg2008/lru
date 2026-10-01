@@ -494,7 +494,7 @@ public:
     /// P2-3: Top-K hot keys with human-readable names (via `set_key_to_string`).
     ///
     /// Returns key_name → estimated hit count pairs, sorted by count descending.
-    /// If no `key_to_string` callback is set, the key name is the hash
+    /// If no `key_to_string_cb_` callback is set, the key name is the hash
     /// formatted as a hexadecimal string.
     ///
     /// P2-9: The top-K query is lock-free (reads from the active instance

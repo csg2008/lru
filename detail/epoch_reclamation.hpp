@@ -1286,9 +1286,9 @@ private:
     /// CAS-loop prepend: atomically insert a chain at the front of the
     /// global pending list. Finds the tail of the chain and links it to
     /// the current head, then CAS-swaps the head pointer. No mutex required.
-    /// P1-3 (T1.4): also bumps `pending_count_` by the chain length so
-    /// `maybe_auto_reclaim()` can detect threshold overflow without
-    /// walking the pending list.
+    /// P1-3 (T1.4): also bumps the pending ledger (`pending_add`) by the
+    /// chain length so `maybe_auto_reclaim()` can detect threshold
+    /// overflow via `pending_count()` without walking the pending list.
     ///
     /// P1-6 (T2.3): chain_head is a hazptr_obj_base* chain (linked via
     /// next_), not a retired_node* chain. No wrapper allocations.
@@ -1579,7 +1579,7 @@ public:
     alignas(64) std::atomic<std::size_t> reclaim_total_{0};
 
     // P1-3 (T1.4): Auto-reclaim threshold and stampede guard.
-    // When `pending_count_` exceeds `reclaim_threshold_`, the next
+    // When `pending_count()` exceeds `reclaim_threshold_`, the next
     // flush_tls_buffer() synchronously invokes try_reclaim(). The
     // `reclaim_in_progress_` CAS flag ensures at most one thread at a
     // time performs the synchronous reclaim. `reclaim_auto_triggered_count_`

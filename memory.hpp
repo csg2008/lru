@@ -38,7 +38,7 @@
 #  include <windows.h>
 #  include <psapi.h>  // GetProcessMemoryInfo for RSS sampling
 #  define LRU_HAS_WIN32_NUMA 1
-#  define LRU_HAS_WIN32_MEM_NOTIF 1  // QueryMemoryResourceNotification
+#  define LRU_HAS_WIN32_MEM_NOTIF 1  // CreateMemoryResourceNotification
 #elif defined(__linux__)
 #  include <sys/mman.h>
 #  include <sys/stat.h>
@@ -299,9 +299,11 @@ private:
 // Design goals:
 //   * Cheap: sampling runs on a background thread at a configurable interval
 //     (default 1s). The hot path only reads an atomic snapshot pointer.
-//   * Portable: uses Win32 `QueryMemoryResourceNotification` + `GetProcessMemoryInfo`
-//     on Windows and `/proc/self/statm` + `/proc/meminfo` + cgroup v1/v2 files
-//     on Linux. Unsupported platforms return `level::unknown`.
+//   * Portable: uses Win32 `GetProcessMemoryInfo` + `GlobalMemoryStatusEx`
+//     (plus `CreateMemoryResourceNotification` handles for OS pressure
+//     transitions) on Windows, and `/proc/self/statm` + `/proc/meminfo` +
+//     cgroup v1/v2 files on Linux. Unsupported platforms return
+//     `level::unknown`.
 //   * Non-blocking: `latest()` returns the most recent snapshot without
 //     triggering a fresh sample. Call `refresh()` to force a synchronous sample.
 //   * Self-contained: does not depend on `memory_monitor`, so it can be unit

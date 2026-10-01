@@ -568,7 +568,7 @@ private:
     /// `clear_expired()` came to leave 63 of 64 shards' worth of expired
     /// entries resident forever — they kept consuming their shard's
     /// `max_size` quota and pushed live entries out through LRU, while
-    /// `ttl_expired_total` still reported zero cleanups. Every full-scan
+    /// `lru_cache_ttl_expired_total` still reported zero cleanups. Every full-scan
     /// path must go through this helper rather than calling
     /// `mm().begin()` directly.
     ///

@@ -4046,7 +4046,7 @@ public:
         if (overloaded) {
             hash_overload_events_.fetch_add(1, std::memory_order_relaxed);
             // P2-4 (T2.4): Async mode enqueues {current_lf, threshold} for
-            // later draining by the event_drain_worker, so user callbacks
+            // later draining by the event drain worker, so user callbacks
             // performing IO/logging cannot block the rehash hot path.
             // Sync mode preserves the original inline-invocation semantics.
             if (overload_callback_async_.load(std::memory_order_acquire)) {
@@ -4148,7 +4148,7 @@ public:
 
     /// P2-4 (T2.4): Drain pending overload events and dispatch the
     /// registered callback for each. Designed to be called from a
-    /// background worker (e.g. the event_drain_worker in `unified_cache`)
+    /// background worker (e.g. the event drain worker in `unified_cache`)
     /// rather than from a rehash hot path.
     ///
     /// Returns the number of events drained. Exceptions thrown by the
@@ -6571,7 +6571,7 @@ public:
     /// rehash_migrating_ too often.
     ///
     /// Works for both chain and F14 probing modes — `is_rehashing()` is
-    /// the per-segment flag set by `start_incremental_rehash()` and
+    /// the per-segment flag set by `set_incremental_rehash(true)` and
     /// cleared by `rehash_finish()` regardless of probing style.
     float rehash_in_progress_ratio() const noexcept {
         if (num_segments_ == 0) return 0.0f;
@@ -6701,7 +6701,7 @@ public:
     // segment so that a cache-wide `set_async_overload_callback(true)`
     // covers the entire segmented table without requiring per-segment
     // setup. `drain_overload_callbacks()` aggregates across segments so
-    // the event_drain_worker can drain the whole table in one call.
+    // the event drain worker can drain the whole table in one call.
     // ========================================================================
 
     void set_overload_callback(std::function<void(float, float)> cb) {
