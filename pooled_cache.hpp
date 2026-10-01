@@ -61,6 +61,13 @@ struct pool_config {
     /// Optional MM-level config (pool-specific delayed promotion, insertion point, etc.).
     /// When provided, overrides the global default config.
     /// Only meaningful when the underlying MM type supports per-instance config.
+    ///
+    /// P0-3: the member carries a default member initializer so that callers can
+    /// write the natural designated-initializer form
+    /// `{.name = ..., .max_size = ..., .priority = ...}` without tripping
+    /// -Wmissing-designated-field-initializers / -Wmissing-field-initializers
+    /// (both compilers suppress the diagnostic for omitted members that have a
+    /// default member initializer).
     struct {
         /// lru_refresh_time override (0 = use global default)
         uint32_t lru_refresh_time_override = 0;
@@ -70,7 +77,7 @@ struct pool_config {
         std::optional<bool> update_on_read_override;
         /// update_on_write override (disabled = use global default)
         std::optional<bool> update_on_write_override;
-    } mm_overrides;
+    } mm_overrides{};
 
     /// Validate this config.
     void validate() const {
@@ -143,7 +150,7 @@ struct marginal_hits_strategy {
         if (diff < min_hit_rate_diff) return std::nullopt;
 
         std::size_t transfer_amount = static_cast<std::size_t>(
-            worst->max_size * max_transfer_fraction);
+            static_cast<double>(worst->max_size) * max_transfer_fraction);
         if (transfer_amount == 0) transfer_amount = 1;
 
         return transfer{worst->name, best->name, transfer_amount};
@@ -593,7 +600,7 @@ public:
         auto lock = maybe_unique_lock();
         auto hint = first_non_empty_pool_.load(std::memory_order_acquire);
         if (hint >= 0 && static_cast<std::size_t>(hint) < pools_.size()) {
-            auto& entry = pools_[hint];
+            auto& entry = pools_[static_cast<std::size_t>(hint)];
             if (!entry->cache->empty()) {
                 auto result = entry->cache->get(key);
                 if (result) return result;

@@ -151,6 +151,10 @@ struct alignas(8) compressed_intrusive_hook {
     static constexpr uint8_t kTailFlag     = 1 << 0;
     static constexpr uint8_t kAccessedFlag = 1 << 1;
     static constexpr uint8_t kLinkedFlag   = 1 << 2;
+    // P0-3: pre-computed clear masks — see the note in detail/intrusive_list.hpp.
+    static constexpr uint8_t kTailClearMask     = static_cast<uint8_t>(~kTailFlag);
+    static constexpr uint8_t kAccessedClearMask = static_cast<uint8_t>(~kAccessedFlag);
+    static constexpr uint8_t kLinkedClearMask   = static_cast<uint8_t>(~kLinkedFlag);
 
     /// Compressed offsets from the item's allocation base.
     uint32_t prev_offset = 0;
@@ -246,15 +250,15 @@ struct alignas(8) compressed_intrusive_hook {
 
     bool is_tail() const noexcept { return flags & kTailFlag; }
     void set_tail() noexcept { flags |= kTailFlag; }
-    void clear_tail() noexcept { flags &= ~kTailFlag; }
+    void clear_tail() noexcept { flags &= kTailClearMask; }
 
     bool is_accessed() const noexcept { return flags & kAccessedFlag; }
     void set_accessed() noexcept { flags |= kAccessedFlag; }
-    void clear_accessed() noexcept { flags &= ~kAccessedFlag; }
+    void clear_accessed() noexcept { flags &= kAccessedClearMask; }
 
     bool is_linked() const noexcept { return flags & kLinkedFlag; }
     void set_linked() noexcept { flags |= kLinkedFlag; }
-    void clear_linked() noexcept { flags &= ~kLinkedFlag; }
+    void clear_linked() noexcept { flags &= kLinkedClearMask; }
 
     uint32_t get_update_time() const noexcept { return update_time; }
     void set_update_time(uint32_t t) noexcept { update_time = t; }

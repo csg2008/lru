@@ -105,6 +105,13 @@ struct intrusive_hook {
     static constexpr uint8_t kTailFlag     = 1 << 0;  // Item is in tail section (insertion point tracking)
     static constexpr uint8_t kAccessedFlag = 1 << 1;  // Item has been accessed since insertion
     static constexpr uint8_t kLinkedFlag   = 1 << 2;  // Item is currently linked in a list
+    // P0-3: pre-computed clear masks. `flags &= ~kXxxFlag` performs the ~ on a
+    // promoted int, producing a negative constant that -Wsign-conversion flags
+    // when masked back into a uint8_t. Using a uint8_t mask keeps the compound
+    // assignment value-preserving and warning-free.
+    static constexpr uint8_t kTailClearMask     = static_cast<uint8_t>(~kTailFlag);
+    static constexpr uint8_t kAccessedClearMask = static_cast<uint8_t>(~kAccessedFlag);
+    static constexpr uint8_t kLinkedClearMask   = static_cast<uint8_t>(~kLinkedFlag);
 
     void* prev = nullptr;
     void* next = nullptr;
@@ -123,16 +130,16 @@ struct intrusive_hook {
     // --- Flag operations ---
     bool is_tail() const noexcept { return flags & kTailFlag; }
     void set_tail() noexcept { flags |= kTailFlag; }
-    void clear_tail() noexcept { flags &= ~kTailFlag; }
+    void clear_tail() noexcept { flags &= kTailClearMask; }
 
     bool is_accessed() const noexcept { return flags & kAccessedFlag; }
     void set_accessed() noexcept { flags |= kAccessedFlag; }
-    void clear_accessed() noexcept { flags &= ~kAccessedFlag; }
+    void clear_accessed() noexcept { flags &= kAccessedClearMask; }
 
     // Linked flag (node liveness tracking)
     bool is_linked() const noexcept { return flags & kLinkedFlag; }
     void set_linked() noexcept { flags |= kLinkedFlag; }
-    void clear_linked() noexcept { flags &= ~kLinkedFlag; }
+    void clear_linked() noexcept { flags &= kLinkedClearMask; }
 
     // B12: TSan-safe update_time 读取（对齐 CacheLib DList.h:69-75）
     uint32_t get_update_time() const noexcept {
@@ -558,6 +565,8 @@ public:
     void poison_removed(T& item) {
 #if defined(LRU_HAS_ASAN)
         ASAN_POISON_MEMORY_REGION(&item, sizeof(T));
+#else
+        (void)item;  // only meaningful under ASan
 #endif
     }
 
@@ -1158,6 +1167,27 @@ public:
         }
     }
 
+    /// Move an existing item to the head of segment 0, ASSUMING the caller
+    /// already holds both the item's source-segment lock and segment 0's
+    /// lock.
+    ///
+    /// Needed because move_to_head() acquires those two locks itself, and
+    /// segment_spinlock is a non-recursive test-and-set spinlock — calling it
+    /// while already holding them spins forever. mm_lru::record_access_at()'s
+    /// segmented try-lock path holds both locks (via
+    /// try_lock_two_segments()) and then promotes, so with
+    /// use_segmented_lru enabled every single promotion hung the calling
+    /// thread, and with it whichever stripe or shard lock the caller held.
+    void move_to_head_locked(T& item) {
+        auto& hook = GetHook(item);
+        // Already at head of segment 0? No work needed.
+        if (hook.segment_idx == 0 && hook_traits::is_end_prev(hook)) return;
+        auto& src_seg = segments_[hook.segment_idx];
+        auto& dst_seg = segments_[0];
+        unlink_locked(item, src_seg);
+        relink_at_segment_head(item, dst_seg);
+    }
+
     /// Replace old_node with new_node at the same position.
     void replace(T& old_node, T& new_node) {
         assert(&old_node != &new_node && "segmented_intrusive_list::replace: nodes must differ");
@@ -1277,7 +1307,11 @@ public:
                 hook_traits::set_next(hook, nullptr, nullptr);
                 hook.clear_linked();
                 hook.segment_idx = 0;
-                curr = next_ptr;
+                // P0-2 (fix.01 方案 A): hook_traits::get_next() returns void*
+                // (it serves both raw and compressed hook variants), so the
+                // implicit conversion to T* was ill-formed and this function
+                // never compiled.
+                curr = static_cast<T*>(next_ptr);
             }
             seg.head = nullptr;
             seg.tail = nullptr;
@@ -1329,6 +1363,8 @@ public:
     void poison_removed(T& item) {
 #if defined(LRU_HAS_ASAN)
         ASAN_POISON_MEMORY_REGION(&item, sizeof(T));
+#else
+        (void)item;  // only meaningful under ASan
 #endif
     }
 

@@ -31,8 +31,8 @@ using namespace lru;
 TEST(SlabAllocatorTest, ConcurrentAllocateDeallocate8Threads) {
     slab_allocator alloc;
 
-    constexpr int kThreads = 8;
-    constexpr int kCycles = 10000;
+    constexpr std::size_t kThreads = 8;
+    constexpr std::size_t kCycles = 10000;
     constexpr uint32_t kAllocSize = 128;  // fits in class size 128
 
     // Each thread pre-allocates a batch, holds them, then deallocates.
@@ -41,11 +41,11 @@ TEST(SlabAllocatorTest, ConcurrentAllocateDeallocate8Threads) {
     std::vector<std::vector<void*>> thread_ptrs(kThreads);
 
     std::vector<std::thread> threads;
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t]() {
             auto& my_ptrs = thread_ptrs[t];
             my_ptrs.reserve(kCycles);
-            for (int i = 0; i < kCycles; ++i) {
+            for (std::size_t i = 0; i < kCycles; ++i) {
                 void* ptr = alloc.allocate(kAllocSize);
                 if (ptr) {
                     my_ptrs.push_back(ptr);
@@ -57,7 +57,7 @@ TEST(SlabAllocatorTest, ConcurrentAllocateDeallocate8Threads) {
 
     // Now deallocate in parallel — each thread returns its own batch
     threads.clear();
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t]() {
             for (auto* p : thread_ptrs[t]) {
                 alloc.deallocate(p, kAllocSize);
@@ -72,8 +72,8 @@ TEST(SlabAllocatorTest, ConcurrentAllocateDeallocate8Threads) {
 TEST(SlabAllocatorTest, ConcurrentMixedSizeAllocate) {
     slab_allocator alloc;
 
-    constexpr int kThreads = 8;
-    constexpr int kCycles = 5000;
+    constexpr std::size_t kThreads = 8;
+    constexpr std::size_t kCycles = 5000;
 
     // Each thread uses a different size class — no contention on the same free list
     uint32_t sizes[] = {64, 128, 256, 512, 1024, 2048, 4096, 8192};
@@ -81,12 +81,12 @@ TEST(SlabAllocatorTest, ConcurrentMixedSizeAllocate) {
     std::vector<std::vector<void*>> thread_ptrs(kThreads);
 
     std::vector<std::thread> threads;
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t]() {
             uint32_t sz = sizes[t];
             auto& my_ptrs = thread_ptrs[t];
             my_ptrs.reserve(kCycles);
-            for (int i = 0; i < kCycles; ++i) {
+            for (std::size_t i = 0; i < kCycles; ++i) {
                 void* ptr = alloc.allocate(sz);
                 if (ptr) {
                     my_ptrs.push_back(ptr);
@@ -98,7 +98,7 @@ TEST(SlabAllocatorTest, ConcurrentMixedSizeAllocate) {
 
     // Deallocate
     threads.clear();
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t]() {
             uint32_t sz = sizes[t];
             for (auto* p : thread_ptrs[t]) {
@@ -117,8 +117,8 @@ TEST(SlabAllocatorTest, ConcurrentMixedSizeAllocate) {
 TEST(SlabAllocatorTest, HighContentionRapidAllocDeallocNoABA) {
     slab_allocator alloc;
 
-    constexpr int kThreads = 8;
-    constexpr int kCycles = 20000;  // 8 * 20K = 160K ops, well past 16-bit wrap
+    constexpr std::size_t kThreads = 8;
+    constexpr std::size_t kCycles = 20000;  // 8 * 20K = 160K ops, well past 16-bit wrap
     constexpr uint32_t kAllocSize = 128;
 
     std::atomic<int> alloc_count{0};
@@ -126,9 +126,9 @@ TEST(SlabAllocatorTest, HighContentionRapidAllocDeallocNoABA) {
 
     std::vector<std::thread> threads;
     threads.reserve(kThreads);
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&]() {
-            for (int i = 0; i < kCycles; ++i) {
+            for (std::size_t i = 0; i < kCycles; ++i) {
                 void* ptr = alloc.allocate(kAllocSize);
                 if (ptr) {
                     alloc_count.fetch_add(1, std::memory_order_relaxed);

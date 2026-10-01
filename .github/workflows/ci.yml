@@ -307,3 +307,84 @@ jobs:
               --current  current.json
         env:
           REGRESSION_THRESHOLD_PCT: "20"
+
+  # T-CI-5: Warnings-as-errors build.
+  #
+  # lru_cache_warnings carries -Wall -Wextra -Wpedantic -Wshadow
+  # -Wconversion -Wsign-conversion for every test/example/benchmark target.
+  # The tree is warning-clean under that set on Clang/MinGW (verified
+  # locally, zero diagnostics across all 49 test TUs); GCC is more eager on
+  # some of these checks, so this job starts as continue-on-error.
+  #
+  # Flip it to a hard gate once it has been observed green on the CI
+  # toolchain: remove the `continue-on-error` line below.
+  werror:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++
+          git clone --depth 1 https://github.com/martinus/unordered_dense.git ../unordered_dense
+
+      - name: Configure (warnings as errors)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DLRU_BUILD_TESTS=ON -DLRU_BUILD_EXAMPLES=OFF \
+            -DLRU_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build -j4
+
+  # T-CI-6: clang-format drift report for the files this change set touches.
+  #
+  # REPORT ONLY — this step must not fail the build yet. The library predates
+  # .clang-format and every file checked so far disagrees with the configured
+  # style in dozens of places (detail/refcount.hpp: 62, ttl.hpp: 38,
+  # pooled_cache.hpp: 68, ...). A hard `clang-format --dry-run --Werror` gate
+  # would therefore be red on every PR that touches any existing file, which
+  # trains people to ignore it.
+  #
+  # To turn this into a real gate:
+  #   1. run `clang-format -i` over the tree once, in its own commit
+  #      (it will be a large whitespace-only diff, so keep it isolated);
+  #   2. replace the step body below with:
+  #        clang-format --dry-run --Werror "${files[@]}"
+  lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+
+      - name: Report formatting drift on changed C++ files
+        run: |
+          set -uo pipefail
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          mapfile -t files < <(
+            git diff --name-only --diff-filter=ACMR \
+              "origin/${{ github.base_ref }}...HEAD" -- '*.hpp' '*.cpp'
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No C++ files changed — nothing to check."
+            exit 0
+          fi
+          echo "Files in this change set: ${#files[@]}"
+          total=0
+          for f in "${files[@]}"; do
+            n=$(clang-format --dry-run "$f" 2>&1 | grep -c "warning:" || true)
+            total=$((total + n))
+            printf '%6d  %s\n' "$n" "$f"
+          done
+          echo "Total formatting differences: $total"
+          echo "(informational only — see the comment above this job)"

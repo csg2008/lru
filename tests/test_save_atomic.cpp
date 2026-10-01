@@ -33,7 +33,13 @@ TEST(SaveAtomicTest, RoundTripsAllShards) {
     // save_atomic drains handles, shuts down, then snapshots.
     auto data = c.save_atomic(5s);
     EXPECT_FALSE(data.empty());
-    EXPECT_TRUE(c.is_shutdown());
+    // P1-40 (fix.01 方案 A): save_atomic() QUIESCES the cache for the duration of
+    // the snapshot and RESUMES it afterwards — it no longer shuts the cache down.
+    // The previous assertion here (`is_shutdown() == true`) pinned exactly the
+    // behaviour that let one backup job take the cache out of service until the
+    // process was restarted.
+    EXPECT_FALSE(c.is_shutdown());
+    EXPECT_FALSE(c.is_quiesced());
 
     // Load into a fresh cache.
     striped_cache<int, std::string> c2(1024, 8);
@@ -53,7 +59,13 @@ TEST(SaveAtomicTest, EmptyCacheRoundTrip) {
     striped_cache<int, std::string> c(256, 4);
     auto data = c.save_atomic(5s);
     EXPECT_FALSE(data.empty());
-    EXPECT_TRUE(c.is_shutdown());
+    // P1-40 (fix.01 方案 A): save_atomic() QUIESCES the cache for the duration of
+    // the snapshot and RESUMES it afterwards — it no longer shuts the cache down.
+    // The previous assertion here (`is_shutdown() == true`) pinned exactly the
+    // behaviour that let one backup job take the cache out of service until the
+    // process was restarted.
+    EXPECT_FALSE(c.is_shutdown());
+    EXPECT_FALSE(c.is_quiesced());
 
     striped_cache<int, std::string> c2(256, 4);
     c2.load_per_shard(data);
@@ -61,14 +73,28 @@ TEST(SaveAtomicTest, EmptyCacheRoundTrip) {
 }
 
 // ============================================================================
-// Leaves source in shutdown state
+// P1-40 (fix.01 方案 A): saving must NOT take the source cache out of service
 // ============================================================================
-TEST(SaveAtomicTest, LeavesSourceShutdown) {
+TEST(SaveAtomicTest, LeavesSourceUsable) {
     striped_cache<int, int> c(256, 4);
     for (int i = 0; i < 32; ++i) c.set(i, i);
     ASSERT_FALSE(c.is_shutdown());
     (void)c.save_atomic(5s);
-    EXPECT_TRUE(c.is_shutdown());
+
+    // Was `EXPECT_TRUE(c.is_shutdown())` — that pinned the defect.
+    EXPECT_FALSE(c.is_shutdown());
+    EXPECT_FALSE(c.is_quiesced());
+
+    // The actual point of the fix: the cache is still readable AND writable
+    // after a transactional snapshot, so a scheduled backup no longer silently
+    // removes it from service.
+    auto h = c.get(7);
+    ASSERT_TRUE(h.has_value());
+    EXPECT_EQ(*h, 7);
+    c.set(12345, 99);
+    auto h2 = c.get(12345);
+    ASSERT_TRUE(h2.has_value());
+    EXPECT_EQ(*h2, 99);
 }
 
 // ============================================================================
@@ -102,7 +128,13 @@ TEST(SaveAtomicTest, ThrowsOnHandleDrainTimeout) {
 
     // 50ms timeout is far shorter than the holder will keep the handle.
     EXPECT_THROW(c.save_atomic(50ms), std::runtime_error);
-    EXPECT_TRUE(c.is_shutdown());
+    // P1-40 (fix.01 方案 A): save_atomic() QUIESCES the cache for the duration of
+    // the snapshot and RESUMES it afterwards — it no longer shuts the cache down.
+    // The previous assertion here (`is_shutdown() == true`) pinned exactly the
+    // behaviour that let one backup job take the cache out of service until the
+    // process was restarted.
+    EXPECT_FALSE(c.is_shutdown());
+    EXPECT_FALSE(c.is_quiesced());
 
     // Let the holder release its handle so the thread can join cleanly.
     hold_release.store(true, std::memory_order_release);
@@ -144,7 +176,13 @@ TEST(SaveAtomicTest, ProductionCacheAlias) {
 
     auto data = c.save_atomic(5s);
     EXPECT_FALSE(data.empty());
-    EXPECT_TRUE(c.is_shutdown());
+    // P1-40 (fix.01 方案 A): save_atomic() QUIESCES the cache for the duration of
+    // the snapshot and RESUMES it afterwards — it no longer shuts the cache down.
+    // The previous assertion here (`is_shutdown() == true`) pinned exactly the
+    // behaviour that let one backup job take the cache out of service until the
+    // process was restarted.
+    EXPECT_FALSE(c.is_shutdown());
+    EXPECT_FALSE(c.is_quiesced());
 
     production_cache<int, std::string> c2(2048);
     c2.load_per_shard(data);

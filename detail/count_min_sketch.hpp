@@ -28,16 +28,51 @@ public:
     // width = number of counters per hash row
     // depth = number of hash functions (rows)
     // Default: width ~6*e/epsilon, depth ~ln(1/delta)/ln(2)
+    // P1-25 (fix.01 方案 A): the table is sized from the CAPACITY, matching
+    // CacheLib's MMTinyLFU:
+    //     numCounters = next_pow2(e * capacity * window_multiplier / error_threshold)
+    //     hash_count  = 4
+    //
+    // The previous configuration was (error_rate, confidence) with defaults
+    // error_rate = 0.5, confidence = 0.99, i.e. width = ceil(e/0.5) = 6 and
+    // depth = ceil(log2(1/(1-0.99))) = 7 => 42 counters TOTAL, independent of
+    // capacity. For a 1e6-item cache that is pure collision noise: frequency
+    // estimates are meaningless, so TinyLFU/W-TinyLFU admission and the
+    // Probation->Protection promotion effectively became RANDOM and both
+    // strategies degenerated into "LRU with extra bookkeeping" — they are
+    // advertised features, so this was a silent quality failure.
+    //
+    // Callers that want the old, tiny table can still ask for it explicitly;
+    // what they can no longer do is get it by accident from a capacity argument.
+    static constexpr std::size_t kDefaultWindowMultiplier = 32;
+    static constexpr double kDefaultErrorThreshold = 5.0;
+    static constexpr std::size_t kDefaultHashCount = 4;
+    /// Floor for the geometric window shrink below. Without a floor the decay
+    /// period could collapse to a handful of accesses, and since each decay
+    /// halves the WHOLE table, that would turn decay into a hot loop.
+    static constexpr std::size_t kMinWindowSize = 256;
+
+    /// Smallest power of two >= v (v >= 1). Keeps the counter count a power of
+    /// two so the modulo in index_for() is a mask.
+    static std::size_t next_pow2(std::size_t v) noexcept {
+        std::size_t p = 1;
+        while (p < v) p <<= 1;
+        return p;
+    }
+
     explicit count_min_sketch(std::size_t capacity = 1000,
-                              double error_rate = 0.5,
-                              double confidence = 0.99)
-        : max_window_size_(capacity) {
-        auto width = static_cast<std::size_t>(std::ceil(std::exp(1) / error_rate));
-        auto depth = static_cast<std::size_t>(std::ceil(std::log(1.0 / (1.0 - confidence)) / std::log(2.0)));
-        width = std::max(width, std::size_t(1));
-        depth = std::max(depth, std::size_t(1));
-        width_ = width;
-        depth_ = depth;
+                              std::size_t window_multiplier = kDefaultWindowMultiplier,
+                              double error_threshold = kDefaultErrorThreshold,
+                              std::size_t hash_count = kDefaultHashCount)
+        : max_window_size_(capacity * window_multiplier),
+          window_size_(capacity * window_multiplier) {
+        const double raw = std::exp(1.0) * static_cast<double>(capacity) *
+                           static_cast<double>(window_multiplier) / error_threshold;
+        const std::size_t counters =
+            next_pow2(raw < 1.0 ? std::size_t(1) : static_cast<std::size_t>(raw));
+        depth_ = std::max<std::size_t>(hash_count, 1);
+        // width = counters per row; at least 4 so the modulo is meaningful.
+        width_ = std::max<std::size_t>(counters / depth_, 4);
         resize_table(depth_ * width_);
         init_hash_seeds();
         recount_saturated();
@@ -73,7 +108,12 @@ public:
             // max_window_size_, attempt to claim the decay duty via CAS
             // (reset total_accesses_ to 0). Only the winning thread proceeds.
             auto old_total = total_accesses_.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (old_total < max_window_size_.load(std::memory_order_relaxed)) {
+            // P1-26 (fix.01 方案 A): the decay period is the single `window_size_`
+            // (geometrically shrinking), not `max_window_size_`. Previously the
+            // counter was reset at max_window_size_ every time, so the growth
+            // condition in recompute_size() (`total > 2 * max_window`) could never
+            // hold — growth was dead code.
+            if (old_total < window_size_.load(std::memory_order_relaxed)) {
                 return;
             }
             // Try to claim the decay duty: atomically swap total_accesses_ to 0.
@@ -132,6 +172,10 @@ public:
         }
         total_accesses_.store(0, std::memory_order_relaxed);
         decay_step_.store(0, std::memory_order_relaxed);
+        // P1-26: an explicit full decay also re-arms the window to its configured
+        // maximum, undoing any accumulated geometric shrink.
+        window_size_.store(max_window_size_.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
         recount_saturated();
     }
 
@@ -227,8 +271,20 @@ public:
 
     void set_max_window_size(std::size_t size) noexcept {
         max_window_size_.store(size, std::memory_order_relaxed);
+        // P1-26: the decay period is the live `window_size_`; setting the maximum
+        // re-arms it (so the existing callers that pass a window size keep
+        // working), and later decays shrink it geometrically from there.
+        window_size_.store(size, std::memory_order_relaxed);
     }
     std::size_t max_window_size() const noexcept { return max_window_size_.load(std::memory_order_relaxed); }
+
+    /// P1-26 (fix.01 方案 A): the LIVE decay period. Starts at
+    /// `capacity * window_multiplier` and halves on every whole-table decay down
+    /// to `kMinWindowSize`. Exposed so the geometric-shrink contract is testable
+    /// and observable rather than an internal detail.
+    std::size_t window_size() const noexcept {
+        return window_size_.load(std::memory_order_relaxed);
+    }
 
     // ====================================================================
     // S3: Serialization support — save/restore CMS internal state
@@ -350,16 +406,18 @@ private:
     // the exclusive lock and use structure_change_guard.
     void step_decay_locked() noexcept {
         structure_change_guard guard(structure_version_);
-        // Each step processes one row (depth partitions)
-        std::size_t step = decay_step_.load(std::memory_order_relaxed);
-        std::size_t row = step % depth_;
-        std::size_t base = row * width_;
-        for (std::size_t j = 0; j < width_; ++j) {
-            auto& cell = table_[base + j];
+        // P1-26: halve the WHOLE table (see step_decay_shared for why per-row
+        // ageing was wrong) and shrink the window geometrically.
+        for (std::size_t i = 0; i < table_size_; ++i) {
+            auto& cell = table_[i];
             cell.store(cell.load(std::memory_order_relaxed) >> 1,
                        std::memory_order_relaxed);
         }
-        decay_step_.store(step + 1, std::memory_order_relaxed);
+        const std::size_t w = window_size_.load(std::memory_order_relaxed);
+        if (w > kMinWindowSize) {
+            window_size_.store(std::max(w >> 1, kMinWindowSize),
+                               std::memory_order_relaxed);
+        }
         // Reset total_accesses after each decay step so that the next
         // cycle of record() calls can proceed lock-free until the threshold
         // is hit again.
@@ -376,16 +434,31 @@ private:
     // No structure_change_guard is needed here because the table dimensions
     // and hash seeds don't change. The row-halving only touches atomic
     // cells, which estimate() already reads atomically.
+    // P1-26 (fix.01 方案 A): decay the WHOLE table and shrink the window
+    // geometrically, matching CacheLib's MMTinyLFU.
+    //
+    // The previous policy halved ONE ROW per event, round-robin via decay_step_.
+    // Because estimate() takes the MINIMUM across rows, rows aged at different
+    // times yield a minimum over counts of different ages: the estimate is
+    // systematically biased low and the bias drifts. It also made the effective
+    // ageing rate depend on depth_ and let several threads advance several rows
+    // concurrently, so hot counters collapsed unpredictably. That is exactly the
+    // "strong recency-bias noise" P1-26 describes in admission decisions.
     void step_decay_shared() noexcept {
         std::shared_lock<detail::distributed_shared_mutex> read_lock(mutex_);
-        // Each step processes one row (depth partitions)
-        std::size_t step = decay_step_.fetch_add(1, std::memory_order_relaxed);
-        std::size_t row = step % depth_;
-        std::size_t base = row * width_;
-        for (std::size_t j = 0; j < width_; ++j) {
-            auto& cell = table_[base + j];
+        // Halve every counter in every row — one consistent ageing step.
+        for (std::size_t i = 0; i < table_size_; ++i) {
+            auto& cell = table_[i];
             cell.store(cell.load(std::memory_order_relaxed) >> 1,
                        std::memory_order_relaxed);
+        }
+        // Geometric window shrink: the decay period halves as well, so recent
+        // history carries proportionally more weight (CacheLib does the same,
+        // with a floor to keep decay from becoming a hot loop).
+        const std::size_t w = window_size_.load(std::memory_order_relaxed);
+        if (w > kMinWindowSize) {
+            window_size_.store(std::max(w >> 1, kMinWindowSize),
+                               std::memory_order_relaxed);
         }
         // total_accesses_ was already reset to 0 by the caller (record())
         // before entering this method, so no need to reset again.
@@ -431,6 +504,11 @@ private:
     std::size_t depth_ = 0;
     alignas(64) std::atomic<std::size_t> total_accesses_{0};
     std::atomic<std::size_t> max_window_size_{1000};
+    /// P1-25/P1-26 (fix.01 方案 A): the live decay period, initialised from
+    /// `capacity * window_multiplier` and halved on every whole-table decay
+    /// (with a kMinWindowSize floor). Distinct from max_window_size_, which
+    /// records the configured ceiling that an explicit decay() resets to.
+    std::atomic<std::size_t> window_size_{1000};
     std::atomic<std::size_t> decay_step_{0};
     // Number of cells that have reached UINT32_MAX.
     std::atomic<std::uint64_t> saturated_{0};

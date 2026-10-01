@@ -66,33 +66,53 @@
 #include "tiered_storage.hpp"
 #include "warm_cache.hpp"
 
-// Version info
-#define LRU_CACHE_VERSION_MAJOR 4
+// Version info.
+//
+// Must match `project(lru_cache VERSION ...)` in CMakeLists.txt. The two were
+// previously out of step (1.0.0 there, 4.x here), so the installed
+// lru_cache-config-version.cmake advertised a different version than the
+// headers reported at runtime and a downstream `find_package(lru_cache 4)`
+// failed against a package whose headers claimed 4.0.0.
+#define LRU_CACHE_VERSION_MAJOR 1
 #define LRU_CACHE_VERSION_MINOR 0
 #define LRU_CACHE_PATCH 0
 
 namespace lru {
 
 /// Library version string.
-inline constexpr char version_string[] = "4.0.0";
+inline constexpr char version_string[] = "1.0.0";
 
 /// Library version number (MAJOR * 10000 + MINOR * 100 + PATCH).
-inline constexpr int version_number = 40000;
+inline constexpr int version_number = 10000;
 
 // ============================================================================
-// P0-A: Default hash — well-mixed to prevent hot shards.
+// Default hash — well-mixed to prevent hot shards.
 // ============================================================================
-// Previously every alias used `std::hash<Key>`, which for integer keys is the
-// identity function (`std::hash<int>{}(i) == i`). Combined with
-// `sharded_mm_lru::shard_for(key) = Hash{}(key) % num_shards_` (no extra
-// mixing — see R-9), sequential integer keys (auto-increment IDs, timestamps,
-// round-robin counters) all landed on the first N shards, producing severe
-// hot-shard skew under 32+ thread read contention.
+// Every alias used to default to `std::hash<Key>`, which for integer keys is
+// the identity function (`std::hash<int>{}(i) == i`). Sequential integer keys
+// (auto-increment IDs, timestamps, round-robin counters) then produced
+// severely skewed access under 32+ thread read contention.
 //
-// `default_hash` selects `ankerl::unordered_dense::hash` when available
-// (high-quality splitmix64-based mixing, already a library dependency) and
-// falls back to `std::hash<Key>` otherwise. Callers can always override by
-// passing an explicit Hash template parameter.
+// Two independent layers now guard against that:
+//
+//   1. `default_hash` below selects `ankerl::unordered_dense::hash` when
+//      available (splitmix64-based mixing, already a library dependency) and
+//      falls back to `std::hash<Key>` otherwise.
+//   2. `sharded_mm_lru::shard_for_hash()` additionally overlays splitmix64 on
+//      whatever the caller's hash produced, controlled by
+//      `sharded_mm_lru_config::mix_shard_hash` (default: true). That is
+//      deliberate defence-in-depth for callers who pass an identity hash
+//      explicitly; see the comment on that option for why mixing is safe even
+//      when `max_size < num_shards`.
+//
+// Callers can always override the hash by passing an explicit Hash template
+// parameter. Note that with (2) enabled by default, an identity hash is no
+// longer the hazard it once was — but supplying a well-mixed hash still saves
+// the redundant second mix.
+//
+// When ankerl is unavailable, `default_hash` degrades to `std::hash<Key>` and
+// the fallback is visible at runtime through `diagnostics_text()` /
+// `hot_shards()`; layer (2) remains in effect regardless.
 #if defined(LRU_HAS_WELL_MIXED_HASH)
 template <typename Key>
 using default_hash = ankerl::unordered_dense::hash<Key>;
@@ -603,36 +623,6 @@ using striped_unified_compact_cache = unified_cache<compact_unified_sharded_lru_
 
 namespace detail {
 
-/// Helper: determine the mm_type_id for a given MM type at compile time.
-template <typename MM> struct mm_type_id_for;
-template <typename K, typename V, typename H, typename E, typename P, bool S>
-struct mm_type_id_for<mm_lru<K, V, H, E, P, S>> {
-    static constexpr mm_type_id value = mm_type_id::lru;
-};
-template <typename K, typename V, typename H, typename E, typename P, bool S>
-struct mm_type_id_for<mm_2q<K, V, H, E, P, S>> {
-    static constexpr mm_type_id value = mm_type_id::two_q;
-};
-template <typename K, typename V, typename H, typename E, typename P, bool S>
-struct mm_type_id_for<mm_tiny_lfu<K, V, H, E, P, S>> {
-    static constexpr mm_type_id value = mm_type_id::tiny_lfu;
-};
-template <typename K, typename V, typename H, typename E, typename P, bool S>
-struct mm_type_id_for<mm_wtiny_lfu<K, V, H, E, P, S>> {
-    static constexpr mm_type_id value = mm_type_id::w_tiny_lfu;
-};
-template <typename K, typename V, typename H, typename E, typename P, bool S>
-struct mm_type_id_for<mm_fifo<K, V, H, E, P, S>> {
-    static constexpr mm_type_id value = mm_type_id::fifo;
-};
-template <typename K, typename V, typename H, typename E, typename P, bool S>
-struct mm_type_id_for<sharded_mm_lru<K, V, H, E, P, S>> {
-    static constexpr mm_type_id value = mm_type_id::sharded_lru;
-};
-
-template <typename MM>
-inline constexpr mm_type_id mm_type_id_v = mm_type_id_for<MM>::value;
-
 /// Collect a cache_snapshot from an MM object (to be called under read lock).
 template <typename MM>
 auto collect_snapshot(const MM& mm) {
@@ -709,8 +699,6 @@ auto collect_snapshot(const MM& mm) {
 /// Collect a snapshot from a sharded_mm_lru (per-shard snapshots).
 template <typename MM>
 auto collect_sharded_snapshot(const MM& mm) {
-    using Key = typename MM::key_type;
-    using Value = typename MM::mapped_type;
     using shard_type = typename MM::shard_type;
 
     // Collect per-shard serialized data
@@ -752,80 +740,6 @@ auto collect_sharded_snapshot(const MM& mm) {
     return w.release();
 }
 
-/// Rebuild an MM object from parsed_deserialization_data (to be called under
-/// write lock). The parsed data was obtained from parse_serialized_data()
-/// without any lock.
-template <typename MM>
-void rebuild_from_parsed(MM& mm, const parsed_deserialization_data<typename MM::key_type, typename MM::mapped_type>& parsed) {
-    using Key = typename MM::key_type;
-    using Value = typename MM::mapped_type;
-    constexpr auto type_id = mm_type_id_v<MM>;
-
-    mm.flush();
-
-    if constexpr (type_id == mm_type_id::lru) {
-        auto new_cfg = mm.config();
-        new_cfg.lru_insertion_point_spec = parsed.config.lru_insertion_point_spec;
-        new_cfg.update_on_read = parsed.config.update_on_read;
-        new_cfg.update_on_write = parsed.config.update_on_write;
-        new_cfg.try_lock_update = parsed.config.try_lock_update;
-        new_cfg.lru_refresh_ratio = parsed.config.lru_refresh_ratio;
-        new_cfg.mm_reconfigure_interval_secs = parsed.config.mm_reconfigure_interval_secs;
-        new_cfg.default_lru_refresh_time = parsed.config.lru_refresh_time;
-
-        uint32_t ins_pos = parsed.list_state.insertion_point_pos;
-        uint32_t tail_sz = parsed.list_state.tail_size;
-
-        mm.rebuild_from_serialized(parsed.items.begin(), parsed.items.end(), ins_pos, tail_sz);
-        mm.set_config(new_cfg);
-    } else if constexpr (type_id == mm_type_id::two_q) {
-        auto new_cfg = mm.config();
-        new_cfg.update_on_read = parsed.config.update_on_read;
-        new_cfg.update_on_write = parsed.config.update_on_write;
-        new_cfg.try_lock_update = parsed.config.try_lock_update;
-        new_cfg.lru_refresh_ratio = parsed.config.lru_refresh_ratio;
-        new_cfg.mm_reconfigure_interval_secs = parsed.config.mm_reconfigure_interval_secs;
-        new_cfg.hot_ratio = parsed.config.hot_ratio;
-        new_cfg.warm_ratio = parsed.config.warm_ratio;
-        new_cfg.rebalance_on_record_access = parsed.config.rebalance_on_record_access;
-        new_cfg.default_lru_refresh_time = parsed.config.lru_refresh_time;
-        mm.set_config(new_cfg);
-
-        mm.rebuild_from_serialized(parsed.items.begin(), parsed.items.end());
-    } else if constexpr (type_id == mm_type_id::fifo) {
-        for (const auto& item : parsed.items) {
-            mm.set(item.key, std::move(item.value));
-        }
-    } else if constexpr (type_id == mm_type_id::tiny_lfu) {
-        auto new_cfg = mm.config();
-        new_cfg.lru_refresh_ratio = parsed.config.lru_refresh_ratio;
-        new_cfg.cms_error_rate = parsed.config.cms_error_rate;
-        new_cfg.try_lock_update = parsed.config.try_lock_update;
-        new_cfg.default_lru_refresh_time = parsed.config.lru_refresh_time;
-        mm.set_config(new_cfg);
-
-        if (!parsed.cms_state.empty()) {
-            auto it = parsed.cms_state.begin();
-            mm.sketch_mut().load_state(it);
-        }
-
-        mm.rebuild_from_serialized(parsed.items.begin(), parsed.items.end());
-    } else if constexpr (type_id == mm_type_id::w_tiny_lfu) {
-        auto new_cfg = mm.config();
-        new_cfg.lru_refresh_ratio = parsed.config.lru_refresh_ratio;
-        new_cfg.cms_error_rate = parsed.config.cms_error_rate;
-        new_cfg.try_lock_update = parsed.config.try_lock_update;
-        new_cfg.default_lru_refresh_time = parsed.config.lru_refresh_time;
-        mm.set_config(new_cfg);
-
-        if (!parsed.cms_state.empty()) {
-            auto it = parsed.cms_state.begin();
-            mm.sketch_mut().load_state(it);
-        }
-
-        mm.rebuild_from_serialized(parsed.items.begin(), parsed.items.end());
-    }
-}
 
 /// Parse sharded LRU binary data into per-shard parsed data.
 /// Only v5 format is supported.
@@ -1076,7 +990,20 @@ unified_cache<Trait, Key, Value, Hash, KeyEqual>::save_atomic(
         //    snapshot would not be safely reproducible and continuing
         //    could deadlock if the handle holder is blocked on this
         //    thread.
-        const bool drained = shutdown_and_wait(handle_drain_timeout);
+        // P1-40 (fix.01 方案 A): QUIESCE, do not shut down.
+        //
+        // This used to call shutdown_and_wait(), which sets `closed_`
+        // permanently — so one backup job silently took the cache out of service
+        // until the process was restarted, even though the surrounding docs
+        // promised service could resume. quiesce() establishes exactly what the
+        // snapshot needs (no writers, no outstanding handles) and is reversible.
+        //
+        // The RAII guard is essential, not cosmetic: if the drain times out we
+        // throw below, and without it the cache would be left silently unable to
+        // accept writes — strictly worse than the old behaviour, which at least
+        // reported itself through is_shutdown().
+        detail::scope_exit resume_guard{[this] { resume(); }};
+        const bool drained = quiesce(handle_drain_timeout);
         if (!drained) {
             throw std::runtime_error(
                 "save_atomic: timeout waiting for active read_handles "

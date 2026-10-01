@@ -21,6 +21,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "atomic_shared_ptr.hpp"
+
 namespace lru::detail {
 
 // ============================================================================
@@ -148,27 +150,53 @@ scope_exit<F> make_scope_exit(F&& f) {
 
 /// A sequence lock optimized for read-heavy workloads where writers are rare.
 /// Readers retry if a write was in progress during their read.
-/// Writers acquire exclusive access by incrementing the sequence to an odd
-/// value, performing the write, then incrementing to the next even value.
+///
+/// The sequence word packs a writer-active bit (the top bit) with a
+/// monotonically increasing sequence in the low bits. A writer must claim
+/// the writer bit before bumping the sequence. Without that claim two
+/// concurrent writers can leave the low bits even (0 -> 1 -> 2) while one
+/// of them is still mutating the protected data, so a reader that sampled
+/// the even value would accept torn data as consistent. The Linux kernel
+/// seqlock this is modelled on relies on an outer spinlock for exactly this
+/// reason; folding the claim into the same atomic keeps the type at one
+/// 4-byte word.
 ///
 /// This is ideal for cache_stats::consistent_snapshot() where:
 ///   - All counter updates are atomic (lock-free writes)
 ///   - Snapshots need consistent reads across multiple counters
 ///   - Writes to the snapshot lock are rare (only during reset_counters)
 ///
-/// Based on the Linux kernel seqlock design.
+/// The writer claim spins rather than blocking. A blocking writer lock
+/// would deadlock `cache_stats::operator=` for two threads running
+/// `a = b` and `b = a` concurrently, which take the two snapshot locks in
+/// opposite orders; use dual_seqlock_write_guard() for that case.
 class seqlock {
 public:
+    static constexpr std::uint32_t kWriterBit = 0x8000'0000u;
+    static constexpr std::uint32_t kSeqMask = ~kWriterBit;
+
     seqlock() : seq_(0) {}
 
     /// Begin a read section. Returns the current sequence number.
-    /// If the sequence is odd, a write is in progress — spin until even.
+    ///
+    /// P1-7 (fix.01 方案 A): this is a plain load — it deliberately does NOT
+    /// wait for an in-progress writer, and never sleeps. Waiting here inverted
+    /// the entire point of a seqlock: one preempted writer put *every* reader
+    /// to sleep for microseconds-to-milliseconds, so a rare writer could
+    /// wreck P99 for all readers.
+    ///
+    /// The standard optimistic protocol is used instead:
+    ///     do { seq = read_begin(); ...read payload...; } while (read_retry(seq));
+    ///
+    /// This is sound because `read_retry()` compares the entire sequence word,
+    /// and a writer advances it *twice* per critical section — once when it
+    /// claims the writer bit (low bits go odd) and once on release (write_unlock
+    /// stores `cur + 1`, clearing the bit). A sequence sampled while a writer is
+    /// active therefore can never compare equal afterwards:
+    ///   - sampled `kWriterBit | (S+1)` -> on release the word becomes `S+2`
+    ///   - sampled `S` (writer not yet claimed) -> after a full cycle it is `S+2`
     std::uint32_t read_begin() const noexcept {
-        std::uint32_t s;
-        do {
-            s = seq_.load(std::memory_order_acquire);
-        } while (s & 1);  // Wait until no writer
-        return s;
+        return seq_.load(std::memory_order_acquire);
     }
 
     /// Check if a read section needs to be retried.
@@ -178,16 +206,37 @@ public:
         return seq_.load(std::memory_order_relaxed) != start_seq;
     }
 
-    /// Acquire write access. Increments sequence to odd value.
+    /// Claim exclusive write access and enter the critical section
+    /// (sequence low bits become odd). Only one writer can hold the claim.
     void write_lock() noexcept {
-        std::uint32_t s = seq_.fetch_add(1, std::memory_order_acq_rel);
-        // s must be even — no nested writes allowed
-        (void)s;
+        std::uint32_t cur = seq_.load(std::memory_order_relaxed);
+        for (;;) {
+            int spins = 0;
+            while (cur & kWriterBit) {
+                if (++spins < 64) {
+                    std::this_thread::yield();
+                } else {
+                    std::this_thread::sleep_for(std::chrono::microseconds(1));
+                }
+                cur = seq_.load(std::memory_order_relaxed);
+            }
+            // Set the writer bit and bump the low bits to odd in one step.
+            const std::uint32_t desired =
+                kWriterBit | ((cur & kSeqMask) + 1u);
+            if (seq_.compare_exchange_weak(cur, desired,
+                    std::memory_order_acquire, std::memory_order_relaxed)) {
+                return;
+            }
+            // cur was refreshed by the failed CAS — re-check the writer bit.
+        }
     }
 
-    /// Release write access. Increments sequence to even value.
+    /// Leave the critical section: sequence low bits become even and the
+    /// writer claim is released, in a single store so no reader can observe
+    /// "sequence even but writer still active".
     void write_unlock() noexcept {
-        seq_.fetch_add(1, std::memory_order_release);
+        const std::uint32_t cur = seq_.load(std::memory_order_relaxed);
+        seq_.store((cur + 1u) & kSeqMask, std::memory_order_release);
     }
 
     /// RAII write guard
@@ -203,6 +252,38 @@ public:
 
 private:
     std::atomic<std::uint32_t> seq_;
+};
+
+/// Acquire write guards on two seqlocks in address order.
+///
+/// `cache_stats::operator=` guards both `this` and `other`. Two threads
+/// running `a = b` and `b = a` concurrently would take those two claims in
+/// opposite orders, so any exclusive writer lock — spinning or blocking —
+/// would hang both threads. Ordering the acquisition by address makes the
+/// order a total order, which removes the cycle. Handles the self-assignment
+/// case (identical address) by taking the claim only once.
+class dual_seqlock_write_guard {
+public:
+    dual_seqlock_write_guard(seqlock& a, seqlock& b) noexcept
+        : first_(&a), second_(&b) {
+        if (first_ == second_) {
+            second_ = nullptr;
+        } else if (std::less<seqlock*>{}(second_, first_)) {
+            std::swap(first_, second_);
+        }
+        first_->write_lock();
+        if (second_) second_->write_lock();
+    }
+    ~dual_seqlock_write_guard() {
+        if (second_) second_->write_unlock();
+        first_->write_unlock();
+    }
+    dual_seqlock_write_guard(const dual_seqlock_write_guard&) = delete;
+    dual_seqlock_write_guard& operator=(const dual_seqlock_write_guard&) = delete;
+
+private:
+    seqlock* first_;
+    seqlock* second_;
 };
 
 // ============================================================================
@@ -567,6 +648,44 @@ private:
 };
 
 // ============================================================================
+// P0-1 (fix.01 方案 C): Non-striped storage placeholder for striped_mutex_storage
+// ============================================================================
+//
+// unified_cache<Trait, K, V> stores its striped lock array in a member whose
+// type is `std::conditional_t<is_striped, lock_policy::striped_mutex_type, X>`.
+//
+// Historically X was `std::tuple<>`, which forced every constructor to
+// initialise the member from a static factory that returned the member type by
+// value:
+//
+//     , striped_mutex_(make_default_striped_mutex())
+//
+// That works only when the compiler applies guaranteed copy elision to a
+// `[[no_unique_address]]` member.  GCC does not (long-standing PR98995, still
+// open for GCC 14/15/16/17 — "copy elision not applied to members declared with
+// [[no_unique_address]]"), so the deleted move constructor of
+// `lazy_striped_mutex` (which holds a non-movable std::once_flag) made the whole
+// library fail to compile with g++ for every striped alias
+// (production_cache / striped_cache / segmented_* / f14_striped_cache /
+// read_heavy_striped_cache).
+//
+// The fix is to make the storage type uniformly constructible from a stripe
+// count, so the member can be *directly initialised* — no factory, no prvalue
+// of the member type, and therefore no reliance on copy elision at all:
+//
+//     , striped_mutex_(lock_policy::default_num_stripes)   // striped
+//     , striped_mutex_(num_stripes)                        // striped
+//     , striped_mutex_(any_count)                          // non-striped -> no-op
+//
+// `no_striped_mutex` is deliberately an *empty* class with no member functions,
+// so every `if constexpr (requires { striped_mutex_.foo(); })` probe in
+// cache_trait.hpp keeps exactly the same answer it had with `std::tuple<>`.
+// Combined with [[no_unique_address]] it occupies no storage.
+struct no_striped_mutex {
+    explicit constexpr no_striped_mutex(std::size_t = 0) noexcept {}
+};
+
+// ============================================================================
 // T-P3-5: Lazy-allocated striped_mutex wrapper
 // ============================================================================
 //
@@ -755,7 +874,8 @@ private:
 template <typename MutexType>
 struct striped_mutex_write_all_guard {
     striped_mutex<MutexType>& sm;
-    explicit striped_mutex_write_all_guard(striped_mutex<MutexType>& sm) : sm(sm) { sm.lock_all(); }
+    // Parameter named `m` (not `sm`) to avoid shadowing the member.
+    explicit striped_mutex_write_all_guard(striped_mutex<MutexType>& m) : sm(m) { sm.lock_all(); }
     ~striped_mutex_write_all_guard() { sm.unlock_all(); }
     striped_mutex_write_all_guard(const striped_mutex_write_all_guard&) = delete;
     striped_mutex_write_all_guard& operator=(const striped_mutex_write_all_guard&) = delete;
@@ -766,7 +886,8 @@ struct striped_mutex_write_all_guard {
 template <typename MutexType>
 struct striped_mutex_read_all_guard {
     striped_mutex<MutexType>& sm;
-    explicit striped_mutex_read_all_guard(striped_mutex<MutexType>& sm) : sm(sm) { sm.lock_shared_all(); }
+    // Parameter named `m` (not `sm`) to avoid shadowing the member.
+    explicit striped_mutex_read_all_guard(striped_mutex<MutexType>& m) : sm(m) { sm.lock_shared_all(); }
     ~striped_mutex_read_all_guard() { sm.unlock_shared_all(); }
     striped_mutex_read_all_guard(const striped_mutex_read_all_guard&) = delete;
     striped_mutex_read_all_guard& operator=(const striped_mutex_read_all_guard&) = delete;
@@ -785,7 +906,8 @@ public:
                              std::chrono::milliseconds interval)
         : task_(std::move(task))
         , interval_(interval)
-        , running_(true) {
+        , running_(true)
+        , interval_changed_at_(std::chrono::steady_clock::now()) {
         thread_ = std::thread([this] { run(); });
     }
 
@@ -812,47 +934,87 @@ public:
 
     bool is_running() const noexcept { return running_.load(); }
 
-    // Change the interval dynamically
+    // Change the interval dynamically.
+    //
+    // P1-39: the notification is only a hint to *re-evaluate the deadline*; it
+    // must not be interpreted by run() as "the interval elapsed", otherwise
+    // every reconfiguration runs the task one extra time (for a TTL cleaner or
+    // drain worker that means a full extra pass over every shard).
     void set_interval(std::chrono::milliseconds new_interval) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             interval_ = new_interval;
+            // Anchor the deadline at the moment of the change so that
+            // *shortening* the interval takes effect immediately (the deadline
+            // may already be in the past) while *lengthening* it does not
+            // trigger an early run.
+            interval_changed_at_ = std::chrono::steady_clock::now();
         }
         cv_.notify_all();
     }
 
+    /// Install the exception handler invoked when the task throws.
+    ///
+    /// P1-39 (fix.01 方案 A): the handler is published through an atomic
+    /// shared_ptr, because the worker thread reads it (in `run()`) while any
+    /// thread may replace it here. The previous code read and wrote a plain
+    /// `std::function` with no synchronization — a data race that could let the
+    /// worker observe a half-constructed `std::function` (UB). The reader takes
+    /// one RCU-style snapshot per tick, so an already-running tick may still
+    /// invoke the previous handler, which is harmless.
     void on_error(std::function<void(std::exception_ptr)> handler) {
-        error_handler_ = std::move(handler);
+        error_handler_.store(
+            std::make_shared<std::function<void(std::exception_ptr)>>(std::move(handler)));
     }
 
 private:
     void run() {
         std::unique_lock<std::mutex> lock(mutex_);
         while (running_.load()) {
-            if (cv_.wait_for(lock, interval_, [this] { return !running_.load(); })) {
-                break; // stopped
-            }
-            if (running_.load()) {
-                lock.unlock();
-                try {
-                    task_();
-                } catch (...) {
-                    if (error_handler_) {
-                        error_handler_(std::current_exception());
-                    }
+            // P1-39: wait on an absolute DEADLINE rather than on "a
+            // notification arrived". A notification from set_interval() (or a
+            // spurious wake-up) merely causes a re-evaluation of the deadline;
+            // the task runs only once the deadline has genuinely passed.
+            auto deadline = interval_changed_at_ + interval_;
+            while (running_.load()) {
+                if (cv_.wait_until(lock, deadline,
+                                   [this] { return !running_.load(); })) {
+                    return;  // stopped
                 }
-                lock.lock();
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    break;  // the interval genuinely elapsed
+                }
+                // Early wake-up: either spurious or an interval change. Re-anchor
+                // to the (possibly new) interval; if the new deadline is already
+                // in the past the next wait_until returns immediately.
+                deadline = interval_changed_at_ + interval_;
             }
+            if (!running_.load()) return;
+            lock.unlock();
+            try {
+                task_();
+            } catch (...) {
+                auto handler = error_handler_.load();
+                if (handler && *handler) {
+                    (*handler)(std::current_exception());
+                }
+            }
+            lock.lock();
+            // The next period starts when this run finished.
+            interval_changed_at_ = std::chrono::steady_clock::now();
         }
     }
 
     std::function<void()> task_;
-    std::function<void(std::exception_ptr)> error_handler_;
+    atomic_shared_ptr<std::function<void(std::exception_ptr)>> error_handler_;
     std::chrono::milliseconds interval_;
     std::atomic<bool> running_;
     std::mutex mutex_;
     std::condition_variable cv_;
     std::thread thread_;
+    /// Time origin for the current wait: construction, the last set_interval(),
+    /// or the end of the previous run. Guarded by mutex_.
+    std::chrono::steady_clock::time_point interval_changed_at_;
 };
 
 // ============================================================================

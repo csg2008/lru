@@ -5,9 +5,9 @@
 // Design inspired by Maged Michael's hazard pointer methodology and
 // Facebook CacheLib's reclamation infrastructure.
 //
-// v4.2: Lock-free retire path with thread-local buffering (no mutex),
-//       hazptr_obj_base for zero-allocation retirement, and thread-local
-//       slot cache for O(1) acquire/release on the fast path.
+// Lock-free retire path with thread-local buffering (no mutex),
+// hazptr_obj_base for zero-allocation retirement, and thread-local
+// slot cache for O(1) acquire/release on the fast path.
 
 #ifndef LRU_DETAIL_HAZPTR_HPP
 #define LRU_DETAIL_HAZPTR_HPP
@@ -394,8 +394,20 @@ public:
                     return npos;
                 }
                 (void)try_reclaim();
-                // Reset spin budget for the next fallback round.
-                spin_retries = 0;
+                // P1-12/P1-5 (measured defect): do NOT re-grant the spin budget
+                // here. Resetting `spin_retries` to 0 after every sync fallback
+                // let the loop run kMaxSpinRetries full-table scans *per*
+                // fallback round, i.e. ~1024 x 64 = 65,536 scans of the whole
+                // slot table — measured 66,625 scans = 546 million
+                // compare_exchange probes, 4.1 s per call even at -O2 (and ~200 s
+                // at -O0). That is exactly the "degrade gracefully" path, so
+                // burning minutes of CPU (and inflating slot_exhaustion_count_ by
+                // 1000x) before returning npos defeats its purpose.
+                //
+                // Keeping `spin_retries` monotonic bounds the whole path to
+                // about kMaxSpinRetries + kMaxSyncFallbacks scans while
+                // preserving the intended sequence: bounded spin, then bounded
+                // sync-reclaim fallbacks, then npos.
                 std::this_thread::yield();
                 continue;
             }
@@ -551,54 +563,27 @@ public:
     /// added by T3.4 in cache_trait.hpp).
     void retire_obj(hazptr_obj_base* obj) {
         if (!obj) return;
+        if (!claim_retired(obj)) return;
+        push_retired(obj);
+    }
 
-        // P1-7: Idempotent guard — only the first caller proceeds.
-        // CAS on `retired_` from false → true; if it was already true,
-        // the object is already in a TLS retire buffer (or pending list)
-        // and a second push would corrupt the chain via `next_`.
-        bool expected = false;
-        bool already_retired = !obj->retired_.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
-        if (already_retired) {
-            // Double-retire attempted — drop silently. This happens
-            // when two threads race on evict_lru() for the same
-            // victim after unmarkForEviction() clears kExclusive
-            // but before retire() runs. The race is benign because
-            // only one thread can possibly have a live pointer to
-            // the object's slot in the MM list (markForEviction is
-            // exclusive), but the second thread may still hold the
-            // raw `victim` pointer from find_eviction_victim().
-            return;
-        }
-
-        // P1-3: Warn once if the drain worker has not been started.
-        // Without the background drain worker, retired objects
-        // accumulate in the global pending list and are only reclaimed
-        // when maybe_auto_reclaim() fires (after pending_count exceeds
-        // 4096) or when a thread explicitly calls try_reclaim(). In
-        // read-heavy-write-light workloads this causes unbounded memory
-        // growth — the worker is REQUIRED for production deployments.
-        // The warning fires at most once per domain via a CAS flag; it
-        // does not block retire, just alerts the operator.
-        if (!drain_started_.load(std::memory_order_acquire)) {
-            warn_drain_not_started_once();
-        }
-
-        // Push to TLS buffer (no mutex, no CAS)
-        auto& buf = tls_retire_buf();
-        // If the buffer currently belongs to a different domain, flush it
-        // to that domain first so entries are routed to the correct pending
-        // list. This preserves correctness when a thread interacts with
-        // multiple domains (rare in practice; default_domain is the norm).
-        if (buf.count > 0 && buf.owner_domain != nullptr && buf.owner_domain != this) {
-            buf.owner_domain->flush_tls_buffer();
-        }
-        buf.owner_domain = this;
-        buf.entries[buf.count++] = obj;
-
-        if (buf.full()) {
-            flush_tls_buffer();
-        }
+    /// Retire an object whose deleter is supplied here.
+    ///
+    /// P1-9 (fix.01 方案 A): the deleter is stored into `obj->reclaim_` ONLY by
+    /// the thread that wins the `retired_` claim. Previously `retire<T>()`
+    /// wrote `obj->reclaim_` *before* calling `retire_obj()`, so a second
+    /// (stale-pointer) retire could overwrite the winner's deleter with a
+    /// different one — e.g. `retire<Derived>` racing `retire<Base>`, or a
+    /// different allocator's deleter. The object was then destroyed through the
+    /// wrong destructor / wrong allocator: heap corruption whose symptom appears
+    /// much later and nowhere near the cause.
+    void retire_obj(hazptr_obj_base* obj, void (*reclaim)(hazptr_obj_base*)) {
+        if (!obj) return;
+        if (!claim_retired(obj)) return;
+        // Published only after winning the claim, so it can never be clobbered
+        // by a loser of the race.
+        obj->reclaim_ = reclaim;
+        push_retired(obj);
     }
 
     /// P1-3: Mark the drain worker as started. Called by
@@ -625,17 +610,20 @@ public:
         if (!ptr) return;
 
         if constexpr (is_hazptr_obj_v<T>) {
-            // Zero-allocation path: T inherits from hazptr_obj_base
-            auto* obj = static_cast<hazptr_obj_base*>(ptr);
-            obj->reclaim_ = [](hazptr_obj_base* p) { delete static_cast<T*>(p); };
-            retire_obj(obj);
+            // Zero-allocation path: T inherits from hazptr_obj_base.
+            // P1-9: the deleter is handed to retire_obj() so it is stored only
+            // after this caller wins the `retired_` claim.
+            retire_obj(static_cast<hazptr_obj_base*>(ptr),
+                       [](hazptr_obj_base* p) { delete static_cast<T*>(p); });
         } else {
             // Heap-allocating wrapper for backward compatibility
             struct retire_wrapper : hazptr_obj_base {
                 T* wrapped_ptr;
                 explicit retire_wrapper(T* p) : wrapped_ptr(p) {
-                    reclaim_ = [](hazptr_obj_base* p) {
-                        auto* self = static_cast<retire_wrapper*>(p);
+                    // Lambda parameter named `raw` (not `p`) to avoid shadowing
+                    // the constructor parameter `p`.
+                    reclaim_ = [](hazptr_obj_base* raw) {
+                        auto* self = static_cast<retire_wrapper*>(raw);
                         delete self->wrapped_ptr;
                         delete self;
                     };
@@ -732,7 +720,6 @@ public:
         std::size_t reclaimed_count = 0;
         hazptr_obj_base* new_head = nullptr;  // re-chain protected entries
         hazptr_obj_base* new_tail = nullptr;
-        std::size_t remaining_count = 0;
         std::size_t processed = 0;  // T-P2-3 (R-7): batch counter
 
         hazptr_obj_base* curr = head;
@@ -764,7 +751,6 @@ public:
                     new_tail->next_ = curr;
                     new_tail = curr;
                 }
-                ++remaining_count;
             }
             curr = next;
             ++processed;
@@ -789,10 +775,9 @@ public:
                     new_tail = new_tail->next_;
                 }
             }
-            // Count the unprocessed objects for pending_count_ accounting.
-            for (hazptr_obj_base* p = curr; p; p = p->next_) {
-                ++remaining_count;
-            }
+            // P1-10: no need to count the unprocessed tail — the ledger is
+            // released by the number reclaimed, and push_pending() below
+            // re-reserves exactly these objects.
         }
 
         // Push remaining protected entries back to the global list
@@ -802,15 +787,35 @@ public:
 
         // Update statistics (relaxed, hot path is try_reclaim itself)
         reclaim_total_.fetch_add(reclaimed_count, std::memory_order_relaxed);
-        pending_count_.store(remaining_count, std::memory_order_release);
+        // P1-10 (fix.01 方案 C): RELEASE exactly what was reclaimed instead of
+        // storing a recomputed remainder. try_reclaim() removed the whole
+        // pending list from the global chain, so the ledger must drop by the
+        // number of objects actually freed; the protected ones were pushed back
+        // and are already accounted for by push_pending().
+        pending_release(reclaimed_count);
 
         return reclaimed_count;
     }
 
     /// Return the current number of pending (unreclaimed) retired objects.
     /// This is a snapshot — the actual count may change concurrently.
+    ///
+    /// P1-10 (fix.01 方案 C): the ledger is sharded, and each shard stores a
+    /// signed DELTA (pushes add, reclaims subtract) rather than a count. That is
+    /// what makes sharding safe: the thread that reclaims is generally not the
+    /// thread that pushed, so an individual shard can legitimately be negative.
+    /// Only the sum is meaningful. Reading sums the shards; the value is a
+    /// snapshot, so a perfectly consistent reading is not possible and not
+    /// needed (it drives an approximate backlog signal and the auto-reclaim
+    /// threshold).
     std::size_t pending_count() const noexcept {
-        return pending_count_.load(std::memory_order_acquire);
+        std::ptrdiff_t total = 0;
+        for (const auto& shard : pending_shards_) {
+            total += shard.value.load(std::memory_order_acquire);
+        }
+        // Clamp: a transient negative sum can only mean the ledger is being
+        // read mid-update.
+        return total > 0 ? static_cast<std::size_t>(total) : 0;
     }
 
     /// Return the cumulative number of objects reclaimed since the domain
@@ -845,9 +850,26 @@ public:
     }
 
     /// Obtain the default global hazard pointer domain.
+    ///
+    /// P1-11 (fix.01 方案 A): the default domain is intentionally NEVER
+    /// destroyed — it is leaked at process exit on purpose.
+    ///
+    /// Rationale: the domain owns the global pending list, TLS retire buffers
+    /// and hazard slots that other threads may still reference while they are
+    /// shutting down. A function-local static would run ~hazptr_domain() during
+    /// static destruction, which calls reclaim_all_pending() and frees objects
+    /// that a still-exiting thread can be about to touch through its own TLS
+    /// retire buffer (`owner_domain->flush_tls_buffer()` in the buffer's
+    /// destructor) — a use-after-free / double-free whose only symptom is a
+    /// crash at process exit. Skipping destruction removes the ordering
+    /// dependency entirely. This mirrors the `process_lifetime` strategy already
+    /// used by the TLS rings (see `lru/tls_ring.hpp`).
+    ///
+    /// The cost is bounded and one-off: whatever is still pending at exit is not
+    /// freed (the OS reclaims the process address space anyway).
     static hazptr_domain& default_domain() {
-        static hazptr_domain domain;
-        return domain;
+        static hazptr_domain* domain = new hazptr_domain();
+        return *domain;
     }
 
     // Allow hazptr_holder to access internal helpers.
@@ -996,23 +1018,6 @@ private:
     }
 
     // ---- Protected pointer utilities --------------------------------------
-
-    /// Check whether a pointer is currently protected by any hazard slot.
-    /// O(max_slots) scan — used only in the fast-path of single-pointer checks.
-    bool is_protected(void* ptr) const {
-        std::size_t nb = num_batches_.load(std::memory_order_acquire);
-        for (std::size_t b = 0; b < nb; ++b) {
-            for (std::size_t j = 0; j < kBatchSize; ++j) {
-                if (used_batches_[b][j].load(std::memory_order_acquire)) {
-                    if (slot_batches_[b][j].load(std::memory_order_acquire) == ptr) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
     /// Build a sorted vector of all currently protected pointers.
     /// Replaces the old std::unordered_set — avoids hash computation and
     /// per-bucket heap allocation. Binary search gives O(log n) lookups.
@@ -1084,7 +1089,7 @@ private:
             // Retry with the new pending_head_ value.
         }
 
-        pending_count_.fetch_add(chain_len, std::memory_order_release);
+        pending_add(chain_len);
 
         // P1-3 (T1.4): Auto-reclaim when pending_count exceeds threshold.
         // The check is on every push_pending() (called from flush_tls_buffer
@@ -1114,7 +1119,9 @@ private:
         }
         if (reclaimed > 0) {
             reclaim_total_.fetch_add(reclaimed, std::memory_order_relaxed);
-            pending_count_.store(0, std::memory_order_release);
+            // P1-10: release what was actually removed rather than zeroing the
+            // ledger (producers may still be pushing concurrently).
+            pending_release(reclaimed);
         }
     }
 
@@ -1130,7 +1137,7 @@ private:
         const std::size_t threshold = reclaim_threshold_.load(std::memory_order_acquire);
         // threshold == max() effectively disables auto-reclaim.
         if (threshold == std::numeric_limits<std::size_t>::max()) return;
-        const std::size_t pending = pending_count_.load(std::memory_order_acquire);
+        const std::size_t pending = pending_count();
         if (pending <= threshold) return;
 
         // Try to claim the reclaim slot. CAS from false->true; if it
@@ -1147,8 +1154,61 @@ private:
         reclaim_in_progress_.store(false, std::memory_order_release);
     }
 
-    // ---- Data members -----------------------------------------------------
+    // ---- Retire internals -------------------------------------------------
 
+    /// P1-7: Idempotent-retire claim. CAS on `retired_` from false → true; the
+    /// first caller wins and every later caller becomes a no-op (a second push
+    /// would corrupt the pending chain through `next_`).
+    ///
+    /// This is deliberately a separate step from storing `reclaim_` so that the
+    /// deleter can only ever be written by the winner (P1-9).
+    ///
+    /// @return true if this caller won the claim.
+    bool claim_retired(hazptr_obj_base* obj) noexcept {
+        bool expected = false;
+        // Double-retire is expected under concurrency: two threads can race on
+        // evict_lru() for the same victim after unmarkForEviction() clears
+        // kExclusive but before retire() runs. The loser simply drops its
+        // reference — only one thread can hold a live pointer to the object's
+        // slot in the MM list (markForEviction is exclusive).
+        return obj->retired_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    /// Push an already-claimed object onto this domain's TLS retire buffer.
+    /// Extracted from retire_obj() so both retire entry points share it.
+    void push_retired(hazptr_obj_base* obj) {
+        // P1-3: Warn once if the drain worker has not been started.
+        // Without the background drain worker, retired objects
+        // accumulate in the global pending list and are only reclaimed
+        // when maybe_auto_reclaim() fires (after pending_count exceeds
+        // 4096) or when a thread explicitly calls try_reclaim(). In
+        // read-heavy-write-light workloads this causes unbounded memory
+        // growth — the worker is REQUIRED for production deployments.
+        // The warning fires at most once per domain via a CAS flag; it
+        // does not block retire, just alerts the operator.
+        if (!drain_started_.load(std::memory_order_acquire)) {
+            warn_drain_not_started_once();
+        }
+
+        // Push to TLS buffer (no mutex, no CAS)
+        auto& buf = tls_retire_buf();
+        // If the buffer currently belongs to a different domain, flush it
+        // to that domain first so entries are routed to the correct pending
+        // list. This preserves correctness when a thread interacts with
+        // multiple domains (rare in practice; default_domain is the norm).
+        if (buf.count > 0 && buf.owner_domain != nullptr && buf.owner_domain != this) {
+            buf.owner_domain->flush_tls_buffer();
+        }
+        buf.owner_domain = this;
+        buf.entries[buf.count++] = obj;
+
+        if (buf.full()) {
+            flush_tls_buffer();
+        }
+    }
+
+    // ---- Data members -----------------------------------------------------
     // Hazard pointer slots (batch-based)
     std::vector<std::unique_ptr<std::atomic<void*>[]>> slot_batches_;
     std::vector<std::unique_ptr<std::atomic<bool>[]>>  used_batches_;
@@ -1199,7 +1259,47 @@ private:
     std::atomic<hazptr_obj_base*> pending_head_{nullptr};
 
     // Statistics counters (alignas to avoid false sharing with pending_head_)
-    alignas(64) std::atomic<std::size_t> pending_count_{0};
+    //
+    // P1-10 (fix.01 方案 C): the pending backlog is a sharded reservation
+    // ledger rather than one counter that was overwritten with a recomputed
+    // remainder. The old `pending_count_.store(remaining_count)` both discarded
+    // concurrent push_pending() increments and never subtracted the objects it
+    // had just freed, so under load the value collapsed to a small number, the
+    // auto-reclaim trigger stopped firing, and the backlog grew until OOM.
+    //
+    // Each shard holds a signed delta; pushes add, reclaims subtract. Sharding
+    // keeps producer and consumer from bouncing one cache line, and each shard
+    // is padded to its own cache line to avoid false sharing between them.
+    static constexpr std::size_t kPendingCounterShards = 8;
+
+    struct alignas(64) pending_shard {
+        std::atomic<std::ptrdiff_t> value{0};
+    };
+    std::array<pending_shard, kPendingCounterShards> pending_shards_{};
+
+    /// Stable per-thread shard index (computed once per thread).
+    static std::size_t pending_shard_for_this_thread() noexcept {
+        static thread_local const std::size_t index = [] {
+            const std::size_t h =
+                std::hash<std::thread::id>{}(std::this_thread::get_id());
+            return h % kPendingCounterShards;
+        }();
+        return index;
+    }
+
+    /// Reserve `n` retired objects (called when they are linked into the
+    /// global pending list).
+    void pending_add(std::size_t n) noexcept {
+        pending_shards_[pending_shard_for_this_thread()].value.fetch_add(
+            static_cast<std::ptrdiff_t>(n), std::memory_order_release);
+    }
+
+    /// Release `n` retired objects that have been reclaimed.
+    void pending_release(std::size_t n) noexcept {
+        pending_shards_[pending_shard_for_this_thread()].value.fetch_sub(
+            static_cast<std::ptrdiff_t>(n), std::memory_order_release);
+    }
+
     alignas(64) std::atomic<std::size_t> reclaim_total_{0};
 
     // P1-3 (T1.4): Auto-reclaim threshold and stampede guard.
@@ -1308,12 +1408,76 @@ public:
     }
 
     /// Publish protection for a pointer.
-    /// P0-3: No-op if the holder is empty (slot acquisition failed).
+    ///
+    /// P1-4 CONTRACT — READ THIS BEFORE USE.
+    ///
+    /// This only PUBLISHES `ptr` into the holder's slot. On its own it does NOT
+    /// establish hazard-pointer protection: the algorithm's core invariant is
+    /// "publish, then RE-READ the source, and accept the protection only if the
+    /// re-read still yields the same object". Publishing alone leaves the window
+    /// between the caller's load and the publication open, and a thread that
+    /// unlinked and reclaimed the object inside that window has already made the
+    /// caller's pointer dangling.
+    ///
+    /// Therefore any use of `protect()` MUST be followed — before dereferencing
+    /// `ptr` — by a data-structure-specific re-validation that the object is
+    /// still reachable, with a full fence in between:
+    ///
+    ///   * single atomic source  -> use protect_and_reload(src)
+    ///   * any other source      -> use protect_and_reload_with(ptr, reload)
+    ///                             (slot+version stamps, chain reachability, ...)
+    ///
+    /// `protect()` remains available for those indirect cases because their
+    /// re-validation cannot be expressed as "reload one atomic and compare".
+    /// It is deliberately NOT marked [[deprecated]]: every existing call site
+    /// implements a re-validation that is *stronger* than the atomic form, and
+    /// forcing a rewrite to a weaker primitive would be a regression. See
+    /// §P1-4 in spec/fix.01.md.
     template <typename T>
     void protect(T* ptr) {
         if (!valid()) return;
         domain_.store_slot(slot_,
             const_cast<void*>(static_cast<const volatile void*>(ptr)));
+    }
+
+    /// Publish `ptr`, then re-read the source through `reload` and only accept
+    /// the protection once the re-read agrees.
+    ///
+    /// P1-4 (fix.01 方案 A): this is the general "cannot be skipped" form of the
+    /// hazard-pointer protocol. `reload()` must return the pointer that its data
+    /// structure currently considers valid for the same logical position (for a
+    /// plain atomic that is `src.load(acquire)`; for a slot+version layout it is
+    /// "the slot's value if the version is unchanged, else something different";
+    /// for a chain it is the currently reachable node). Returning a different
+    /// value causes a retry with the newly observed value, so the caller can
+    /// never dereference a pointer that was not observed *after* publication.
+    ///
+    /// The seq_cst fence is required, not decorative: it orders the publication
+    /// of the slot before the re-read, so a retirer that observes our slot is
+    /// guaranteed to also observe any later value of the source.
+    template <typename T, typename ReloadFn>
+    T* protect_and_reload_with(T* ptr, ReloadFn&& reload) {
+        if (!valid()) return nullptr;
+        for (;;) {
+            protect(ptr);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            T* current = reload();
+            if (current == ptr) {
+                return ptr;  // published value confirmed by the re-read
+            }
+            ptr = current;
+        }
+    }
+
+    /// Protect a pointer loaded from a single atomic source, using the standard
+    /// publish/fence/re-read protocol. Prefer this over `protect()` whenever the
+    /// source really is one atomic pointer.
+    template <typename T>
+    T* protect_and_reload(const std::atomic<T*>& src) {
+        return protect_and_reload_with(src.load(std::memory_order_relaxed),
+                                       [&src] {
+                                           return src.load(std::memory_order_acquire);
+                                       });
     }
 
     /// Clear the protected pointer (e.g. when the iterator moves away).

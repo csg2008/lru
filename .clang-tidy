@@ -1,0 +1,51 @@
+# clang-tidy configuration for the lru cache library.
+#
+# Scope is deliberately narrow: this is a header-only, lock-free data
+# structure library, so the checks that matter are the ones that find
+# lifetime, concurrency and correctness defects. Style and modernization
+# checks are left out — they would produce thousands of hits on a codebase
+# that intentionally uses raw pointers, placement new, atomics and
+# reinterpret_cast in its allocator and reclamation layers.
+#
+# Usage:
+#   clang-tidy -p build <file> --header-filter='^.*/lru/.*\.hpp$'
+---
+Checks: >
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-narrowing-conversions,
+  -bugprone-unchecked-optional-access,
+  concurrency-*,
+  -concurrency-mt-unsafe,
+  performance-*,
+  -performance-avoid-endl,
+  misc-definitions-in-headers,
+  misc-misplaced-const,
+  misc-redundant-expression,
+  misc-static-assert,
+  misc-unused-using-decls,
+  modernize-use-override,
+  modernize-use-nullptr,
+  cert-*,
+  -cert-err58-cpp,
+  -cert-msc30-c,
+  -cert-msc50-cpp,
+  -cert-err33-c,
+  -cert-env33-c,
+  -cert-dcl50-cpp,
+  clang-analyzer-*
+
+CheckOptions:
+  # The library is header-only; every header is part of the public surface
+  # and is included from many TUs, so anonymous namespaces are not an option.
+  misc-definitions-in-headers:
+    HeaderFileExtensions: ['hpp']
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*/lru/.*\.hpp$'
+FormatStyle: file
+UseColor: true
+
+# The test suite deliberately triggers misuse (leaks handles, ignores
+# return values); it is excluded from the header filter.

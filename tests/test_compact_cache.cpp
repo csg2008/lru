@@ -560,7 +560,9 @@ TEST(CompactCacheProductionApi, DiagnosticsInfoStructFields) {
     EXPECT_GE(info.slot_total, 1u);
     EXPECT_GE(info.bucket_count, 0u);
     EXPECT_GE(info.load_factor, 0.0f);
-    EXPECT_TRUE(info.latency_tracking_enabled);
+    // Latency tracking is off by default (it costs two clock reads plus a
+    // histogram update per operation); see cache_stats::latency_tracking_enabled.
+    EXPECT_FALSE(info.latency_tracking_enabled);
     EXPECT_FALSE(info.async_callbacks_enabled);
     EXPECT_FALSE(info.is_thread_safe);  // default is single-threaded
     EXPECT_FALSE(info.shutdown_in_progress);
@@ -569,13 +571,15 @@ TEST(CompactCacheProductionApi, DiagnosticsInfoStructFields) {
 
 TEST(CompactCacheProductionApi, SetLatencyTrackingTogglesFlag) {
     compact_cache<int, int> c{100};
-    EXPECT_TRUE(c.is_latency_tracking_enabled());
-
-    c.set_latency_tracking(false);
+    // Off by default — the timer's two clock reads per operation are not
+    // something a "high-performance" cache should pay unless asked.
     EXPECT_FALSE(c.is_latency_tracking_enabled());
 
     c.set_latency_tracking(true);
     EXPECT_TRUE(c.is_latency_tracking_enabled());
+
+    c.set_latency_tracking(false);
+    EXPECT_FALSE(c.is_latency_tracking_enabled());
 }
 
 TEST(CompactCacheProductionApi, SetAsyncCallbacksTogglesFlag) {

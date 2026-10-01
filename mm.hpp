@@ -20,10 +20,14 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+#include <utility>
 
 #include "detail/concurrent_hash_table.hpp"
 #include "core.hpp"
 #include "detail/count_min_sketch.hpp"
+// P1-31 (fix.01 方案 A): strategy-agnostic TTL expiry index.
+#include "detail/ttl_heap.hpp"
 #include "detail/hazptr.hpp"
 #include "detail/epoch_reclamation.hpp"
 #include "detail/intrusive_list.hpp"
@@ -70,6 +74,201 @@ inline void validate_capacity(std::size_t /*max_size*/, std::size_t /*max_memory
     // Zero capacity is allowed: it means no insertions are permitted.
     // Use lru::unlimited for no limit.
 }
+
+// ============================================================================
+// P1-23 (fix.01 方案 B): eviction-failure reporting
+// ============================================================================
+//
+// 方案 B says the best-effort eviction paths must "return failure and
+// increment an `eviction_failed` metric; capacity guarantees are the caller's
+// job". Two reporting channels are used, so the failure is never silent even
+// when the counter is unavailable:
+//
+//   1. `cache_stats::eviction_failed` — written when the field exists. The
+//      detection is a template so that this header does not hard-depend on a
+//      field owned by `core.hpp`: until core.hpp carries it, the write is
+//      compiled out and channel (2) still reports. (The field is ~10 trivial
+//      lines to add: one `padded_atomic_size eviction_failed{};` member plus
+//      the matching lines in the copy/move ctors, assignments, snapshot(),
+//      reset_counters()/reset_all() and operator+/==.)
+//   2. `callbacks().collect_reject(key, value)` — the rejection callback is an
+//      existing, always-available signal and is the operator-facing channel.
+//
+// Callers must treat *every* `IncResult` failure as "cannot pin": besides
+// kIncFailedMoving / kIncFailedEviction / kIncFailedOverflow, P1-22 appended a
+// failure for "item is not in the MM container", so an item can become
+// un-evictable without being exclusively held.
+
+/// Does `cache_stats` expose the P1-23 `eviction_failed` counter?
+template <typename Stats, typename = void>
+struct has_eviction_failed : std::false_type {};
+
+template <typename Stats>
+struct has_eviction_failed<Stats,
+    std::void_t<decltype(std::declval<Stats&>().eviction_failed)>> : std::true_type {};
+
+/// Record one eviction failure on `st` (no-op when the counter is absent).
+/// `Stats` is a template parameter on purpose: that keeps `st.eviction_failed`
+/// a dependent name, so the member is only looked up when it exists. Writing
+/// `if constexpr (has_eviction_failed<S>::value) { obj.eviction_failed...; }`
+/// with a *known* object type does NOT work — the discarded statement is still
+/// name-looked-up and would fail to compile against a cache_stats without the
+/// field.
+template <typename Stats>
+inline void note_eviction_failed(Stats& st) noexcept {
+    if constexpr (has_eviction_failed<Stats>::value) {
+        // `padded_atomic_size` exposes its counter as `.value`; the implicit
+        // conversion is available too, but `.value` keeps the atomic access
+        // explicit and identical to the pinned_skip_count sites.
+        st.eviction_failed.value.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+/// Publish a total eviction-failure count onto a stats object (used by the
+/// sharded `stats()` aggregation). No-op when the counter is absent.
+template <typename Stats>
+inline void store_eviction_failed(Stats& st, std::size_t total) noexcept {
+    if constexpr (has_eviction_failed<Stats>::value) {
+        st.eviction_failed.store(total, std::memory_order_relaxed);
+    }
+}
+
+/// Read one stats object's eviction-failure count (0 when absent).
+template <typename Stats>
+inline std::size_t load_eviction_failed(const Stats& st) noexcept {
+    if constexpr (has_eviction_failed<Stats>::value) {
+        return st.eviction_failed.load(std::memory_order_relaxed);
+    } else {
+        static_cast<void>(st);
+        return 0;
+    }
+}
+
+/// Record one rejected insertion: the counter above plus the always-available
+/// rejection callback. `collect_reject` is already part of callback_manager, so
+/// this needs no new surface.
+template <typename Stats, typename Callbacks, typename Key, typename Value>
+inline void note_eviction_rejected(Stats& st, Callbacks& cbs,
+                                   const Key& key, Value&& value) {
+    note_eviction_failed(st);
+    cbs.collect_reject(key, std::forward<Value>(value));
+}
+
+// ============================================================================
+// P1-32 (fix.01 方案 A): the ONE expiry check used by every read path
+// ============================================================================
+//
+// Before this helper, five strategies each carried their own copy of the TTL
+// test, and they had drifted: `mm_lru` used a three-tier cached-time scheme,
+// the other four read the clock unconditionally, and some paths (notably
+// `contains` / `peek` / `get_shared`) checked nothing at all. That is how the
+// cache came to answer `contains(k) == true`, `get(k) == miss` and
+// `peek(k) == 有值` for the same expired key.
+//
+// Every read path that can hand out an item now calls these functions, so a
+// single definition decides whether an expired item is visible. The outcome is
+// three-state (`expiry_check_result`), the read-side counterpart of the
+// `RemoveRes` enum already used by the delete-side API.
+//
+// `Stats`/`Callbacks` are template parameters on purpose: this must work for
+// every MM strategy's callback_manager without introducing a common base class.
+enum class expiry_check_result {
+    kNotExpired,   ///< no TTL, or the TTL is still in the future — usable
+    kExpired,      ///< past its expiry — callers must treat it as a miss
+};
+
+/// @param ttl_held_ref  true when the caller already incremented the item's
+///        access_ref (the pin-then-check pattern). On expiry the reference is
+///        released here and the read is reported as a miss.
+template <typename Item, typename Key, typename Stats, typename Callbacks>
+inline expiry_check_result check_expiry(Item& item, const Key& key,
+                                        Stats& stats, Callbacks& callbacks,
+                                        bool ttl_held_ref) noexcept {
+    if (item.expiry_ns == 0) return expiry_check_result::kNotExpired;
+    // P1-10: track TTL check frequency so ttl_expired_count /
+    // ttl_checked_count gives the expiration ratio (used to size the cleaner
+    // interval).
+    stats.ttl_checked_count.fetch_add(1, std::memory_order_relaxed);
+    const auto now_ns = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    if (now_ns < item.expiry_ns) return expiry_check_result::kNotExpired;
+
+    stats.ttl_expired_count.fetch_add(1, std::memory_order_relaxed);
+    if (ttl_held_ref) {
+        // The caller pinned the item before the check — undo the pin so the
+        // item can be reclaimed once it is swept.
+        item.refcount.decRef();
+    }
+    stats.register_miss();
+    callbacks.collect_miss(key);
+    return expiry_check_result::kExpired;
+}
+
+/// P1-32: TTL-aware presence test, shared by every strategy.
+///
+/// `contains(k)` must answer the same question as `get(k)`: an
+/// expired-but-not-yet-swept item is ABSENT. Only `mm_lru` used to check the
+/// expiry here; the other four strategies returned the physical presence,
+/// which is exactly how the APIs came to disagree.
+template <typename Item, typename Key, typename Stats, typename Callbacks>
+inline bool contains_with_ttl(Item& item, const Key& key,
+                              Stats& stats, Callbacks& callbacks) {
+    return check_expiry(item, key, stats, callbacks, /*ttl_held_ref=*/false) ==
+           expiry_check_result::kNotExpired;
+}
+
+/// P1-44 (fix.01 方案 A): RAII rollback guard for `map_.insert()` failures.
+///
+/// Every MM `insert_new()` links the new item into its eviction queue *before*
+/// calling `map_.insert()`. If that insert throws (e.g. `std::bad_alloc` from a
+/// hash-table node allocation or during an in-progress rehash), the item stays
+/// linked in the queue but is unreachable from the map:
+///   - the queue/map invariant is permanently broken (drift between the two
+///     size notions of P1-43, tripping `rebalance()`'s assert),
+///   - the leaked item can never be evicted, because eviction looks items up
+///     by key,
+///   - a later `map_.insert` of the same key is shadowed by the stale entry.
+///
+/// `mm_lru` already had a private local guard for this; the other four
+/// strategies did not, and instead papered over the invariant break with
+/// defensive `map_.contains(tail->key)` probes in `rebalance()`. This helper
+/// makes the guard available to all of them so those probes can be deleted.
+///
+/// Usage (this order matters — the item is not user-visible until the map
+/// insert succeeds, which is exactly what keeps the P1-22 `kLinked` pin
+/// barrier sound):
+///   detail::insert_rollback_guard<mm_2q> guard{this, item, &mm_2q::rollback_unlink};
+///   queues_[q].link_at_head(*item);
+///   item->refcount.markInMMContainer();
+///   guard.linked = true;
+///   map_.insert(key, item);      // may throw
+///   guard.committed = true;      // item is now reachable in both structures
+///
+/// `unlink` removes the item from whichever queue it was linked into. It must
+/// be `noexcept` (it runs from a destructor during stack unwinding) and must
+/// tolerate the item still being linked. It must NOT unmark `kLinked` — the
+/// guard does that itself so a throw from `unlink` cannot leave the refcount
+/// mirror stale.
+template <typename Mm>
+struct insert_rollback_guard {
+    Mm* self;
+    typename Mm::item_ptr item;
+    void (*unlink)(Mm&, typename Mm::item_ptr) noexcept;
+    bool linked = false;
+    bool committed = false;
+
+    ~insert_rollback_guard() {
+        if (committed) return;
+        if (linked) {
+            unlink(*self, item);
+            // Keep the refcount mirror consistent with the hook flag: the item
+            // is about to be destroyed, but leaving kLinked set would make
+            // isDrained() and any diagnostic run on it lie.
+            item->refcount.unmarkInMMContainer();
+        }
+        delete item;
+    }
+};
 
 /// Mixin that gives an MM strategy a slab_allocator integration point.
 /// It stores the allocator pointer and provides allocate_item(), which uses
@@ -290,7 +489,8 @@ template <
 >
 /// A4: 线程安全契约——此类非线程安全，调用方必须确保在外层 unified_cache 锁内访问。
 /// 内部 update_mutex_ 仅用于 try_lock_update 路径的解耦优化，不保证 MM 层独立线程安全。
-class mm_lru : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>> {
+class mm_lru : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>>,
+               public detail::mm_ttl_index_mixin<mm_lru<Key, Value, Hash, KeyEqual>, Key> {
 public:
     using key_type = Key;
     using mapped_type = Value;
@@ -344,11 +544,13 @@ public:
     mm_lru() : mm_lru(mm_lru_config{}) {}
 
     explicit mm_lru(const mm_lru_config& config)
-        : config_(config)
-        , map_(config.expected_items > 0
+        // Initialized in declaration order (map_ precedes config_); both
+        // read the `config` parameter, not the member, so the order is safe.
+        : map_(config.expected_items > 0
             ? map_type::buckets_for_items(config.expected_items)
             : 1024,
             config.alloc_fn, config.dealloc_fn)
+        , config_(config)
         , lru_refresh_time_(config.default_lru_refresh_time)
         , next_reconfigure_time_(config.mm_reconfigure_interval_secs == 0
             ? std::numeric_limits<uint32_t>::max()
@@ -481,86 +683,15 @@ public:
     /// Locking: callers must hold the MM write lock (this is the same contract
     /// as `flush()`). The background TTL cleaner in `unified_cache` acquires
     /// the write lock before calling this.
-    std::size_t evict_expired() {
-        cleanup_pending_deletion();
-        auto now_ns = static_cast<std::uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
+    ///
+    /// P1-31 (fix.01 方案 A): the implementation now lives once, in the shared
+    /// `detail::mm_ttl_index_mixin` (which also owns the index and the
+    /// pinned-entry deferral). This class previously carried a hand-rolled
+    /// min-heap plus two near-identical 40-line sweep copies; both are gone.
+    /// See the `evict_expired()` / `evict_expired_n()` overrides below, which
+    /// only add the `cleanup_pending_deletion()` step this strategy requires.
 
-        // P0-2: Use TTL min-heap for O(log n) expired-item lookup.
-        // Lazy: pop from heap and validate against the current map entry.
-        // Stale entries (key removed, or expiry updated to later time) are
-        // simply discarded. Pinned items are pushed back so they are retried
-        // on the next eviction pass.
-        std::size_t evicted = 0;
-        while (!ttl_heap_.empty()) {
-            const auto& top = ttl_heap_.front();
-            if (top.expiry_ns > now_ns) {
-                break;  // smallest expiry is in the future — done
-            }
-            Key key = top.key;
-            std::uint64_t heap_expiry = top.expiry_ns;
-            std::pop_heap(ttl_heap_.begin(), ttl_heap_.end(),
-                          std::greater<ttl_heap_entry>{});
-            ttl_heap_.pop_back();
-
-            auto ptr = map_.find(key);
-            if (!ptr) continue;  // key already removed
-            if (ptr->expiry_ns != heap_expiry) continue;  // stale heap entry
-            if (ptr->has_active_handle()) {
-                // Pinned — push back and try again next time
-                ttl_heap_.push_back(ttl_heap_entry{heap_expiry, std::move(key)});
-                std::push_heap(ttl_heap_.begin(), ttl_heap_.end(),
-                               std::greater<ttl_heap_entry>{});
-                // Stop early to avoid cycling through many pinned items
-                // under sustained handle pressure.
-                break;
-            }
-            // O7: TTL expiration — fire on_expire (not on_evict).
-            erase_expired_impl(key);
-            ++evicted;
-        }
-        return evicted;
-    }
-
-    /// Batched variant: evict at most `batch_size` expired items. Used by
-    /// the non-blocking TTL cleaner path to avoid holding the write lock for
-    /// too long under heavy expiry load. If `batch_size == 0`, delegates to
-    /// `evict_expired()` (evict all).
-    std::size_t evict_expired_n(std::size_t batch_size) {
-        if (batch_size == 0) return evict_expired();
-        cleanup_pending_deletion();
-        auto now_ns = static_cast<std::uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-
-        // P0-2: Batched TTL min-heap eviction.
-        std::size_t evicted = 0;
-        while (evicted < batch_size && !ttl_heap_.empty()) {
-            const auto& top = ttl_heap_.front();
-            if (top.expiry_ns > now_ns) {
-                break;
-            }
-            Key key = top.key;
-            std::uint64_t heap_expiry = top.expiry_ns;
-            std::pop_heap(ttl_heap_.begin(), ttl_heap_.end(),
-                          std::greater<ttl_heap_entry>{});
-            ttl_heap_.pop_back();
-
-            auto ptr = map_.find(key);
-            if (!ptr) continue;
-            if (ptr->expiry_ns != heap_expiry) continue;
-            if (ptr->has_active_handle()) {
-                // Pinned — push back and stop this batch
-                ttl_heap_.push_back(ttl_heap_entry{heap_expiry, std::move(key)});
-                std::push_heap(ttl_heap_.begin(), ttl_heap_.end(),
-                               std::greater<ttl_heap_entry>{});
-                break;
-            }
-            // O7: TTL expiration — fire on_expire (not on_evict).
-            erase_expired_impl(key);
-            ++evicted;
-        }
-        return evicted;
-    }
+public:
 
     template <typename V>
     bool add(const Key& key, V&& value) {
@@ -667,69 +798,17 @@ public:
         // lazily by evict_expired() / the background TTL cleaner, NOT here,
         // so we don't need a write lock on the hot path.
         if (ptr->expiry_ns != 0) {
-            // P1-10: Track TTL check frequency on the read path.
-            // ttl_expired_count / ttl_checked_count gives the expiration
-            // ratio, useful for sizing the TTL cleaner interval.
-            stats_.ttl_checked_count.fetch_add(1, std::memory_order_relaxed);
-            // P1-8: Three-tier TTL check using cached_now_ns_.
-            //
-            // Key invariant: cached_now_ns_ <= real_now (the cached value
-            // is only ever updated to a real clock reading, and real_now
-            // is monotonically increasing). This gives us:
-            //
-            //   cached_now >= expiry_ns  =>  real_now >= expiry_ns  (definitely expired)
-            //   cached_now < expiry_ns   =>  unknown (cache may be stale)
-            //
-            // Tier 1 (fast, no clock read): If the cached time already
-            // exceeds expiry_ns, the item is definitely expired. This
-            // handles the common case of repeatedly accessing items that
-            // expired long ago but haven't been cleaned up yet.
-            //
-            // Tier 2 (fast, no clock read): If cached_now is far from
-            // expiry_ns (beyond the drift window), the item is treated as
-            // fresh. This is safe from false-expires (we never report an
-            // unexpired item as expired), but may delay expiry detection
-            // if cached_now is very stale. The delay is bounded by the
-            // TTL cleaner's refresh interval (refresh_cached_now() is
-            // called periodically by the background cleaner).
-            //
-            // Tier 3 (slow, clock read): If cached_now is within the drift
-            // window of expiry_ns, we need a precise reading to determine
-            // whether the item has actually expired. This is the only
-            // path that reads steady_clock::now().
-            std::uint64_t now_ns = cached_now_ns_.load(std::memory_order_relaxed);
-
-            // Tier 1 (cheap, no clock): if the cached time already passed
-            // expiry, the item is definitely expired — cached_now_ns_ is a
-            // lower bound on real time (it only ever moves forward), so
-            // cached_now >= expiry  ⇒  real_now >= expiry. This catches
-            // repeatedly-accessed long-expired items without a clock read.
-            if (now_ns != 0 && now_ns >= ptr->expiry_ns) {
-                stats_.ttl_expired_count.fetch_add(1, std::memory_order_relaxed);
-                ptr->refcount.decRef();
-                stats_.register_miss();
-                callbacks_.collect_miss(key);
+            if (detail::check_expiry(*ptr, key, stats_, callbacks_, true) ==
+                detail::expiry_check_result::kExpired) {
                 return {};
             }
-
-            // Tier 2 (precise): cached_now_ns_ is only refreshed by the
-            // background TTL cleaner, so without one it can go arbitrarily
-            // stale. "cached_now is far before expiry" therefore does NOT
-            // imply the item is still fresh — a stale cached time would
-            // serve already-expired items forever. Always read the real
-            // clock here for a sound expiry check. (Non-TTL items skip this
-            // whole block via the `expiry_ns != 0` guard above.)
-            now_ns = static_cast<std::uint64_t>(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-            cached_now_ns_.store(now_ns, std::memory_order_relaxed);
-
-            if (now_ns >= ptr->expiry_ns) {
-                stats_.ttl_expired_count.fetch_add(1, std::memory_order_relaxed);
-                ptr->refcount.decRef();
-                stats_.register_miss();
-                callbacks_.collect_miss(key);
-                return {};
-            }
+            // The item is live: refresh the cached-now lower bound so the next
+            // read can settle the common "long expired" case without a clock
+            // read (P1-8 keeps `cached_now_ns_` meaningful for the cleaner).
+            cached_now_ns_.store(
+                static_cast<std::uint64_t>(
+                    std::chrono::steady_clock::now().time_since_epoch().count()),
+                std::memory_order_relaxed);
         }
         return read_handle<Value>{&ptr->value, &ptr->refcount, pre_pinned};
     }
@@ -807,12 +886,7 @@ public:
             // pointer protecting this node. When EBR is enabled, use
             // epoch_domain::retire() instead for faster read-path overhead.
             callbacks_.collect_evict(item->key, std::move(item->value));
-            if (config_.use_ebr) {
-                auto* domain = ebr_domain_ ? ebr_domain_ : &detail::epoch_domain::default_domain();
-                domain->retire(item);
-            } else {
-                detail::hazptr_domain::default_domain().retire(item);
-            }
+            retire_item(item);
         } else {
             // Has active handles - add to pending, do NOT move or invalidate value.
             // Eviction callback and deletion deferred to cleanup_pending_deletion()
@@ -834,12 +908,7 @@ public:
         remove_from_list(item);
         unpinned_tail_ = nullptr;
         map_.erase(key);
-        if (config_.use_ebr) {
-            auto* domain = ebr_domain_ ? ebr_domain_ : &detail::epoch_domain::default_domain();
-            domain->retire(item);
-        } else {
-            detail::hazptr_domain::default_domain().retire(item);
-        }
+        retire_item(item);
         stats_.current_size.store(list_size());
         return value;
     }
@@ -855,12 +924,7 @@ public:
         remove_from_list(tail);
         unpinned_tail_ = nullptr;
         map_.erase(result.first);
-        if (config_.use_ebr) {
-            auto* domain = ebr_domain_ ? ebr_domain_ : &detail::epoch_domain::default_domain();
-            domain->retire(tail);
-        } else {
-            detail::hazptr_domain::default_domain().retire(tail);
-        }
+        retire_item(tail);
         stats_.current_size.store(list_size());
         return result;
     }
@@ -940,12 +1004,7 @@ public:
         // Now the background reclaimer (or maybe_auto_reclaim) can free them
         // without risking UAF during list traversal or hash chain traversal.
         for (auto* item : to_retire) {
-            if (config_.use_ebr) {
-                auto* domain = ebr_domain_ ? ebr_domain_ : &detail::epoch_domain::default_domain();
-                domain->retire(item);
-            } else {
-                detail::hazptr_domain::default_domain().retire(item);
-            }
+            retire_item(item);
         }
         insertion_point_ = nullptr;
         unpinned_tail_ = nullptr;
@@ -965,15 +1024,9 @@ public:
         // also makes the expiry read race-free.
         auto* item = map_.find_embedded_shared(key);
         if (!item) return false;
-        if (item->expiry_ns != 0) {
-            // Same cached-now fast path as peek_for_get(): cached_now_ns_ is
-            // a lower bound on real time, so cached_now >= expiry ⇒ expired.
-            std::uint64_t now_ns = cached_now_ns_.load(std::memory_order_relaxed);
-            if (now_ns != 0 && now_ns >= item->expiry_ns) return false;
-            now_ns = static_cast<std::uint64_t>(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-            cached_now_ns_.store(now_ns, std::memory_order_relaxed);
-            if (now_ns >= item->expiry_ns) return false;
+        // P1-32: the ONE shared TTL check — see detail::contains_with_ttl.
+        if (!detail::contains_with_ttl(*item, key, stats_, callbacks_)) {
+            return false;
         }
         return true;
     }
@@ -1093,7 +1146,7 @@ public:
         LockedIterator(const LockedIterator&) = delete;
         LockedIterator& operator=(const LockedIterator&) = delete;
         LockedIterator(LockedIterator&& other) noexcept
-            : guard_(std::move(other.guard_)), mm_(other.mm_), curr_(other.curr_) {}
+            : guard_(std::move(other.guard_)), curr_(other.curr_), mm_(other.mm_) {}
 
         void destroy() { guard_.destroy(); }
 
@@ -1479,12 +1532,7 @@ public:
             // deferred until the hazard is released. When EBR is enabled,
             // use epoch_domain::retire() instead for faster read-path overhead.
             victim->refcount.unmarkForEviction();
-            if (config_.use_ebr) {
-                auto* domain = ebr_domain_ ? ebr_domain_ : &detail::epoch_domain::default_domain();
-                domain->retire(victim);
-            } else {
-                detail::hazptr_domain::default_domain().retire(victim);
-            }
+            retire_item(victim);
         }
         stats_.current_size.store(list_size());
     }
@@ -1515,12 +1563,21 @@ public:
         size_t steps = 0;
         // R5: Track the first unpinned item found (for delayed update)
         item_ptr first_unpinned = nullptr;
+        // P1-41 (fix.01 方案 A): set when the scan had to walk past a pinned
+        // item. unpinned_tail_ is then clamped back to list_tail() at the end
+        // so the next eviction reconsiders the (possibly by then unpinned)
+        // oldest item. Without the clamp the cursor only ever advances toward
+        // the MRU end, so an old item that was pinned during one scan is never
+        // reconsidered — the cache then evicts *newer* items while keeping
+        // *older* ones, which violates LRU order.
+        bool saw_pinned = false;
         while (curr) {
             stats_.eviction_search_steps.fetch_add(1, std::memory_order_relaxed);
             ++steps;
             // H0: 跳过有活跃句柄的节点（不计入 tries，这些节点绝对不能淘汰）
             if (curr->has_active_handle()) {
                 stats_.pinned_skip_count.fetch_add(1, std::memory_order_relaxed);
+                saw_pinned = true;
                 curr = list_get_prev(*curr);
                 continue;
             }
@@ -1542,6 +1599,12 @@ public:
             // victim (which will be removed), point at what will be the
             // new tail after removal.
             unpinned_tail_ = list_get_prev(*curr);
+            // P1-41: if the LRU tail itself was pinned, the item we are about
+            // to evict is not the oldest one. Clamp the cursor back to the
+            // tail so the next call starts from the true LRU position again.
+            if (saw_pinned) {
+                unpinned_tail_ = list_tail();
+            }
             stats_.eviction_search_steps_hist.record(steps);
             return curr;
         }
@@ -1549,7 +1612,10 @@ public:
         // unpinned item we found (if any), so the next eviction doesn't
         // re-walk the pinned prefix. Only reset to nullptr if we found
         // no unpinned items at all.
-        unpinned_tail_ = first_unpinned;
+        // P1-41: a pinned tail means that "first unpinned" item is not the
+        // oldest evictable candidate — keep the cursor at the tail so the
+        // pinned item is retried once its handle is released.
+        unpinned_tail_ = saw_pinned ? list_tail() : first_unpinned;
         if (steps > 0) stats_.eviction_search_steps_hist.record(steps);
         return nullptr;
     }
@@ -1625,18 +1691,16 @@ public:
 
 private:
 
-    // P0-2: TTL min-heap for O(log n) expired-item lookup.
-    // Lazy heap: entries may be stale (key updated to a later expiry or
-    // removed). evict_expired() validates entries when popping.
-    // Stored as a min-heap via std::push_heap / std::pop_heap with greater<>.
-    struct ttl_heap_entry {
-        std::uint64_t expiry_ns;
-        Key key;
-        bool operator>(const ttl_heap_entry& other) const noexcept {
-            return expiry_ns > other.expiry_ns;
-        }
-    };
-    std::vector<ttl_heap_entry> ttl_heap_;
+    // P0-2 / P1-31 (fix.01 方案 A): TTL index for O(log n) expired-item lookup.
+    //
+    // The index itself is the shared, strategy-agnostic `detail::ttl_heap`
+    // (see `detail/ttl_heap.hpp`): it owns the min-heap, the stale-entry
+    // validation protocol and the deferred-retry queue for expired-but-pinned
+    // entries. `mm_lru` supplies only the two strategy-specific answers —
+    // "what is this entry's state?" and "erase it as an EXPIRY (on_expire, not
+    // on_evict)". That is what makes the same TTL semantics available to every
+    // eviction strategy instead of only this one.
+    // (The index itself — `index_` — is owned by the mixin base above.)
 
     // P1-8: Cached current time for TTL hot path. Avoids steady_clock::now()
     // on every TTL get. Updated lazily when the drift exceeds max_drift,
@@ -1761,13 +1825,15 @@ private:
     }
 
     /// Dispatch: clear
-    void list_clear() {
-        if (use_segmented_lru()) {
-            segmented_items_.clear();
-        } else {
-            items_.clear();
-        }
-    }
+    // P0-2 (fix.01 方案 A): list_clear() was dead code — no caller anywhere in
+    // the library. It was also the only caller of
+    // segmented_intrusive_list::clear(), whose void* -> T* conversion made it
+    // uncompilable (so the segmented path's clear() had never been instantiated
+    // at all). mm_lru::flush() clears both list flavours through
+    // list_head()/list_get_next()/remove_from_list(), so nothing needs this
+    // dispatch helper. Deleted rather than kept as an uncompilable entry point;
+    // segmented_intrusive_list::clear() is now covered directly by
+    // tests/test_api_surface.cpp.
 
     /// Clean up pending-deletion items whose handles have all been released.
     /// Now also fires the deferred eviction callback (with value move) before
@@ -1784,12 +1850,7 @@ private:
                 // traversal) may still hold a hazard pointer to this item even
                 // though its refcount is 0 — raw delete would cause UAF.
                 // Use the same EBR/hazptr selection as the non-pending path.
-                if (config_.use_ebr) {
-                    auto* domain = ebr_domain_ ? ebr_domain_ : &detail::epoch_domain::default_domain();
-                    domain->retire(item);
-                } else {
-                    detail::hazptr_domain::default_domain().retire(item);
-                }
+                retire_item(item);
                 it = pending_deletion_.erase(it);
             } else {
                 ++it;
@@ -1797,43 +1858,88 @@ private:
         }
     }
 
-    // P0-2: Push a TTL entry into the min-heap. Used on insert and update.
-    // Each TTL update pushes a new entry; stale ones are only removed lazily
-    // when evict_expired() pops them after expiry. When the heap grows past
-    // `kMaxTtlHeapMultiplier * live_items`, rebuild it from the list to
-    // discard stale entries and bound heap memory.
-    static constexpr std::size_t kMaxTtlHeapMultiplier = 4;
+    // P0-2 / P1-31 (fix.01 方案 A): item-level TTL. The ordered index, the
+    // stale-entry validation, the pinned-entry deferral and the batch parameter
+    // all come from the shared `detail::mm_ttl_index_mixin`; this strategy
+    // supplies only the four strategy-specific answers below. That is what makes
+    // the same TTL semantics available to every eviction strategy instead of
+    // only this one, and it removes the hand-rolled copy that was already
+    // drifting from the shared version.
+    //
+    // Public because the CRTP mixin base calls back into them and is not a
+    // derived class of mm_lru, so it cannot reach private members. These are
+    // internal contract points, not user API.
+public:
+    using ttl_probe_result = detail::ttl_heap<Key>::probe_result;
 
-    void ttl_heap_push(const Key& key, std::uint64_t expiry_ns) {
-        if (expiry_ns == 0) return;
-        ttl_heap_.push_back(ttl_heap_entry{expiry_ns, key});
-        std::push_heap(ttl_heap_.begin(), ttl_heap_.end(),
-                       std::greater<ttl_heap_entry>{});
-        // Bound heap growth: repeated set_with_expiry() updates push one new
-        // entry each while the stale one stays until its (old) expiry is
-        // popped. When the heap far exceeds the live item count, most entries
-        // are stale — rebuild from the list. Amortized O(1) per push (the
-        // O(list_size) rebuild fires only once per multiplier worth of pushes).
-        const std::size_t live = list_size();
-        if (ttl_heap_.size() > kMaxTtlHeapMultiplier * live) {
-            ttl_heap_rebuild();
+    /// Classify an indexed entry against the live map.
+    ttl_probe_result ttl_probe_entry(const Key& key, std::uint64_t heap_expiry) {
+        auto ptr = map_.find(key);
+        if (!ptr) {
+            return ttl_probe_result::absent;  // key already removed
         }
+        if (ptr->expiry_ns != heap_expiry) {
+            return ttl_probe_result::stale;  // stale index entry
+        }
+        if (ptr->has_active_handle()) {
+            // P1-31 A1: defer and keep going (the shared sweep continues past it
+            // and retries it on the next round once the handle is released).
+            return ttl_probe_result::pinned;
+        }
+        return ttl_probe_result::ready;
     }
 
-    /// Rebuild the TTL min-heap from the live items on the LRU list,
-    /// discarding entries for keys that were removed or whose expiry was
-    /// updated. Must be called under the write lock (list mutation would
-    /// otherwise race); the iteration is read-only.
-    void ttl_heap_rebuild() {
-        ttl_heap_.clear();
+    /// O7: TTL expiration — fire on_expire (not on_evict).
+    void ttl_erase_expired(const Key& key) { erase_expired_impl(key); }
+
+    std::size_t ttl_live_count() const { return list_size(); }
+
+    /// Emit every live item that carries an expiry, for index rebuilds.
+    template <typename Emit>
+    void ttl_for_each_live(Emit&& emit) const {
         for (auto* curr = list_head(); curr != nullptr; curr = list_get_next(*curr)) {
             if (curr->expiry_ns != 0) {
-                ttl_heap_.push_back(ttl_heap_entry{curr->expiry_ns, curr->key});
+                emit(curr->key, curr->expiry_ns);
             }
         }
-        std::make_heap(ttl_heap_.begin(), ttl_heap_.end(),
-                       std::greater<ttl_heap_entry>{});
     }
+
+    /// Record (or refresh) a key's expiry in the shared index.
+    void ttl_heap_push(const Key& key, std::uint64_t expiry_ns) {
+        this->ttl_index_push(key, expiry_ns);
+    }
+
+    /// Rebuild the index from the live items on the LRU list, discarding entries
+    /// for keys that were removed or whose expiry was updated. Must be called
+    /// under the write lock (list mutation would otherwise race); the iteration
+    /// is read-only. Kept as a named entry point because the insert path calls it.
+    void ttl_heap_rebuild() { this->ttl_index_rebuild(); }
+
+public:
+    // --------------------------------------------------------------------
+    // P1-31: shared TTL index hooks
+    // --------------------------------------------------------------------
+    // Public only because the CRTP mixin base (detail::mm_ttl_index_mixin)
+    // calls back into them and is not a derived class of mm_lru, so it cannot
+    // reach private members. They are internal contract points, not user API —
+    // see detail/ttl_heap.hpp for the full explanation of each.
+    using ttl_base = detail::mm_ttl_index_mixin<mm_lru<Key, Value, Hash, KeyEqual>, Key>;
+
+    /// Evict every expired item. `cleanup_pending_deletion()` first, exactly as
+    /// the previous hand-rolled sweep did.
+    std::size_t evict_expired() {
+        cleanup_pending_deletion();
+        return ttl_base::evict_expired();
+    }
+
+    /// Batched variant (0 = no limit).
+    std::size_t evict_expired_n(std::size_t batch_size) {
+        if (batch_size == 0) return evict_expired();
+        cleanup_pending_deletion();
+        return ttl_base::evict_expired_n(batch_size);
+    }
+
+private:
 
     // --------------------------------------------------------------------
     // Time utilities
@@ -1891,14 +1997,9 @@ private:
             return false;
         }
 
-        auto promote = [this, item, curr]() {
-            reconfigure_locked(curr);
-            ensure_not_insertion_point(item);
-            if (config_.use_segmented_lru) {
-                segmented_items_.move_to_head(*item);
-            } else {
-                items_.move_to_head(*item);
-            }
+        // Everything a promotion does apart from the relink itself, which is
+        // the only part that varies with the locking mode.
+        auto promote_bookkeeping = [this, item, curr]() {
             item->hook.update_time = curr;
             if (item->hook.is_tail()) {
                 item->hook.clear_tail();
@@ -1906,6 +2007,30 @@ private:
                 update_lru_insertion_point();
             }
         };
+
+        auto promote = [this, item, curr, &promote_bookkeeping]() {
+            reconfigure_locked(curr);
+            ensure_not_insertion_point(item);
+            if (config_.use_segmented_lru) {
+                segmented_items_.move_to_head(*item);
+            } else {
+                items_.move_to_head(*item);
+            }
+            promote_bookkeeping();
+        };
+
+        // Segmented try-lock path only. try_lock_two_segments() has already
+        // acquired the item's source-segment lock and segment 0's lock, so the
+        // relink must adopt them rather than re-acquire them: segment_spinlock
+        // is non-recursive, and calling the plain move_to_head() here spun
+        // forever on the lock this thread already held.
+        auto promote_segmented_locked =
+            [this, item, curr, &promote_bookkeeping]() {
+                reconfigure_locked(curr);
+                ensure_not_insertion_point(item);
+                segmented_items_.move_to_head_locked(*item);
+                promote_bookkeeping();
+            };
 
         if (config_.use_segmented_lru) {
             // Segmented LRU: use per-segment spinlocks instead of global update_mutex_.
@@ -1919,7 +2044,9 @@ private:
                     stats_.try_lock_fail_count.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
-                promote();
+                // result still holds both segment locks here, so use the
+                // adopt-the-locks variant (see promote_segmented_locked).
+                promote_segmented_locked();
             } else {
                 // Blocking mode: acquire segment locks in address order (handled by move_to_head).
                 // But we still need to coordinate with reconfigure_locked and insertion point.
@@ -2104,24 +2231,16 @@ private:
             item->expiry_ns = expiry_ns;
         }
 
-        // P-MED-1 (T-H3): RAII rollback guard. If map_.insert throws
+        // P-MED-1 (T-H3) / P1-44: RAII rollback guard. If map_.insert throws
         // (e.g. bad_alloc), the item would be linked in the intrusive list
         // but unreachable from the hash table, corrupting list_size() and
         // leaking memory. The guard undoes the list link and deallocates
         // the item on exception, then is dismissed once map_.insert succeeds.
-        struct insert_rollback_guard {
-            mm_lru* self;
-            item_type* item;
-            bool linked = false;
-            bool committed = false;
-            ~insert_rollback_guard() {
-                if (committed) return;
-                if (linked) {
-                    self->list_remove(*item);
-                }
-                delete item;
-            }
-        } guard{this, item, false, false};
+        // P1-44: the guard is now the shared detail::insert_rollback_guard so
+        // every strategy uses the same rollback contract.
+        detail::insert_rollback_guard<mm_lru> guard{
+            this, item, static_cast<void (*)(mm_lru&, item_ptr) noexcept>(
+                            [](mm_lru& mm, item_ptr it) noexcept { mm.list_remove(*it); })};
 
         // Insert into list based on insertion point config
         if (config_.lru_insertion_point_spec == 0 || !insertion_point_) {
@@ -2199,12 +2318,51 @@ private:
     /// 与 replace(key, value) 不同——后者只改值，本方法替换整个节点。
     /// 替换时保留 old_node 的 is_accessed 和 tail 状态（对齐 CacheLib MMLru.h:783-787）。
     /// D5: 增加 is_linked() 运行时守卫（对齐 CacheLib MMLru.h:775）。
+    ///
+    /// P1-24 (fix.01 方案 A): the original implementation left the pair of
+    /// container-membership flags inconsistent — `intrusive_list::replace()`
+    /// only clears the *hook* linked flag of old_node, so:
+    ///   - new_node never got `markInMMContainer()` → `isInMMContainer()`
+    ///     stayed false, and every subsequent `record_access()` /
+    ///     `remove_from_list()` early-returned on the D5 guard. The item
+    ///     became un-promotable and un-removable (leak + list corruption).
+    ///   - old_node kept `kLinked` set → it was never retired and could be
+    ///     reported as still in the container.
+    /// The fix transfers the flag explicitly and retires old_node.
+    ///
+    /// Preconditions enforced at runtime (the API is public but has no
+    /// in-tree caller, so it is hardened rather than assumed correct):
+    ///   - old_node must be in the container, new_node must not be;
+    ///   - old_node must have no active handles — a pinned old_node cannot be
+    ///     retired here (retire_item() hands the memory to the reclaimer), and
+    ///     racing a live read_handle would be a use-after-free. Callers that
+    ///     need replacement of a pinned node must wait for the handle to be
+    ///     released, or use set()/erase()+insert.
+    // D5: 运行时检查——old_node 必须在容器中，new_node 不能在容器中（对齐 CacheLib MMLru.h:775）
+    //
+    // P1-24: exposed publicly (it was private with no in-tree caller) so the
+    // consistency contract can be pinned by a regression test in
+    // tests/test_mm_p1.cpp. Widening access on a previously unreachable entry
+    // point adds no risk, whereas leaving it untestable is how the bug shipped.
+public:
     void replace_node(item_ptr old_node, item_ptr new_node) {
         assert(old_node != nullptr && new_node != nullptr);
-        // D5: 运行时检查——old_node 必须在容器中，new_node 不能在容器中（对齐 CacheLib MMLru.h:775）
-        if (!old_node->refcount.isInMMContainer() || new_node->refcount.isInMMContainer()) {
+        if (old_node == new_node) return;
+        // D5: 运行时检查——old_node 必须在容器中，new_node 不能在容器中
+        // （对齐 CacheLib MMLru.h:775）。
+        if (!old_node->refcount.isInMMContainer() ||
+            new_node->refcount.isInMMContainer()) {
             return;
         }
+        // P1-24: a live handle must not be handed to the reclaimer.
+        if (old_node->has_active_handle()) {
+            return;
+        }
+        // P1-24: normalize new_node. A freshly allocated item has kLinked
+        // clear, but a recycled/rebuilt node may not; the hook's linked flag
+        // is cleared by intrusive_list::replace(), so clear the refcount
+        // mirror too before re-asserting both below.
+        new_node->refcount.unmarkInMMContainer();
         ensure_not_insertion_point(old_node);
         bool was_tail = old_node->hook.is_tail();
         if (was_tail) {
@@ -2219,6 +2377,9 @@ private:
             new_node->hook.clear_accessed();
         }
         list_replace(*old_node, *new_node);
+        // P1-24: transfer container membership (old → new).
+        old_node->refcount.unmarkInMMContainer();
+        new_node->refcount.markInMMContainer();
         // 更新 map
         map_.insert_or_assign(old_node->key, new_node);
         // 更新 tail 跟踪
@@ -2229,14 +2390,32 @@ private:
             new_node->hook.set_tail();
             ++tail_size_;
         }
+        // P1-24: invalidate the eviction cursor. It may point at old_node (now
+        // detached and handed to the reclaimer); find_eviction_victim() would
+        // then walk a freed node. Clearing it costs one extra scan from
+        // list_tail() on the next eviction, which is the safe trade.
+        unpinned_tail_ = nullptr;
         update_lru_insertion_point();
+
+        // P1-24: retire the detached old_node. Its refcount is drained
+        // (checked above) and it is no longer reachable from list or map, so
+        // it is never deleted immediately — hazptr/EBR deferral protects
+        // readers that are still traversing the hash chain.
+        retire_item(old_node);
     }
 
+    // P0-2 (fix.01 方案 A): set_eviction_predicate() must be public so that
+    // sharded_mm_lru (composition, not inheritance) and unified_cache can
+    // forward to it. It was private here while mm_fifo/sharded_mm_lru already
+    // declared it public, which made unified_cache::set_eviction_predicate()
+    // fail to compile for the most common aliases (cache/safe_cache use mm_lru).
+public:
     /// B15: 设置淘汰谓词——返回 false 表示该 item 不可淘汰。
     void set_eviction_predicate(std::function<bool(const Key&, const Value&)> pred) {
         eviction_predicate_ = std::move(pred);
     }
 
+private:
     void erase_impl(const Key& key) {
         auto ptr = map_.find(key);
         if (!ptr) return;
@@ -2250,7 +2429,7 @@ private:
         map_.erase(key);
         remove_from_list(item);
         unpinned_tail_ = nullptr;
-        detail::hazptr_domain::default_domain().retire(item);
+        retire_item(item);
         stats_.current_size.store(list_size());
     }
 
@@ -2270,8 +2449,28 @@ private:
         map_.erase(key);
         remove_from_list(item);
         unpinned_tail_ = nullptr;
-        detail::hazptr_domain::default_domain().retire(item);
+        retire_item(item);
         stats_.current_size.store(list_size());
+    }
+
+    /// Retire an unlinked item for deferred reclamation.
+    ///
+    /// Every path that unlinks an item MUST retire it through this helper.
+    /// The reclamation domain has to match the protection mechanism the
+    /// readers use: under EBR a reader holds only a TLS epoch guard and
+    /// publishes no hazard pointer, so retiring into the hazptr domain
+    /// would let the reclaimer free the item while a reader is still
+    /// dereferencing it. Hand-copying the branch at each call site is
+    /// exactly how `erase_impl` and `erase_expired_impl` came to retire
+    /// into the wrong domain and reintroduce that use-after-free.
+    void retire_item(item_ptr item) noexcept {
+        if (config_.use_ebr) {
+            auto* domain = ebr_domain_ ? ebr_domain_
+                                       : &detail::epoch_domain::default_domain();
+            domain->retire(item);
+        } else {
+            detail::hazptr_domain::default_domain().retire(item);
+        }
     }
 
     /// Remove item from the list and adjust insertion point tracking.
@@ -2437,7 +2636,8 @@ template <
 /// FIFO eviction strategy: first-in-first-out. Accessing an item does NOT
 /// change its position in the eviction queue. The oldest inserted item
 /// (tail of the list) is evicted first.
-class mm_fifo : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>> {
+class mm_fifo : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>>,
+                public detail::mm_ttl_index_mixin<mm_fifo<Key, Value, Hash, KeyEqual>, Key> {
 public:
     using key_type = Key;
     using mapped_type = Value;
@@ -2477,11 +2677,14 @@ public:
     mm_fifo() = default;
 
     explicit mm_fifo(const mm_fifo_config& cfg)
-        : config_(cfg)
-        , map_(cfg.expected_items > 0
+        // Member init order follows declaration order (map_ is declared before
+        // config_) so that -Wreorder is clean; map_'s initializer reads the
+        // `cfg` *parameter*, so reordering is behaviour-preserving.
+        : map_(cfg.expected_items > 0
             ? map_type::buckets_for_items(cfg.expected_items)
             : 1024,
-            cfg.alloc_fn, cfg.dealloc_fn) {}
+            cfg.alloc_fn, cfg.dealloc_fn)
+        , config_(cfg) {}
 
     mm_fifo(size_type max_size)
         : mm_fifo() {
@@ -2622,15 +2825,9 @@ public:
         // lazily by evict_expired() / the background TTL cleaner, NOT here,
         // so we don't need a write lock on the hot path.
         if (ptr->expiry_ns != 0) {
-            // P1-10: Track TTL check frequency on the read path.
-            stats_.ttl_checked_count.fetch_add(1, std::memory_order_relaxed);
-            auto now_ns = static_cast<std::uint64_t>(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-            if (now_ns >= ptr->expiry_ns) {
-                stats_.ttl_expired_count.fetch_add(1, std::memory_order_relaxed);
-                ptr->refcount.decRef();
-                stats_.register_miss();
-                callbacks_.collect_miss(key);
+            // P1-32: the ONE shared expiry check (see detail::check_expiry).
+            if (detail::check_expiry(*ptr, key, stats_, callbacks_, true) ==
+                detail::expiry_check_result::kExpired) {
                 return {};
             }
         }
@@ -2753,7 +2950,12 @@ public:
     }
 
     bool contains(const Key& key) const {
-        return map_.contains(key);
+        auto* item = map_.find_embedded_shared(key);
+        if (!item) return false;
+        // P1-32: TTL-aware presence — an expired-but-not-yet-swept item is
+        // reported absent, exactly as get() reports it. See
+        // detail::contains_with_ttl for why this is shared by every strategy.
+        return detail::contains_with_ttl(*item, key, stats_, callbacks_);
     }
 
     // --------------------------------------------------------------------
@@ -3032,6 +3234,12 @@ public:
     }
 
     /// Find eviction victim from tail, respecting EvictionPredicate and active handles.
+    ///
+    /// P1-41 (fix.01 方案 A): FIFO has no persistent cursor — every scan
+    /// starts at the queue tail — so the "cursor permanently skips a pinned
+    /// tail" defect cannot occur here. The scan is documented as
+    /// oldest-first and returns the first unpinned, predicate-accepted node
+    /// walking toward the MRU end.
     item_ptr find_eviction_victim() {
         auto* curr = items_.tail();
         if (!curr) return curr;
@@ -3142,7 +3350,7 @@ private:
     // --------------------------------------------------------------------
 
     template <typename V>
-    void insert_new(const Key& key, V&& value) {
+    void insert_new(const Key& key, V&& value, std::uint64_t expiry_ns = 0) {
         if (max_size_ == 0 || max_memory_ == 0) return;
         cleanup_pending_deletion();
         if (is_at_capacity()) evict();
@@ -3162,17 +3370,128 @@ private:
             }
         }
 
-        // Allocate new item and link at head (MRU)
+        // Allocate new item and link at head (MRU).
+        // P1-44: the guard must be armed before the link so an exception from
+        // map_.insert() below cannot leave the item stranded in the queue.
         auto* item = this->allocate_item(key, std::forward<V>(value));
+        // P1-31 (fix.01 方案 A): item-level expiry. The shared `cache_item`
+        // already carried `expiry_ns`, but nothing in this strategy ever set it,
+        // so every TTL check here was dead code and TTL came only from the
+        // value-layer `ttl_entry<V>` wrapper (swept by an O(n) full-cache scan).
+        item->expiry_ns = expiry_ns;
+        detail::insert_rollback_guard<mm_fifo> guard{
+            this, item, static_cast<void (*)(mm_fifo&, item_ptr) noexcept>(
+                            [](mm_fifo& mm, item_ptr it) noexcept { mm.items_.remove(*it); })};
         items_.link_at_head(*item);
         item->refcount.markInMMContainer();
+        guard.linked = true;
         map_.insert(key, item);
+        guard.committed = true;
+        // P1-31: index the expiry only after the item is fully inserted, so a
+        // throw from map_.insert() cannot leave an index entry behind.
+        this->ttl_index_push(key, expiry_ns);
 
         stats_.current_size.store(total_size());
         stats_.current_memory.fetch_add(mem);
         stats_.register_insertion();
         callbacks_.collect_insert(key, item->value);
     }
+
+    // P1-31 (fix.01): item-level TTL entry points. Public because
+    // `unified_cache` discovers native TTL support with a
+    // `requires { mm_.set_with_expiry(...); }` probe; hiding them behind the
+    // class' private access would silently disable native TTL for this strategy
+    // and send the cache back to a full scan.
+public:
+    /// P1-31 (fix.01 方案 A): set a value together with an absolute expiry
+    /// (nanoseconds since the steady_clock epoch; 0 means "no TTL").
+    /// Mirrors `mm_lru::set_with_expiry` so every strategy offers the cache layer
+    /// the same item-level TTL facility.
+    template <typename V>
+    void set_with_expiry(const Key& key, V&& value, std::uint64_t expiry_ns) {
+        auto ptr = map_.find(key);
+        if (!ptr) {
+            insert_new(key, std::forward<V>(value), expiry_ns);
+            return;
+        }
+        update_existing(ptr, std::forward<V>(value));
+        ptr->expiry_ns = expiry_ns;
+        this->ttl_index_push(key, expiry_ns);
+    }
+
+    /// TTL lookup helper: remaining nanoseconds for a key, or nullopt when the
+    /// key is absent or carries no expiry.
+    std::optional<std::uint64_t> ttl_remaining_ns(const Key& key) const {
+        auto ptr = map_.find(key);
+        if (!ptr || ptr->expiry_ns == 0) return std::nullopt;
+        const auto now_ns = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        if (ptr->expiry_ns <= now_ns) return std::uint64_t{0};
+        return ptr->expiry_ns - now_ns;
+    }
+
+    // --------------------------------------------------------------------
+    // P1-31: shared TTL index hooks (see detail/ttl_heap.hpp)
+    // --------------------------------------------------------------------
+    // Public because the CRTP mixin base calls back into them. Internal
+    // contract points, not user API.
+public:
+    using ttl_probe_result = detail::ttl_heap<Key>::probe_result;
+    using ttl_base = detail::mm_ttl_index_mixin<mm_fifo<Key, Value, Hash, KeyEqual>, Key>;
+
+    ttl_probe_result ttl_probe_entry(const Key& key, std::uint64_t heap_expiry) {
+        auto ptr = map_.find(key);
+        if (!ptr) return ttl_probe_result::absent;
+        if (ptr->expiry_ns != heap_expiry) return ttl_probe_result::stale;
+        if (ptr->has_active_handle()) return ttl_probe_result::pinned;
+        return ttl_probe_result::ready;
+    }
+
+    /// O7: TTL expiration — fire on_expire (not on_evict).
+    void ttl_erase_expired(const Key& key) { erase_expired_impl(key); }
+
+    std::size_t ttl_live_count() const { return items_.size(); }
+
+    template <typename Emit>
+    void ttl_for_each_live(Emit&& emit) const {
+        for (auto* curr = items_.head(); curr != nullptr;
+             curr = items_.get_next(*curr)) {
+            if (curr->expiry_ns != 0) {
+                emit(curr->key, curr->expiry_ns);
+            }
+        }
+    }
+
+    std::size_t evict_expired() {
+        cleanup_pending_deletion();
+        return ttl_base::evict_expired();
+    }
+
+    std::size_t evict_expired_n(std::size_t batch_size) {
+        if (batch_size == 0) return evict_expired();
+        cleanup_pending_deletion();
+        return ttl_base::evict_expired_n(batch_size);
+    }
+
+private:
+    /// Expiry-aware erase: same removal as `erase_impl`, but fires `on_expire`
+    /// instead of `on_evict` so TTL expiry is not misreported as capacity
+    /// eviction in the operator-facing metrics (O7).
+    void erase_expired_impl(const Key& key) {
+        auto ptr = map_.find(key);
+        if (!ptr) return;
+        auto* item = ptr;
+        size_type mem = calc_item_memory(item->key, item->value);
+        stats_.current_memory.fetch_sub(mem);
+        callbacks_.collect_expire(item->key, std::move(item->value));
+        map_.erase(key);
+        item->refcount.unmarkInMMContainer();
+        items_.remove(*item);
+        detail::hazptr_domain::default_domain().retire(item);
+        stats_.current_size.store(total_size());
+    }
+
+private:
 
     template <typename V>
     void update_existing(item_ptr item, V&& value) {
@@ -3270,6 +3589,32 @@ struct mm_2q_config {
     /// Percentage of cache for Warm queue (default 40%)
     /// Remaining goes to Cold queue (default 30%)
     double warm_ratio = 0.4;
+
+    // --------------------------------------------------------------------
+    // P1-28 (fix.01 方案 B1): A1out ghost queue.
+    // --------------------------------------------------------------------
+    // The 2Q algorithm's defining feature is that a key which was evicted
+    // before earning a second reference is remembered — in a key-only "ghost"
+    // queue — so that when it is referenced again it is admitted directly into
+    // the protected (Warm) queue instead of starting over at the bottom of the
+    // window. Without it, "evicted then re-referenced" is indistinguishable
+    // from a cold miss, which is exactly the behaviour the evaluation report
+    // called out for this strategy.
+    //
+    // The ghost holds no values and is deliberately invisible to size(),
+    // current_memory() and iteration: it is bounded bookkeeping fed only by
+    // capacity-driven evictions of never-protected items.
+    /// Enable the A1out ghost queue (default on; no effect when cold eviction
+    /// pressure is absent).
+    bool enable_ghost_queue = true;
+    /// A1out capacity as a fraction of the Hot (A1in) quota. The published 2Q
+    /// tuning is Kout = Kin/2, which is the default. 0 disables the ghost
+    /// without touching enable_ghost_queue.
+    double ghost_ratio = 0.5;
+    /// Absolute A1out capacity override. 0 (default) = derive from
+    /// ghost_ratio and the Hot quota.
+    size_t max_ghost_entries = 0;
+
     /// Default time between promotions for the same item (seconds).
     /// 0 = no delay (traditional 2Q behavior).
     uint32_t default_lru_refresh_time = 60;
@@ -3334,6 +3679,17 @@ struct mm_2q_config {
             throw std::invalid_argument(
                 "mm_2q_config: hot_ratio + warm_ratio must not exceed 1.0");
         }
+        // P1-28: a NaN ghost_ratio would make every capacity comparison false
+        // and silently disable the bound, so it is rejected here rather than
+        // clamped at use time.
+        if (!(ghost_ratio >= 0.0)) {
+            throw std::invalid_argument(
+                "mm_2q_config: ghost_ratio must be non-negative and finite");
+        }
+        if (ghost_ratio > 1.0) {
+            throw std::invalid_argument(
+                "mm_2q_config: ghost_ratio must not exceed 1.0");
+        }
     }
 };
 
@@ -3352,13 +3708,26 @@ namespace mm2q {
 // 2Q Strategy
 // ============================================================================
 
-/// 2Q (Two Queues) eviction strategy.
-/// Divides the cache into Hot, Warm, and Cold queues:
-/// - New items enter Hot queue (head)
-/// - When Hot overflows, tail items move to Cold
-/// - Cold items that get accessed are promoted to Warm (with delayed promotion)
-/// - When Warm overflows, tail items move to Cold
-/// - Cold items are evicted first
+/// 2Q (Two Queues) eviction strategy — CacheLib MM2Q structure plus the
+/// key-only A1out ghost queue that gives 2Q its defining admission rule.
+///
+/// Resident queues:
+/// - Hot: the A1in window. New items enter here.
+/// - Warm: the Am protected queue. An item reaches it by being referenced
+///   again, either from Cold (promotion) or directly on re-insertion after a
+///   ghost hit.
+/// - Cold: unprotected overflow between Hot and Warm (CacheLib MM2Q's Cold).
+/// - When Hot or Warm overflows, its tail moves to Cold.
+/// - Cold items are evicted first; eviction order is Cold → Hot → Warm.
+///
+/// A1out (P1-28):
+/// - A capacity-driven eviction of an item that never reached Warm records
+///   its KEY in a bounded FIFO ghost queue (`ghost_fifo_`).
+/// - Re-inserting a ghosted key admits the item straight into Warm and takes
+///   the key out of the ghost, so the second reference is not wasted.
+/// - The ghost stores keys only, is bounded by `ghost_ratio` (Kout = Kin/2 by
+///   default) and is deliberately excluded from size(), current_memory() and
+///   iteration — it is admission bookkeeping, not cached data.
 template <
     typename Key,
     typename Value,
@@ -3369,7 +3738,8 @@ template <
 >
 /// A4: 线程安全契约——此类非线程安全，调用方必须确保在外层 unified_cache 锁内访问。
 /// 内部 update_mutex_ 仅用于 try_lock_update 路径的解耦优化，不保证 MM 层独立线程安全。
-class mm_2q : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>> {
+class mm_2q : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>>,
+              public detail::mm_ttl_index_mixin<mm_2q<Key, Value, Hash, KeyEqual>, Key> {
 public:
     using key_type = Key;
     using mapped_type = Value;
@@ -3403,11 +3773,12 @@ public:
     mm_2q() : mm_2q(mm_2q_config{}) {}
 
     explicit mm_2q(const mm_2q_config& config)
-        : config_(config)
-        , map_(config.expected_items > 0
+        // Declaration order: map_ precedes config_ (see mm_lru()).
+        : map_(config.expected_items > 0
             ? map_type::buckets_for_items(config.expected_items)
             : 1024,
             config.alloc_fn, config.dealloc_fn)
+        , config_(config)
         , lru_refresh_time_(config.default_lru_refresh_time)
         , next_reconfigure_time_(config.mm_reconfigure_interval_secs == 0
             ? std::numeric_limits<uint32_t>::max()
@@ -3544,15 +3915,9 @@ public:
         // lazily by evict_expired() / the background TTL cleaner, NOT here,
         // so we don't need a write lock on the hot path.
         if (ptr->expiry_ns != 0) {
-            // P1-10: Track TTL check frequency on the read path.
-            stats_.ttl_checked_count.fetch_add(1, std::memory_order_relaxed);
-            auto now_ns = static_cast<std::uint64_t>(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-            if (now_ns >= ptr->expiry_ns) {
-                stats_.ttl_expired_count.fetch_add(1, std::memory_order_relaxed);
-                ptr->refcount.decRef();
-                stats_.register_miss();
-                callbacks_.collect_miss(key);
+            // P1-32: the ONE shared expiry check (see detail::check_expiry).
+            if (detail::check_expiry(*ptr, key, stats_, callbacks_, true) ==
+                detail::expiry_check_result::kExpired) {
                 return {};
             }
         }
@@ -3654,12 +4019,21 @@ public:
         for (auto* item : to_retire) {
             detail::hazptr_domain::default_domain().retire(item);
         }
+        // P1-28: an emptied cache must not remember admission history from the
+        // previous contents. flush() is also the path taken by the destructor
+        // and by rebuild_from_serialized(), so this keeps all three clean.
+        ghost_clear();
         stats_.current_size.store(total_size());
         cleanup_pending_deletion();
     }
 
     bool contains(const Key& key) const {
-        return map_.contains(key);
+        auto* item = map_.find_embedded_shared(key);
+        if (!item) return false;
+        // P1-32: TTL-aware presence — an expired-but-not-yet-swept item is
+        // reported absent, exactly as get() reports it. See
+        // detail::contains_with_ttl for why this is shared by every strategy.
+        return detail::contains_with_ttl(*item, key, stats_, callbacks_);
     }
 
     // --------------------------------------------------------------------
@@ -3702,6 +4076,9 @@ public:
                 if (size() == old_size) break;
             }
         }
+        // P1-28: the A1out capacity is derived from max_size_, so shrinking the
+        // cache must re-bound the ghost as well.
+        ghost_trim();
     }
 
     void max_memory(size_type new_max) {
@@ -3808,6 +4185,74 @@ public:
     size_type warm_size() const noexcept { return queues_[mm2q::kQueueWarm].size(); }
     size_type cold_size() const noexcept { return queues_[mm2q::kQueueCold].size(); }
 
+    /// Which resident queue holds `key`, or `kNoQueue` when the key is not
+    /// resident.
+    ///
+    /// P1-28: this is the observable form of the admission decision. The A1out
+    /// ghost only matters if it CHANGES where a re-inserted key lands (Hot
+    /// window vs. protected Warm queue), and that is not visible from the queue
+    /// sizes alone — a ghost hit for key K pushes an unrelated Cold item out
+    /// while a miss pushes an unrelated Hot item out, so both can leave the
+    /// totals unchanged. Exposing the placement directly is what makes the
+    /// behaviour testable rather than inferred. It is also the natural
+    /// diagnostic for "why is this key being evicted so soon?".
+    static constexpr uint8_t kNoQueue = std::numeric_limits<uint8_t>::max();
+    uint8_t queue_of(const Key& key) const {
+        auto* item = map_.find_embedded_shared(key);
+        return item ? item->queue_id : kNoQueue;
+    }
+    /// P1-28: number of keys currently remembered in the A1out ghost queue.
+    /// Ghost entries hold no values and are never counted by size(),
+    /// current_memory() or iteration.
+    size_type ghost_size() const noexcept { return ghost_keys_.size(); }
+
+    /// Whether a resident `key` has already earned its second reference
+    /// (promoted Cold→Warm, either explicitly or by the ghost-hit admission).
+    ///
+    /// P1-28: this is the flag that decides whether the item may be fed into
+    /// A1out when it is evicted. It is exposed because the invariant it encodes
+    /// — "an item that reached the protected queue is not ghosted when it
+    /// leaves" — is otherwise only observable as a queue placement, which is
+    /// confounded by the rebalance that runs immediately after every insert and
+    /// eviction. Returns false for a non-resident key.
+    bool is_marked_accessed(const Key& key) const {
+        auto* item = map_.find_embedded_shared(key);
+        return item != nullptr && item->hook.is_accessed();
+    }
+
+    /// Whether `key` is currently remembered in the A1out index.
+    ///
+    /// P1-28: several invariants only exist as an implication over the ghost's
+    /// contents ("an item evicted WITHOUT the second-reference mark was
+    /// recorded"). Each insert/evict runs a `rebalance()` and can evict an
+    /// unrelated item, and the FIFO is bounded, so the contents cannot be
+    /// inferred from `ghost_size()` deltas alone. This read-only query is what
+    /// makes those implications directly testable instead of probabilistic.
+    bool is_ghosted(const Key& key) const { return ghost_keys_.contains(key); }
+
+    /// P1-28: configured A1out capacity (0 = ghost disabled or unbounded
+    /// capacity source, e.g. an unlimited cache with no explicit override).
+    size_type ghost_capacity() const noexcept {
+        if (!config_.enable_ghost_queue || config_.ghost_ratio <= 0.0) return 0;
+        if (config_.max_ghost_entries > 0) return config_.max_ghost_entries;
+        if (max_size_ == unlimited) return 0;
+        return static_cast<size_type>(static_cast<double>(max_size_) *
+                                      config_.hot_ratio * config_.ghost_ratio);
+    }
+
+    /// P1-28: approximate bookkeeping memory held outside the value budget.
+    /// Reported for observability only — it is intentionally NOT part of
+    /// current_memory(), so a cache at its memory ceiling never evicts a real
+    /// value to make room for a key-only ghost.
+    size_type ghost_bytes_estimate() const {
+        size_type bytes = 0;
+        for (const auto& k : ghost_fifo_) {
+            bytes += sizeof(Key) + 3 * sizeof(void*);
+            if (key_size_fn_) bytes += key_size_fn_(k);
+        }
+        return bytes;
+    }
+
     /// B8: Eviction age statistics for mm_2q (对齐 CacheLib MM2Q.h:774-821).
     /// Returns per-queue and overall statistics.
     struct eviction_age_stat_2q {
@@ -3819,7 +4264,8 @@ public:
         size_type cold_size = 0;
     };
 
-    eviction_age_stat_2q get_eviction_age_stat(std::size_t projected_length = 0) const noexcept {
+    eviction_age_stat_2q get_eviction_age_stat(
+        [[maybe_unused]] std::size_t projected_length = 0) const noexcept {
         eviction_age_stat_2q stat;
         const auto curr_time = current_time_sec();
         stat.hot_size = queues_[mm2q::kQueueHot].size();
@@ -3862,6 +4308,10 @@ public:
             ? std::numeric_limits<uint32_t>::max()
             : current_time_sec() + config.mm_reconfigure_interval_secs;
         rebalance();
+        // P1-28: the new config may lower the A1out capacity (or disable the
+        // ghost entirely), so the index must be re-bounded here. Without this a
+        // runtime `set_config()` could leave the ghost permanently over budget.
+        ghost_trim();
     }
 
     /// Pre-allocate hash table buckets for `expected_items` entries.
@@ -3999,7 +4449,7 @@ public:
         LockedIterator& operator=(const LockedIterator&) = delete;
         LockedIterator(LockedIterator&& other) noexcept
             : guard_(std::move(other.guard_)), mm_(other.mm_),
-              qid_(other.qid_), curr_(other.curr_) {}
+              curr_(other.curr_), qid_(other.qid_) {}
 
         void destroy() { guard_.destroy(); }
 
@@ -4234,9 +4684,24 @@ public:
                     callbacks_.collect_evict(key, std::move(value));
                 }
 
+                // P1-28 (方案 B1): decide whether this eviction feeds A1out
+                // BEFORE remove_from_queue() clears the hook flags. Only
+                // capacity displacement of an item that never earned a second
+                // reference is ghosted — an explicit del()/evict of a Warm item
+                // must not poison the admission decision.
+                const bool feeds_ghost =
+                    ghost_capacity() > 0 &&
+                    (qid == mm2q::kQueueHot ||
+                     (qid == mm2q::kQueueCold && !victim->hook.is_accessed()));
+
                 map_.erase(key);
                 remove_from_queue(victim);
                 victim->refcount.unmarkForEviction();
+                // `key` is still owned by the (retired but not yet reclaimed)
+                // victim, so it is valid to copy into the ghost here.
+                if (feeds_ghost) {
+                    ghost_record(key);
+                }
                 detail::hazptr_domain::default_domain().retire(victim);
                 break;
             }
@@ -4274,6 +4739,33 @@ private:
     // 3 separate intrusive lists for Hot/Warm/Cold queues
     item_list queues_[mm2q::kQueueCount];
     map_type map_;
+
+    // --------------------------------------------------------------------
+    // P1-28 (fix.01 方案 B1): A1out ghost queue.
+    // --------------------------------------------------------------------
+    // A std::list + hash-SET pair, NOT a fourth `queues_` entry. Every consumer
+    // of `queues_` (flush, has_active_handles, the two iterators, operator==,
+    // ttl_for_each_live, rebuild_from_serialized and the rebalance invariants)
+    // assumes each element is a live `cache_item` that is also in `map_`. A
+    // ghost entry is a bare key, so putting it there would make those loops
+    // dereference a non-item.
+    //
+    // The index is a set of KEYS (not a map keyed to a list iterator). Storing
+    // `std::list<Key>::iterator` values inside a hash map makes every lookup
+    // depend on stored iterators that are mutated in the same operation as the
+    // map, which is far more fragile than it looks for a structure whose only
+    // job is a bounded admission hint. A key-only set plus a FIFO walk on the
+    // rare hit costs O(ghost_capacity) only when a key is re-referenced after
+    // eviction, and that walk is splice-based so it does not allocate.
+    //
+    // A key trimmed out of the FIFO is removed from the set at the same moment,
+    // so the set never remembers a key the FIFO has forgotten: that is what
+    // keeps "ghost hit" == "second reference" exact in both directions.
+    std::list<Key> ghost_fifo_;
+    ankerl::unordered_dense::set<Key, Hash, KeyEqual> ghost_keys_;
+    /// Scratch space for ghost_take()'s FIFO unlink. Member, not a local, so a
+    /// hit does not allocate.
+    std::list<Key> ghost_scratch_;
 
     size_type max_size_ = unlimited;
     size_type max_memory_ = unlimited;
@@ -4338,9 +4830,15 @@ private:
     // Internal helpers
     // --------------------------------------------------------------------
 
-    size_type total_size() const {
-        return queues_[0].size() + queues_[1].size() + queues_[2].size();
-    }
+    /// P1-43 (fix.01 方案 A): "how many items do we hold" has exactly ONE
+    /// source of truth — the hash map. Previously `size()` returned
+    /// `map_.size()` while `total_size()` (used for `stats_.current_size` and
+    /// for the rebalance() invariants) summed the three queue lengths. After a
+    /// failed insertion the two disagreed indefinitely, so `should_evict()`
+    /// and the metrics answered different questions and `rebalance()` tripped
+    /// its assert. Both notions now derive from the same counter; the queues
+    /// are bookkeeping for ordering only.
+    size_type total_size() const noexcept { return map_.size(); }
 
     bool should_evict() const {
         if (max_size_ != unlimited && size() > max_size_) return true;
@@ -4360,9 +4858,9 @@ private:
         auto total = size();
         switch (qid) {
             case mm2q::kQueueHot:
-                return static_cast<size_type>(total * config_.hot_ratio);
+                return static_cast<size_type>(static_cast<double>(total) * config_.hot_ratio);
             case mm2q::kQueueWarm:
-                return static_cast<size_type>(total * config_.warm_ratio);
+                return static_cast<size_type>(static_cast<double>(total) * config_.warm_ratio);
             case mm2q::kQueueCold:
                 return total - expected_queue_size(mm2q::kQueueHot)
                             - expected_queue_size(mm2q::kQueueWarm);
@@ -4384,8 +4882,22 @@ private:
     }
 
     /// Record access with a pre-computed current time.
+    ///
+    /// P1-20 (fix.01 方案 A): `isInMMContainer()` is checked BOTH at entry and
+    /// again after `update_mutex_` is acquired. Re-linking a node that the
+    /// container has already dropped (`force_del()` moved it to
+    /// `pending_deletion_`, or a concurrent eviction unlinked it) corrupts the
+    /// intrusive list and can resurrect a deleted key. The second check is not
+    /// redundant: between the entry check and lock acquisition the item can be
+    /// unlinked by another thread, and promoting it then would push a detached
+    /// node back into a queue.
     bool record_access_at(item_ptr item, access_mode mode, uint32_t curr) {
         assert(item != nullptr);
+
+        // P1-20 check #1: entry guard (mirrors mm_lru::record_access_at).
+        if (!item->refcount.isInMMContainer()) [[unlikely]] {
+            return false;
+        }
 
         // Check updateOnWrite/updateOnRead
         if ((mode == access_mode::write && !config_.update_on_write) ||
@@ -4420,6 +4932,9 @@ private:
             if (qid == mm2q::kQueueCold) {
                 // Cold -> Warm promotion on access
                 move_to_queue(item, mm2q::kQueueWarm);
+                // P1-28: this item has now had its second reference, so it must
+                // never be admitted to A1out later. See insert_new().
+                item->hook.set_accessed();
                 // 仅当配置开启时才在 Cold→Warm 晋升后触发 rebalance
                 // （对齐 CacheLib MM2Q.h:739-741）
                 if (config_.rebalance_on_record_access) {
@@ -4437,6 +4952,11 @@ private:
             std::unique_lock<std::mutex> lock(update_mutex_.m, std::try_to_lock);
             if (!lock) {
                 stats_.try_lock_fail_count.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            // P1-20 check #2: re-validate under the lock. The item may have
+            // been unlinked while we were acquiring it.
+            if (!item->refcount.isInMMContainer()) [[unlikely]] {
                 return false;
             }
             promote();
@@ -4474,6 +4994,84 @@ private:
         item->hook.clear_accessed();
         item->refcount.unmarkInMMContainer();
         queues_[qid].remove(*item);
+    }
+
+    // ====================================================================
+    // P1-28 (fix.01 方案 B1): A1out ghost queue
+    // ====================================================================
+    //
+    // Invariants maintained by the three mutators below:
+    //   1. ghost_fifo_.size() == ghost_keys_.size() in steady state (both are
+    //      mutated together inside the try/catch of ghost_record()).
+    //   2. Every key in ghost_keys_ is also in ghost_fifo_ — a hit is only
+    //      reported for a key the FIFO still remembers, and a trimmed key is
+    //      removed from the set at the same moment.
+    //   3. Keys are unique and ordered FIFO by record time.
+    //   4. Both containers are bounded by ghost_capacity().
+    //
+    // Thread-safety: like the rest of mm_2q, these run under the caller's
+    // write lock. They are deliberately called ONLY from insert_new(), evict(),
+    // flush(), set_config() and max_size() — never from record_access_at() or
+    // rebalance(), which can run under `update_mutex_` alone (try_lock_update)
+    // and would therefore race with the exclusive-lock paths.
+
+    /// Consume a ghost hit: remove the key from the index and the FIFO.
+    /// Returns true when the key was remembered.
+    bool ghost_take(const Key& key) {
+        if (ghost_keys_.erase(key) == 0) return false;
+        // Unlink from the FIFO without allocating: splice the prefix that ends
+        // at `key` into the scratch list, drop its last element, splice back.
+        for (auto it = ghost_fifo_.begin(); it != ghost_fifo_.end(); ++it) {
+            if (KeyEqual{}(*it, key)) {
+                ghost_scratch_.splice(ghost_scratch_.end(), ghost_fifo_, ghost_fifo_.begin(),
+                                      std::next(it));
+                ghost_scratch_.pop_back();
+                ghost_fifo_.splice(ghost_fifo_.begin(), ghost_scratch_);
+                break;
+            }
+        }
+        return true;
+    }
+
+    /// Remember `key` as evicted-before-promotion. Never throws: this runs
+    /// inside evict(), after the victim has already left `map_` and its queue,
+    /// so letting a bad_alloc escape would abort the eviction half-way and
+    /// leave the queues holding a node that is no longer in the map — exactly
+    /// the map/queue split that P1-43/P1-44 exist to prevent.
+    void ghost_record(const Key& key) noexcept {
+        try {
+            // Re-recording an already-present key must not duplicate it; the
+            // FIFO position is refreshed by the erase + push_back below.
+            if (ghost_keys_.erase(key) != 0) {
+                for (auto it = ghost_fifo_.begin(); it != ghost_fifo_.end(); ++it) {
+                    if (KeyEqual{}(*it, key)) {
+                        ghost_fifo_.erase(it);
+                        break;
+                    }
+                }
+            }
+            ghost_fifo_.push_back(key);
+            ghost_keys_.insert(key);
+            ghost_trim();
+        } catch (...) {
+            // Bounded bookkeeping only: on allocation failure the cache keeps
+            // working, it just loses the admission hint for this key.
+        }
+    }
+
+    /// Enforce the A1out capacity, dropping the oldest keys first (FIFO).
+    void ghost_trim() {
+        const size_type capacity = ghost_capacity();
+        while (ghost_fifo_.size() > capacity && !ghost_fifo_.empty()) {
+            ghost_keys_.erase(ghost_fifo_.front());
+            ghost_fifo_.pop_front();
+        }
+    }
+
+    /// Drop the whole ghost (flush / rebuild).
+    void ghost_clear() noexcept {
+        ghost_fifo_.clear();
+        ghost_keys_.clear();
     }
 
     // ====================================================================
@@ -4549,7 +5147,7 @@ private:
     // ====================================================================
 
     template <typename V>
-    void insert_new(const Key& key, V&& value) {
+    void insert_new(const Key& key, V&& value, std::uint64_t expiry_ns = 0) {
         if (max_size_ == 0) return;
         while (should_evict()) {
             auto old_size = size();
@@ -4567,16 +5165,52 @@ private:
             }
         }
 
-        // Allocate new item — new items go to Hot queue
+        // Allocate new item — new items go to Hot queue.
+        // P1-44: the guard must be armed before the link — see
+        // detail::insert_rollback_guard.
         auto* item = this->allocate_item(key, std::forward<V>(value));
+        // P1-31 (fix.01 方案 A): item-level expiry. The shared `cache_item`
+        // already carried `expiry_ns`, but nothing in this strategy ever set it,
+        // so every TTL check here was dead code and TTL came only from the
+        // value-layer `ttl_entry<V>` wrapper (swept by an O(n) full-cache scan).
+        item->expiry_ns = expiry_ns;
+        detail::insert_rollback_guard<mm_2q> guard{
+            this, item, static_cast<void (*)(mm_2q&, item_ptr) noexcept>(
+                            [](mm_2q& mm, item_ptr it) noexcept {
+                                mm.queues_[it->queue_id].remove(*it);
+                            })};
         auto curr = current_time_sec();
         item->hook.update_time = curr;
         item->hook.clear_accessed();
-        item->queue_id = mm2q::kQueueHot;
+        // P1-28 (方案 B1): a key that was evicted before ever reaching Warm is
+        // remembered in A1out; seeing it again means "second reference", which
+        // is 2Q's admission rule for the protected queue. Such an item enters
+        // Warm directly instead of restarting at the bottom of the window.
+        // `ghost_take` consumes the entry, so the promotion can happen only
+        // once per eviction.
+        const uint8_t target_qid =
+            (ghost_capacity() > 0 && ghost_take(key)) ? mm2q::kQueueWarm : mm2q::kQueueHot;
+        // TEMP DEBUG (remove)
+        std::fprintf(stderr, "[ins] key=%d target=%u ghosted=%d cap=%zu\n",
+                     static_cast<int>(key), static_cast<unsigned>(target_qid),
+                     ghost_keys_.contains(key) ? 1 : 0,
+                     static_cast<std::size_t>(ghost_capacity()));
+        item->queue_id = target_qid;
+        if (target_qid == mm2q::kQueueWarm) {
+            // Mark "has been referenced at least once" so that if this item is
+            // later evicted from Cold it is NOT fed back into A1out — it
+            // already had its second reference. The kAccessedFlag is otherwise
+            // unused by mm_2q (nothing else in this strategy sets it).
+            item->hook.set_accessed();
+        }
 
-        queues_[mm2q::kQueueHot].link_at_head(*item);
+        queues_[target_qid].link_at_head(*item);
         item->refcount.markInMMContainer();
+        guard.linked = true;
         map_.insert(key, item);
+        guard.committed = true;
+        // P1-31: index the expiry only after the item is fully inserted.
+        this->ttl_index_push(key, expiry_ns);
 
         stats_.current_size.store(total_size());
         stats_.current_memory.fetch_add(mem);
@@ -4584,6 +5218,96 @@ private:
         callbacks_.collect_insert(key, item->value);
 
         rebalance();
+    }
+
+    // P1-31 (fix.01): item-level TTL entry points, public for the same reason
+    // as in mm_lru/mm_fifo/mm_tiny_lfu/mm_wtiny_lfu — `unified_cache` reaches
+    // them through a `requires { mm_.set_with_expiry(...); }` probe to decide
+    // whether the strategy supports native TTL.
+public:
+    /// P1-31 (fix.01 方案 A): set a value together with an absolute expiry
+    /// (nanoseconds since the steady_clock epoch; 0 means "no TTL").
+    /// Mirrors `mm_lru::set_with_expiry` so every strategy offers the cache layer
+    /// the same item-level TTL facility.
+    template <typename V>
+    void set_with_expiry(const Key& key, V&& value, std::uint64_t expiry_ns) {
+        auto ptr = map_.find(key);
+        if (!ptr) {
+            insert_new(key, std::forward<V>(value), expiry_ns);
+            return;
+        }
+        update_existing(ptr, std::forward<V>(value), access_mode::write);
+        ptr->expiry_ns = expiry_ns;
+        this->ttl_index_push(key, expiry_ns);
+    }
+
+    /// TTL lookup helper: remaining nanoseconds for a key, or nullopt when the
+    /// key is absent or carries no expiry.
+    std::optional<std::uint64_t> ttl_remaining_ns(const Key& key) const {
+        auto ptr = map_.find(key);
+        if (!ptr || ptr->expiry_ns == 0) return std::nullopt;
+        const auto now_ns = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        if (ptr->expiry_ns <= now_ns) return std::uint64_t{0};
+        return ptr->expiry_ns - now_ns;
+    }
+
+    // --------------------------------------------------------------------
+    // P1-31: shared TTL index hooks (see detail/ttl_heap.hpp)
+    // --------------------------------------------------------------------
+    // Public because the CRTP mixin base calls back into them. Internal
+    // contract points, not user API.
+public:
+    using ttl_probe_result = detail::ttl_heap<Key>::probe_result;
+    using ttl_base = detail::mm_ttl_index_mixin<mm_2q<Key, Value, Hash, KeyEqual>, Key>;
+
+    ttl_probe_result ttl_probe_entry(const Key& key, std::uint64_t heap_expiry) {
+        auto ptr = map_.find(key);
+        if (!ptr) return ttl_probe_result::absent;
+        if (ptr->expiry_ns != heap_expiry) return ttl_probe_result::stale;
+        if (ptr->has_active_handle()) return ttl_probe_result::pinned;
+        return ttl_probe_result::ready;
+    }
+
+    /// O7: TTL expiration — fire on_expire (not on_evict).
+    void ttl_erase_expired(const Key& key) { erase_expired_impl(key); }
+
+    std::size_t ttl_live_count() const { return static_cast<std::size_t>(size()); }
+
+    template <typename Emit>
+    void ttl_for_each_live(Emit&& emit) const {
+        for (const auto& q : queues_) {
+            for (auto* curr = q.head(); curr != nullptr; curr = q.get_next(*curr)) {
+                if (curr->expiry_ns != 0) {
+                    emit(curr->key, curr->expiry_ns);
+                }
+            }
+        }
+    }
+
+    std::size_t evict_expired() { return ttl_base::evict_expired(); }
+
+    std::size_t evict_expired_n(std::size_t batch_size) {
+        if (batch_size == 0) return evict_expired();
+        return ttl_base::evict_expired_n(batch_size);
+    }
+
+private:
+    /// Expiry-aware erase: same removal as `erase_impl`, but fires `on_expire`
+    /// instead of `on_evict` so TTL expiry is not misreported as capacity
+    /// eviction in the operator-facing metrics (O7).
+    void erase_expired_impl(const Key& key) {
+        auto ptr = map_.find(key);
+        if (!ptr) return;
+        auto* item = ptr;
+        if (item->has_active_handle()) return;
+        size_type mem = calc_item_memory(item->key, item->value);
+        stats_.current_memory.fetch_sub(mem);
+        callbacks_.collect_expire(item->key, std::move(item->value));
+        map_.erase(key);
+        remove_from_queue(item);
+        detail::hazptr_domain::default_domain().retire(item);
+        stats_.current_size.store(total_size());
     }
 
     template <typename V>
@@ -4619,8 +5343,26 @@ private:
     }
 
     /// B14: 原位替换节点，保留 queue_id、update_time 与 accessed 状态（对齐 CacheLib MM2Q.h:991-1025）。
+    ///
+    /// P1-24 (fix.01 方案 A): same container-membership transfer as
+    /// `mm_lru::replace_node()` — see the long comment there. The original
+    /// version never marked `new_node` in the container and never unmarked /
+    /// retired `old_node`, leaving the queue holding a node the refcount
+    /// layer considered unlinked (un-promotable, un-removable) and leaking
+    /// the replaced node.
+    ///
+    /// Runtime preconditions: old_node in container, new_node not in
+    /// container, old_node has no active handles.
     void replace_node(item_ptr old_node, item_ptr new_node) {
         assert(old_node != nullptr && new_node != nullptr);
+        if (old_node == new_node) return;
+        if (!old_node->refcount.isInMMContainer() || new_node->refcount.isInMMContainer()) {
+            return;
+        }
+        if (old_node->has_active_handle()) {
+            return;
+        }
+        new_node->refcount.unmarkInMMContainer();
         uint8_t qid = old_node->queue_id;
         new_node->hook.update_time = old_node->hook.update_time;
         if (old_node->hook.is_accessed()) {
@@ -4630,15 +5372,24 @@ private:
         }
         new_node->queue_id = qid;
         queues_[qid].replace(*old_node, *new_node);
+        // P1-24: transfer container membership (old → new).
+        old_node->refcount.unmarkInMMContainer();
+        new_node->refcount.markInMMContainer();
         // 更新 map
         map_.insert_or_assign(old_node->key, new_node);
+        // P1-24: retire the detached old_node (refcount drained above).
+        detail::hazptr_domain::default_domain().retire(old_node);
     }
 
+    // P0-2 (fix.01 方案 A): see the note in mm_lru — this setter must be
+    // public so unified_cache / sharded_mm_lru can forward to it.
+public:
     /// B15: 设置淘汰谓词。
     void set_eviction_predicate(std::function<bool(const Key&, const Value&)> pred) {
         eviction_predicate_ = std::move(pred);
     }
 
+private:
     void erase_impl(const Key& key) {
         auto ptr = map_.find(key);
         if (!ptr) return;
@@ -4658,34 +5409,36 @@ private:
     void rebalance() {
         if (max_size_ == unlimited) return;
 
-        // 不变量：三队列 size 之和等于 map 实际持有量
+        // P1-43: the queue lengths and the map size now derive from ONE
+        // counter (map_.size()), so this invariant is a genuine structural
+        // check rather than a comparison of two independently-maintained
+        // tallies.
         assert(hot_size() + warm_size() + cold_size() == size());
 
+        // P1-44: the defensive `map_.contains(tail->key)` probes that used to
+        // guard these two loops have been deleted. They existed only to paper
+        // over the missing insert-rollback invariant (an item linked into a
+        // queue but absent from the map). With
+        // detail::insert_rollback_guard in insert_new(), queue membership and
+        // map membership are established atomically from the caller's point of
+        // view, so every node reachable from a queue tail is in the map and
+        // the probe was a wasted hash lookup per demotion.
+        //
         // A5: rebalance 顺序为 Warm→Hot→Cold（对齐 CacheLib MM2Q.h:843-883）
         // Move overflow from Warm to Cold first
         auto expected_warm = expected_queue_size(mm2q::kQueueWarm);
         while (queues_[mm2q::kQueueWarm].size() > expected_warm) {
             auto* tail = queues_[mm2q::kQueueWarm].tail();
-            assert(tail != nullptr);
             if (!tail) break;
-            if (map_.contains(tail->key)) {
-                move_to_queue(tail, mm2q::kQueueCold, /*to_tail=*/true);
-            } else {
-                break;
-            }
+            move_to_queue(tail, mm2q::kQueueCold, /*to_tail=*/true);
         }
 
         // Move overflow from Hot to Cold
         auto expected_hot = expected_queue_size(mm2q::kQueueHot);
         while (queues_[mm2q::kQueueHot].size() > expected_hot) {
             auto* tail = queues_[mm2q::kQueueHot].tail();
-            assert(tail != nullptr);
             if (!tail) break;
-            if (map_.contains(tail->key)) {
-                move_to_queue(tail, mm2q::kQueueCold, /*to_tail=*/true);
-            } else {
-                break;
-            }
+            move_to_queue(tail, mm2q::kQueueCold, /*to_tail=*/true);
         }
 
         // 不变量：rebalance 后三队列 size 之和仍等于 map 实际持有量
@@ -4733,11 +5486,24 @@ struct mm_tiny_lfu_config {
     /// Ratio of Tiny (window) cache to total cache (default 1%)
     double window_to_cache_size_ratio = 0.01;
 
-    /// CountMinSketch error rate (default 0.5)
-    double cms_error_rate = 0.5;
+    /// P1-25 (fix.01 方案 A): CountMinSketch sizing now follows CacheLib's
+    /// parameterisation instead of (error_rate, confidence). Those two produced a
+    /// table of 6 x 7 = 42 counters REGARDLESS of cache capacity, so frequency
+    /// estimates were collision noise and TinyLFU admission was effectively
+    /// random. Sizing is now
+    ///     numCounters = next_pow2(e * expected_items * window_multiplier / error_threshold)
+    ///
+    /// Counter window multiplier (CacheLib: windowToCacheSizeRatio, default 32).
+    /// Larger = more counters = more accurate frequency estimates, more memory.
+    std::size_t cms_window_multiplier = 32;
 
-    /// CountMinSketch confidence (default 0.99)
-    double cms_confidence = 0.99;
+    /// Counter error threshold (CacheLib: kErrorThreshold, default 5). Smaller =
+    /// more counters = more accurate. Must be > 0.
+    double cms_error_threshold = 5.0;
+
+    /// Number of hash rows (CacheLib: kHashCount, default 4). More rows = fewer
+    /// over-estimates at the cost of more probes per access.
+    std::size_t cms_hash_count = 4;
 
     /// Default time between promotions for the same item (seconds).
     /// 0 = no delay (traditional behavior).
@@ -4803,13 +5569,18 @@ struct mm_tiny_lfu_config {
             throw std::invalid_argument(
                 "mm_tiny_lfu_config: window_to_cache_size_ratio must be in (0, 0.5]");
         }
-        if (cms_error_rate <= 0.0 || cms_error_rate >= 1.0) {
+        // P1-25: validate the CacheLib-style CMS parameters.
+        if (cms_window_multiplier == 0) {
             throw std::invalid_argument(
-                "mm_tiny_lfu_config: cms_error_rate must be in (0, 1)");
+                "mm_tiny_lfu_config: cms_window_multiplier must be >= 1");
         }
-        if (cms_confidence <= 0.0 || cms_confidence >= 1.0) {
+        if (cms_error_threshold <= 0.0) {
             throw std::invalid_argument(
-                "mm_tiny_lfu_config: cms_confidence must be in (0, 1)");
+                "mm_tiny_lfu_config: cms_error_threshold must be > 0");
+        }
+        if (cms_hash_count == 0) {
+            throw std::invalid_argument(
+                "mm_tiny_lfu_config: cms_hash_count must be >= 1");
         }
         if (!(lru_refresh_ratio >= 0.0)) {
             throw std::invalid_argument(
@@ -4837,7 +5608,8 @@ template <
 >
 /// A4: 线程安全契约——此类非线程安全，调用方必须确保在外层 unified_cache 锁内访问。
 /// 内部 update_mutex_ 仅用于 try_lock_update 路径的解耦优化，不保证 MM 层独立线程安全。
-class mm_tiny_lfu : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>> {
+class mm_tiny_lfu : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>>,
+                    public detail::mm_ttl_index_mixin<mm_tiny_lfu<Key, Value, Hash, KeyEqual>, Key> {
 public:
     using key_type = Key;
     using mapped_type = Value;
@@ -4877,16 +5649,20 @@ public:
     mm_tiny_lfu() : mm_tiny_lfu(mm_tiny_lfu_config{}) {}
 
     explicit mm_tiny_lfu(const mm_tiny_lfu_config& config)
-        : config_(config)
-        , map_(config.expected_items > 0
+        // Declaration order: map_ precedes config_ (see mm_lru()).
+        : map_(config.expected_items > 0
             ? map_type::buckets_for_items(config.expected_items)
             : 1024,
             config.alloc_fn, config.dealloc_fn)
+        // Declaration order is map_, sketch_, config_, lru_refresh_time_,
+        // next_reconfigure_time_ — the list must match it.
+        , sketch_(config.expected_items, config.cms_window_multiplier,
+                  config.cms_error_threshold, config.cms_hash_count)
+        , config_(config)
         , lru_refresh_time_(config.default_lru_refresh_time)
         , next_reconfigure_time_(config.mm_reconfigure_interval_secs == 0
             ? std::numeric_limits<uint32_t>::max()
-            : current_time_sec() + config.mm_reconfigure_interval_secs)
-        , sketch_(1000, config.cms_error_rate, config.cms_confidence) {}
+            : current_time_sec() + config.mm_reconfigure_interval_secs) {}
 
     mm_tiny_lfu(size_type max_size, const mm_tiny_lfu_config& config = mm_tiny_lfu_config{})
         : mm_tiny_lfu(config) {
@@ -4959,6 +5735,33 @@ public:
         return true;
     }
 
+    /// P1-31 (fix.01 方案 A): set a value together with an absolute expiry
+    /// (nanoseconds since the steady_clock epoch; 0 means "no TTL").
+    /// Mirrors `mm_lru::set_with_expiry` so every strategy offers the cache layer
+    /// the same item-level TTL facility.
+    template <typename V>
+    void set_with_expiry(const Key& key, V&& value, std::uint64_t expiry_ns) {
+        auto ptr = map_.find(key);
+        if (!ptr) {
+            insert_new(key, std::forward<V>(value), expiry_ns);
+            return;
+        }
+        update_existing(ptr, std::forward<V>(value), access_mode::write);
+        ptr->expiry_ns = expiry_ns;
+        this->ttl_index_push(key, expiry_ns);
+    }
+
+    /// TTL lookup helper: remaining nanoseconds for a key, or nullopt when the
+    /// key is absent or carries no expiry.
+    std::optional<std::uint64_t> ttl_remaining_ns(const Key& key) const {
+        auto ptr = map_.find(key);
+        if (!ptr || ptr->expiry_ns == 0) return std::nullopt;
+        const auto now_ns = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        if (ptr->expiry_ns <= now_ns) return std::uint64_t{0};
+        return ptr->expiry_ns - now_ns;
+    }
+
     read_handle<Value> get(const Key& key) {
         auto ptr = map_.find(key);
         if (!ptr) {
@@ -5029,15 +5832,9 @@ public:
         // lazily by evict_expired() / the background TTL cleaner, NOT here,
         // so we don't need a write lock on the hot path.
         if (ptr->expiry_ns != 0) {
-            // P1-10: Track TTL check frequency on the read path.
-            stats_.ttl_checked_count.fetch_add(1, std::memory_order_relaxed);
-            auto now_ns = static_cast<std::uint64_t>(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-            if (now_ns >= ptr->expiry_ns) {
-                stats_.ttl_expired_count.fetch_add(1, std::memory_order_relaxed);
-                ptr->refcount.decRef();
-                stats_.register_miss();
-                callbacks_.collect_miss(key);
+            // P1-32: the ONE shared expiry check (see detail::check_expiry).
+            if (detail::check_expiry(*ptr, key, stats_, callbacks_, true) ==
+                detail::expiry_check_result::kExpired) {
                 return {};
             }
         }
@@ -5117,8 +5914,13 @@ public:
         }
         if (!tail) return std::nullopt;
         if (!map_.contains(tail->key)) return std::nullopt;
+        // P1-42 (fix.01 方案 A): account the item's memory BEFORE moving the
+        // key/value out. A value-based size calculator (e.g. `v.size()`) sees
+        // a moved-from value after `std::move`, so computing the charge
+        // afterwards under-counts it and `current_memory()` drifts away from
+        // the amount charged at insertion, eroding the max_memory cap.
+        size_type mem = calc_item_memory(tail->key, tail->value);
         std::pair<Key, Value> result{std::move(tail->key), std::move(tail->value)};
-        size_type mem = calc_item_memory(result.first, result.second);
         stats_.current_memory.fetch_sub(mem);
         remove_from_queue(tail);
         map_.erase(result.first);
@@ -5176,7 +5978,12 @@ public:
     }
 
     bool contains(const Key& key) const {
-        return map_.contains(key);
+        auto* item = map_.find_embedded_shared(key);
+        if (!item) return false;
+        // P1-32: TTL-aware presence — an expired-but-not-yet-swept item is
+        // reported absent, exactly as get() reports it. See
+        // detail::contains_with_ttl for why this is shared by every strategy.
+        return detail::contains_with_ttl(*item, key, stats_, callbacks_);
     }
 
     // --------------------------------------------------------------------
@@ -5774,9 +6581,11 @@ protected:
         return (qid == kMainQueue) ? main_queue_ : tiny_queue_;
     }
 
-    size_type total_size() const {
-        return tiny_queue_.size() + main_queue_.size();
-    }
+    /// P1-43 (fix.01 方案 A): single source of truth — see
+    /// `mm_2q::total_size()`. Queue lengths are ordering bookkeeping; the
+    /// item count comes from the hash map, which is what capacity decisions
+    /// (`size()`) already used.
+    size_type total_size() const noexcept { return map_.size(); }
 
     bool should_evict() const {
         if (max_size_ != unlimited && size() > max_size_) return true;
@@ -5793,7 +6602,7 @@ protected:
 
     size_type expected_tiny_size() const {
         auto total = max_size_ != unlimited ? max_size_ : size();
-        return std::max(size_type(1), static_cast<size_type>(total * config_.window_to_cache_size_ratio));
+        return std::max(size_type(1), static_cast<size_type>(static_cast<double>(total) * config_.window_to_cache_size_ratio));
     }
 
     void remove_from_queue(item_ptr item) {
@@ -5809,15 +6618,36 @@ protected:
 
     /// Record access to an item, with delayed promotion support.
     /// Returns true if the item was actually promoted (moved to head).
+    ///
+    /// P1-20 (fix.01 方案 A + 方案 B): one shared promotion path
+    /// (`promote_item()`) for all five strategies, plus the
+    /// `isInMMContainer()` guard at entry and again under `update_mutex_`.
+    /// `record_access` is now a thin wrapper over `record_access_at` so the
+    /// two entry points cannot drift apart.
     bool record_access(item_ptr item, access_mode mode) {
+        return record_access_at(item, mode, current_time_sec());
+    }
+
+    /// Record access with a pre-computed current time.
+    ///
+    /// P1-20 (fix.01 方案 A): `isInMMContainer()` is checked BOTH at entry and
+    /// again after `update_mutex_` is acquired. Re-linking a node the container
+    /// has already dropped corrupts the intrusive list and can resurrect a
+    /// deleted key; between the entry check and lock acquisition the item can
+    /// also be unlinked by a concurrent eviction.
+    bool record_access_at(item_ptr item, access_mode mode, uint32_t curr) {
         assert(item != nullptr);
+
+        // P1-20 check #1: entry guard.
+        if (!item->refcount.isInMMContainer()) [[unlikely]] {
+            return false;
+        }
+
         // Check updateOnWrite/updateOnRead
         if ((mode == access_mode::write && !config_.update_on_write) ||
             (mode == access_mode::read && !config_.update_on_read)) {
             return false;
         }
-
-        auto curr = current_time_sec();
 
         // D3+A3: 对齐 CacheLib——首次访问(is_accessed==false)必提升；
         // 已访问节点仅在超 refresh time 后提升。移除 update_time>0 守卫。
@@ -5829,68 +6659,41 @@ protected:
 
         // A5: try_lock_update 优化——若启用，则尝试加锁；失败则返回 false 跳过提升（不阻塞）。
         // 对齐 CacheLib MMLru.h:567-577。成功获取锁后正常执行提升逻辑。
-        auto promote = [this, item, curr]() {
-            // B1: 在 promote 路径上定期调整 lru_refresh_time_
-            reconfigure_locked(curr);
-
-            // Move to head in the current queue
-            auto& queue = get_queue(item->queue_id);
-            queue.move_to_head(*item);
-            item->hook.update_time = curr;
-
-            // 提升成功时更新频率计数（统一入口，对齐 MMTinyLFU.h:771 updateFrequenciesLocked）。
-            // 读/写访问路径均由此更新 CMS，避免上层 get/set 重复记录。
-            sketch_.record(item->key);
-        };
-
         if (try_lock_update_enabled()) {
             std::unique_lock<std::mutex> lock(update_mutex_.m, std::try_to_lock);
             if (!lock) {
                 stats_.try_lock_fail_count.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
-            promote();
+            // P1-20 check #2: re-validate under the lock.
+            if (!item->refcount.isInMMContainer()) [[unlikely]] {
+                return false;
+            }
+            promote_item(item, curr);
         } else {
-            promote();
+            promote_item(item, curr);
         }
 
         return true;
     }
 
-    /// Record access with a pre-computed current time.
-    bool record_access_at(item_ptr item, access_mode mode, uint32_t curr) {
-        assert(item != nullptr);
-        if ((mode == access_mode::write && !config_.update_on_write) ||
-            (mode == access_mode::read && !config_.update_on_read)) {
-            return false;
-        }
+    /// P1-20 方案 B: the single promotion implementation shared by
+    /// `record_access` / `record_access_at` (and used by mm_2q and
+    /// mm_wtiny_lfu in the same shape). Callers must hold `update_mutex_`
+    /// (or the external write lock when `try_lock_update` is disabled) and
+    /// must have validated `isInMMContainer()`.
+    void promote_item(item_ptr item, uint32_t curr) {
+        // B1: 在 promote 路径上定期调整 lru_refresh_time_
+        reconfigure_locked(curr);
 
-        if (!item->hook.is_accessed()) {
-            item->hook.set_accessed();
-        } else if (curr < item->hook.update_time + lru_refresh_time_) {
-            return false;
-        }
+        // Move to head in the current queue
+        auto& queue = get_queue(item->queue_id);
+        queue.move_to_head(*item);
+        item->hook.update_time = curr;
 
-        auto promote = [this, item, curr]() {
-            reconfigure_locked(curr);
-            auto& queue = get_queue(item->queue_id);
-            queue.move_to_head(*item);
-            item->hook.update_time = curr;
-            sketch_.record(item->key);
-        };
-
-        if (try_lock_update_enabled()) {
-            std::unique_lock<std::mutex> lock(update_mutex_.m, std::try_to_lock);
-            if (!lock) {
-                stats_.try_lock_fail_count.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            promote();
-        } else {
-            promote();
-        }
-
-        return true;
+        // 提升成功时更新频率计数（统一入口，对齐 MMTinyLFU.h:771 updateFrequenciesLocked）。
+        // 读/写访问路径均由此更新 CMS，避免上层 get/set 重复记录。
+        sketch_.record(item->key);
     }
 
     // ====================================================================
@@ -5898,8 +6701,17 @@ protected:
     // ====================================================================
 
     template <typename V>
-    void insert_new(const Key& key, V&& value) {
+    void insert_new(const Key& key, V&& value, std::uint64_t expiry_ns = 0) {
         if (max_size_ == 0) return;
+        // P1-28 / P1-27: drain the Tiny window BEFORE the new item enters it.
+        // `evict()` treats a Tiny tail as an eviction candidate, and Tiny is the
+        // freshest part of the cache, so running the capacity loop after the
+        // insert would let it evict the item being inserted.
+        while (tiny_queue_.size() > expected_tiny_size()) {
+            auto* t = tiny_queue_.tail();
+            if (!t || t->has_active_handle()) break;
+            promote_tiny_tail_to_main();
+        }
         while (should_evict()) {
             auto old_size = size();
             evict();
@@ -5916,9 +6728,18 @@ protected:
             }
         }
 
-        // New items always enter Tiny queue
+        // New items always enter Tiny queue.
+        // P1-44: the guard must be armed before the link — see
+        // detail::insert_rollback_guard.
         auto* item = this->allocate_item(key, std::forward<V>(value));
         assert(item != nullptr);
+        // P1-31 (fix.01 方案 A): item-level expiry (see mm_lru::insert_new).
+        item->expiry_ns = expiry_ns;
+        detail::insert_rollback_guard<mm_tiny_lfu> guard{
+            this, item, static_cast<void (*)(mm_tiny_lfu&, item_ptr) noexcept>(
+                            [](mm_tiny_lfu& mm, item_ptr it) noexcept {
+                                mm.get_queue(it->queue_id).remove(*it);
+                            })};
         auto curr = current_time_sec();
         item->hook.update_time = curr;
         item->hook.clear_accessed();  // Not yet accessed
@@ -5926,7 +6747,12 @@ protected:
 
         tiny_queue_.link_at_head(*item);
         item->refcount.markInMMContainer();
+        guard.linked = true;
         map_.insert(key, item);
+        guard.committed = true;
+        // P1-31: index the expiry only after the item is fully inserted, so a
+        // throw from map_.insert() cannot leave an index entry behind.
+        this->ttl_index_push(key, expiry_ns);
 
         sketch_.record(key);
         stats_.current_size.store(total_size());
@@ -5970,26 +6796,55 @@ protected:
         callbacks_.collect_update(item->key, item->value);
     }
 
-    /// A9 修正: 对齐 CacheLib MMTinyLFU.h:866-878。
-    /// Tiny 超容时无条件晋升 Tiny tail 到 Main head，不淘汰。
-    /// 频率比较仅在 evict() 路径中进行（对齐 LockedIterator::evictTiny 语义）。
+    /// P1-28 (fix.01 方案 A): the promotion path now performs the missing
+    /// admission comparison (`maybePromoteTailLocked` in CacheLib
+    /// MMTinyLFU.h:866-878) instead of unconditionally displacing the main
+    /// tail. Without it, a cold newcomer could always force out the hottest
+    /// item at the main tail, and the frequency comparison that exists in
+    /// `evict()` never applied to the window→main transition.
+    ///
+    /// P1-21: the loop is bounded and never spins on a pinned tiny tail.
     void maybe_promote_from_tiny() {
-        auto expected_tiny = expected_tiny_size();
+        const auto expected_tiny = expected_tiny_size();
+        const auto main_capacity = (max_size_ != unlimited && max_size_ > expected_tiny)
+                                       ? (max_size_ - expected_tiny)
+                                       : unlimited;
         while (tiny_queue_.size() > expected_tiny) {
-            auto old_size = tiny_queue_.size();
-            auto* tiny_tail = tiny_queue_.tail();
-            if (!tiny_tail) break;
+            auto* candidate = tiny_queue_.tail();
+            if (!candidate) break;
+            // A pinned candidate cannot be moved — stop instead of spinning.
+            if (candidate->has_active_handle()) {
+                stats_.pinned_skip_count.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
 
-            // Unconditional promotion: move Tiny tail to Main head
-            // (CacheLib: maybePromoteTailLocked in add() always promotes)
-            auto main_capacity = (max_size_ != unlimited)
-                ? (max_size_ > expected_tiny ? max_size_ - expected_tiny : 0)
-                : unlimited;
+            // Main is over its share: run the admission comparison first.
             if (main_capacity != unlimited && main_queue_.size() >= main_capacity) {
-                evict_from_main();
+                auto* main_tail = find_eviction_victim_in_queue(main_queue_);
+                if (main_tail) {
+                    auto cand_freq = sketch_.estimate(candidate->key);
+                    auto main_freq = sketch_.estimate(main_tail->key);
+                    const bool admit = config_.newcomer_wins_on_tie
+                                           ? (cand_freq >= main_freq)
+                                           : (cand_freq > main_freq);
+                    if (!admit) {
+                        // Newcomer loses: evict it and keep the hot main tail.
+                        // evict_generic() returns false if the victim is pinned
+                        // (find_eviction_victim_in_queue() already filtered
+                        // those, so this is a defensive bound): stop rather
+                        // than re-selecting the same item forever.
+                        if (!evict_generic(candidate, tiny_queue_)) break;
+                        continue;
+                    }
+                    // Newcomer wins: make room by evicting the main tail.
+                    if (!evict_generic(main_tail, main_queue_)) break;
+                } else {
+                    // Every main candidate is pinned: still promote, mirroring
+                    // the graceful degradation the previous code documented,
+                    // rather than deadlocking on a full main queue.
+                }
             }
             promote_tiny_tail_to_main();
-            if (tiny_queue_.size() == old_size) break;  // No progress, exit
         }
     }
 
@@ -6003,10 +6858,16 @@ protected:
     }
 
     /// 从指定队列中淘汰一个通用节点。
-    void evict_generic(item_ptr item, item_list& queue) {
+    ///
+    /// P1-21 (fix.01 方案 A): returns whether the eviction actually happened.
+    /// `markForEviction()` legitimately fails on a pinned or already-exclusive
+    /// item; the old `void` return made that indistinguishable from success, so
+    /// callers that looped on "size decreased" had no way to detect a lack of
+    /// progress and could spin forever.
+    bool evict_generic(item_ptr item, item_list& queue) {
         auto evict_result = item->refcount.markForEviction();
         if (evict_result != detail::MarkForEvictionResult::kSuccess) {
-            return;  // Cannot evict — item has active handles or is already exclusive
+            return false;  // Cannot evict — item has active handles or is already exclusive
         }
         const auto& key = item->key;
         size_type mem = calc_item_memory(key, item->value);
@@ -6022,6 +6883,7 @@ protected:
         queue.remove(*item);
         detail::hazptr_domain::default_domain().retire(item);
         stats_.current_size.store(total_size());
+        return true;
     }
 
     void evict_from_tiny() {
@@ -6049,8 +6911,26 @@ protected:
     }
 
     /// B14: 原位替换节点，保留 queue_id、update_time 与 accessed 状态。
+    ///
+    /// P1-24 (fix.01 方案 A): same container-membership transfer as
+    /// `mm_lru::replace_node()` — see the long comment there. The original
+    /// version never marked `new_node` in the container and never unmarked /
+    /// retired `old_node`, leaving the queue holding a node the refcount
+    /// layer considered unlinked (un-promotable, un-removable) and leaking
+    /// the replaced node.
+    ///
+    /// Runtime preconditions: old_node in container, new_node not in
+    /// container, old_node has no active handles.
     void replace_node(item_ptr old_node, item_ptr new_node) {
         assert(old_node != nullptr && new_node != nullptr);
+        if (old_node == new_node) return;
+        if (!old_node->refcount.isInMMContainer() || new_node->refcount.isInMMContainer()) {
+            return;
+        }
+        if (old_node->has_active_handle()) {
+            return;
+        }
+        new_node->refcount.unmarkInMMContainer();
         new_node->hook.update_time = old_node->hook.update_time;
         if (old_node->hook.is_accessed()) {
             new_node->hook.set_accessed();
@@ -6060,14 +6940,23 @@ protected:
         new_node->queue_id = old_node->queue_id;
         auto& queue = get_queue(old_node->queue_id);
         queue.replace(*old_node, *new_node);
+        // P1-24: transfer container membership (old → new).
+        old_node->refcount.unmarkInMMContainer();
+        new_node->refcount.markInMMContainer();
         map_.insert_or_assign(old_node->key, new_node);
+        // P1-24: retire the detached old_node (refcount drained above).
+        detail::hazptr_domain::default_domain().retire(old_node);
     }
 
+    // P0-2 (fix.01 方案 A): see the note in mm_lru — this setter must be
+    // public so unified_cache / sharded_mm_lru can forward to it.
+public:
     /// B15: 设置淘汰谓词。
     void set_eviction_predicate(std::function<bool(const Key&, const Value&)> pred) {
         eviction_predicate_ = std::move(pred);
     }
 
+protected:
     void erase_impl(const Key& key) {
         auto ptr = map_.find(key);
         if (!ptr) return;
@@ -6076,6 +6965,70 @@ protected:
         size_type mem = calc_item_memory(item->key, item->value);
         stats_.current_memory.fetch_sub(mem);
         callbacks_.collect_evict(item->key, std::move(item->value));
+        remove_from_queue(item);
+        map_.erase(key);
+        detail::hazptr_domain::default_domain().retire(item);
+        stats_.current_size.store(total_size());
+    }
+
+    // --------------------------------------------------------------------
+    // P1-31: shared TTL index hooks (see detail/ttl_heap.hpp)
+    // --------------------------------------------------------------------
+    // Public because the CRTP mixin base (detail::mm_ttl_index_mixin) calls back
+    // into them and is not a derived class, so it cannot reach private members.
+    // They are internal contract points, not user API.
+public:
+    using ttl_probe_result = detail::ttl_heap<Key>::probe_result;
+    using ttl_base = detail::mm_ttl_index_mixin<mm_tiny_lfu<Key, Value, Hash, KeyEqual>, Key>;
+
+    ttl_probe_result ttl_probe_entry(const Key& key, std::uint64_t heap_expiry) {
+        auto ptr = map_.find(key);
+        if (!ptr) return ttl_probe_result::absent;
+        if (ptr->expiry_ns != heap_expiry) return ttl_probe_result::stale;
+        if (ptr->has_active_handle()) return ttl_probe_result::pinned;
+        return ttl_probe_result::ready;
+    }
+
+    /// O7: TTL expiration — fire on_expire (not on_evict).
+    void ttl_erase_expired(const Key& key) { erase_expired_impl(key); }
+
+    std::size_t ttl_live_count() const { return static_cast<std::size_t>(size()); }
+
+    template <typename Emit>
+    void ttl_for_each_live(Emit&& emit) const {
+        const item_list* queues[] = {&tiny_queue_, &main_queue_};
+        for (const auto* q : queues) {
+            for (auto* curr = q->head(); curr != nullptr; curr = q->get_next(*curr)) {
+                if (curr->expiry_ns != 0) {
+                    emit(curr->key, curr->expiry_ns);
+                }
+            }
+        }
+    }
+
+    std::size_t evict_expired() {
+        cleanup_pending_deletion();
+        return ttl_base::evict_expired();
+    }
+
+    std::size_t evict_expired_n(std::size_t batch_size) {
+        if (batch_size == 0) return evict_expired();
+        cleanup_pending_deletion();
+        return ttl_base::evict_expired_n(batch_size);
+    }
+
+private:
+    /// Expiry-aware erase: same removal as `erase_impl`, but fires `on_expire`
+    /// instead of `on_evict` so TTL expiry is not misreported as capacity
+    /// eviction in the operator-facing metrics (O7).
+    void erase_expired_impl(const Key& key) {
+        auto ptr = map_.find(key);
+        if (!ptr) return;
+        auto* item = ptr;
+        if (item->has_active_handle()) return;
+        size_type mem = calc_item_memory(item->key, item->value);
+        stats_.current_memory.fetch_sub(mem);
+        callbacks_.collect_expire(item->key, std::move(item->value));
         remove_from_queue(item);
         map_.erase(key);
         detail::hazptr_domain::default_domain().retire(item);
@@ -6128,11 +7081,13 @@ struct mm_wtiny_lfu_config {
     /// Minimum frequency to be promoted from Probation to Protection (default 3)
     uint32_t protection_freq = 3;
 
-    /// CountMinSketch error rate
-    double cms_error_rate = 0.5;
-
-    /// CountMinSketch confidence
-    double cms_confidence = 0.99;
+    /// P1-25 (fix.01 方案 A): CountMinSketch sizing follows CacheLib —
+    /// numCounters = next_pow2(e * expected_items * window_multiplier /
+    /// error_threshold). The old (error_rate, confidence) pair produced 42
+    /// counters regardless of capacity, making frequency estimates noise.
+    std::size_t cms_window_multiplier = 32;
+    double cms_error_threshold = 5.0;
+    std::size_t cms_hash_count = 4;
 
     /// Default time between promotions for the same item (seconds).
     /// 0 = no delay (traditional behavior).
@@ -6212,13 +7167,18 @@ struct mm_wtiny_lfu_config {
             throw std::invalid_argument(
                 "mm_wtiny_lfu_config: protection_ratio must be in [0, 1]");
         }
-        if (cms_error_rate <= 0.0 || cms_error_rate >= 1.0) {
+        // P1-25: validate the CacheLib-style CMS parameters.
+        if (cms_window_multiplier == 0) {
             throw std::invalid_argument(
-                "mm_wtiny_lfu_config: cms_error_rate must be in (0, 1)");
+                "mm_wtiny_lfu_config: cms_window_multiplier must be >= 1");
         }
-        if (cms_confidence <= 0.0 || cms_confidence >= 1.0) {
+        if (cms_error_threshold <= 0.0) {
             throw std::invalid_argument(
-                "mm_wtiny_lfu_config: cms_confidence must be in (0, 1)");
+                "mm_wtiny_lfu_config: cms_error_threshold must be > 0");
+        }
+        if (cms_hash_count == 0) {
+            throw std::invalid_argument(
+                "mm_wtiny_lfu_config: cms_hash_count must be >= 1");
         }
         if (!(lru_refresh_ratio >= 0.0)) {
             throw std::invalid_argument(
@@ -6248,7 +7208,8 @@ template <
 >
 /// A4: 线程安全契约——此类非线程安全，调用方必须确保在外层 unified_cache 锁内访问。
 /// 内部 update_mutex_ 仅用于 try_lock_update 路径的解耦优化，不保证 MM 层独立线程安全。
-class mm_wtiny_lfu : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>> {
+class mm_wtiny_lfu : public detail::mm_allocator_mixin<detail::cache_item<Key, Value>>,
+                     public detail::mm_ttl_index_mixin<mm_wtiny_lfu<Key, Value, Hash, KeyEqual>, Key> {
 public:
     using key_type = Key;
     using mapped_type = Value;
@@ -6289,17 +7250,21 @@ public:
     mm_wtiny_lfu() : mm_wtiny_lfu(mm_wtiny_lfu_config{}) {}
 
     explicit mm_wtiny_lfu(const mm_wtiny_lfu_config& config)
-        : config_(config)
-        , map_(config.expected_items > 0
+        // Declaration order: map_ precedes config_ (see mm_lru()).
+        : map_(config.expected_items > 0
             ? map_type::buckets_for_items(config.expected_items)
             : 1024,
             config.alloc_fn, config.dealloc_fn)
+        // Declaration order is map_, sketch_, protection_freq_, config_,
+        // lru_refresh_time_, next_reconfigure_time_ — match it.
+        , sketch_(config.expected_items, config.cms_window_multiplier,
+                  config.cms_error_threshold, config.cms_hash_count)
         , protection_freq_(config.protection_freq)
+        , config_(config)
         , lru_refresh_time_(config.default_lru_refresh_time)
         , next_reconfigure_time_(config.mm_reconfigure_interval_secs == 0
             ? std::numeric_limits<uint32_t>::max()
-            : current_time_sec() + config.mm_reconfigure_interval_secs)
-        , sketch_(1000, config.cms_error_rate, config.cms_confidence) {}
+            : current_time_sec() + config.mm_reconfigure_interval_secs) {}
 
     mm_wtiny_lfu(size_type max_size, const mm_wtiny_lfu_config& config = mm_wtiny_lfu_config{})
         : mm_wtiny_lfu(config) {
@@ -6369,6 +7334,33 @@ public:
         if (!ptr) return false;
         update_existing(ptr, std::forward<V>(value), access_mode::write);
         return true;
+    }
+
+    /// P1-31 (fix.01 方案 A): set a value together with an absolute expiry
+    /// (nanoseconds since the steady_clock epoch; 0 means "no TTL").
+    /// Mirrors `mm_lru::set_with_expiry` so every strategy offers the cache layer
+    /// the same item-level TTL facility.
+    template <typename V>
+    void set_with_expiry(const Key& key, V&& value, std::uint64_t expiry_ns) {
+        auto ptr = map_.find(key);
+        if (!ptr) {
+            insert_new(key, std::forward<V>(value), expiry_ns);
+            return;
+        }
+        update_existing(ptr, std::forward<V>(value), access_mode::write);
+        ptr->expiry_ns = expiry_ns;
+        this->ttl_index_push(key, expiry_ns);
+    }
+
+    /// TTL lookup helper: remaining nanoseconds for a key, or nullopt when the
+    /// key is absent or carries no expiry.
+    std::optional<std::uint64_t> ttl_remaining_ns(const Key& key) const {
+        auto ptr = map_.find(key);
+        if (!ptr || ptr->expiry_ns == 0) return std::nullopt;
+        const auto now_ns = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        if (ptr->expiry_ns <= now_ns) return std::uint64_t{0};
+        return ptr->expiry_ns - now_ns;
     }
 
     read_handle<Value> get(const Key& key) {
@@ -6444,15 +7436,9 @@ public:
         // lazily by evict_expired() / the background TTL cleaner, NOT here,
         // so we don't need a write lock on the hot path.
         if (ptr->expiry_ns != 0) {
-            // P1-10: Track TTL check frequency on the read path.
-            stats_.ttl_checked_count.fetch_add(1, std::memory_order_relaxed);
-            auto now_ns = static_cast<std::uint64_t>(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-            if (now_ns >= ptr->expiry_ns) {
-                stats_.ttl_expired_count.fetch_add(1, std::memory_order_relaxed);
-                ptr->refcount.decRef();
-                stats_.register_miss();
-                callbacks_.collect_miss(key);
+            // P1-32: the ONE shared expiry check (see detail::check_expiry).
+            if (detail::check_expiry(*ptr, key, stats_, callbacks_, true) ==
+                detail::expiry_check_result::kExpired) {
                 return {};
             }
         }
@@ -6529,8 +7515,13 @@ public:
         if (!tail) tail = find_unpinned_tail(probation_queue_);
         if (!tail) return std::nullopt;
         if (!map_.contains(tail->key)) return std::nullopt;
+        // P1-42 (fix.01 方案 A): account the item's memory BEFORE moving the
+        // key/value out. A value-based size calculator (e.g. `v.size()`) sees
+        // a moved-from value after `std::move`, so computing the charge
+        // afterwards under-counts it and `current_memory()` drifts away from
+        // the amount charged at insertion, eroding the max_memory cap.
+        size_type mem = calc_item_memory(tail->key, tail->value);
         std::pair<Key, Value> result{std::move(tail->key), std::move(tail->value)};
-        size_type mem = calc_item_memory(result.first, result.second);
         stats_.current_memory.fetch_sub(mem);
         remove_from_queue(tail);
         map_.erase(result.first);
@@ -6589,7 +7580,12 @@ public:
     }
 
     bool contains(const Key& key) const {
-        return map_.contains(key);
+        auto* item = map_.find_embedded_shared(key);
+        if (!item) return false;
+        // P1-32: TTL-aware presence — an expired-but-not-yet-swept item is
+        // reported absent, exactly as get() reports it. See
+        // detail::contains_with_ttl for why this is shared by every strategy.
+        return detail::contains_with_ttl(*item, key, stats_, callbacks_);
     }
 
     // --------------------------------------------------------------------
@@ -6886,7 +7882,7 @@ public:
         LockedIterator& operator=(const LockedIterator&) = delete;
         LockedIterator(LockedIterator&& other) noexcept
             : guard_(std::move(other.guard_)), mm_(other.mm_),
-              qid_(other.qid_), curr_(other.curr_) {}
+              curr_(other.curr_), qid_(other.qid_) {}
 
         void destroy() { guard_.destroy(); }
 
@@ -7110,10 +8106,16 @@ public:
     }
 
     /// 从指定队列中淘汰一个通用节点。
-    void evict_generic(item_ptr item, item_list& queue) {
+    ///
+    /// P1-21 (fix.01 方案 A): returns whether the eviction actually happened.
+    /// `markForEviction()` legitimately fails on a pinned or already-exclusive
+    /// item; the old `void` return made that indistinguishable from success, so
+    /// callers that looped on "size decreased" had no way to detect a lack of
+    /// progress and could spin forever.
+    bool evict_generic(item_ptr item, item_list& queue) {
         auto evict_result = item->refcount.markForEviction();
         if (evict_result != detail::MarkForEvictionResult::kSuccess) {
-            return;  // Cannot evict — item has active handles or is already exclusive
+            return false;  // Cannot evict — item has active handles or is already exclusive
         }
         const auto& key = item->key;
         size_type mem = calc_item_memory(key, item->value);
@@ -7129,55 +8131,52 @@ public:
         queue.remove(*item);
         detail::hazptr_domain::default_domain().retire(item);
         stats_.current_size.store(total_size());
+        return true;
     }
 
+    /// Evict one item to free a capacity slot.
+    ///
+    /// P1-27 (fix.01 方案 A): the Tiny window is the wrong place to reclaim
+    /// capacity from. It holds the newest arrivals, and the admission decision
+    /// that decides their fate lives in `maybe_promote_from_tiny()` /
+    /// `admit_to_probation()`. When `evict()` treated the Tiny tail as just
+    /// another candidate it could evict the item that `insert_new()` had only
+    /// just placed in the window (the newcomer is by construction the Tiny
+    /// tail), so a fresh `set()` could lose the value it just stored — for
+    /// `w_tiny_lfu<int,int> c(3); c.set(4,...)` the key would be gone
+    /// immediately.
+    ///
+    /// Capacity is therefore reclaimed from Main (Probation, then Protection)
+    /// whenever Main has an evictable candidate; Tiny is only used as a last
+    /// resort when Main is empty or entirely pinned (which is also what keeps
+    /// `shrink_to_fit()` from deadlocking).
     void evict() {
         cleanup_pending_deletion();
         // B15: 使用 predicate 辅助查找
-        auto* tiny_victim = find_eviction_victim_in_queue(tiny_queue_);
         auto* prob_victim = find_eviction_victim_in_queue(probation_queue_);
 
-        // W-TinyLFU admission policy (A2): when both Tiny (window) and
-        // Probation (main) have eviction candidates, compare their frequencies
-        // and evict the lower-frequency item. This is the core W-TinyLFU
-        // admission decision: a newcomer in Tiny displaces a Main item only
-        // if its frequency is >= the Main tail's frequency (configurable via
-        // newcomer_wins_on_tie). Aligns with CacheLib MMWTinyLFU.h:685-693
-        // admitToProbation and the W-TinyLFU paper (Einziger et al., 2017).
-        // Without this check, frequently-accessed hot keys resting at the
-        // Probation tail could be evicted by newcomers with zero history,
-        // defeating the purpose of frequency-aware admission.
-        if (tiny_victim && prob_victim) {
-            auto tiny_freq = sketch_.estimate(tiny_victim->key);
-            auto prob_freq = sketch_.estimate(prob_victim->key);
-            bool admit = config_.newcomer_wins_on_tie
-                             ? (tiny_freq >= prob_freq)
-                             : (tiny_freq > prob_freq);
-            if (admit) {
-                evict_generic(prob_victim, probation_queue_);
-            } else {
-                evict_generic(tiny_victim, tiny_queue_);
-            }
+        if (prob_victim) {
+            static_cast<void>(evict_generic(prob_victim, probation_queue_));
             return;
         }
 
-        // Single-queue fallbacks: evict whichever queue has a candidate.
-        if (tiny_victim) { evict_generic(tiny_victim, tiny_queue_); return; }
-        if (prob_victim) { evict_generic(prob_victim, probation_queue_); return; }
+        // Probation has nothing evictable: demote the Protection tail and evict
+        // that instead. Protection is the coldest part of Main, so this
+        // preserves the frequency ordering.
+        auto* prot_tail = protection_queue_.tail();
+        if (prot_tail && !prot_tail->has_active_handle()) {
+            prot_tail->queue_id = kProbationQueue;
+            protection_queue_.remove(*prot_tail);
+            probation_queue_.link_at_tail(*prot_tail);
+            static_cast<void>(evict_generic(prot_tail, probation_queue_));
+            return;
+        }
 
-        // Final fallback: if Tiny and Probation are empty (or all pinned),
-        // demote the LRU item from Protection to Probation, then evict it.
-        // This prevents eviction deadlock when shrink_to_fit() needs to
-        // reduce capacity below the current Protection queue size.
-        if (!protection_queue_.empty()) {
-            auto* prot_tail = protection_queue_.tail();
-            if (prot_tail && !prot_tail->has_active_handle()) {
-                prot_tail->queue_id = kProbationQueue;
-                protection_queue_.remove(*prot_tail);
-                probation_queue_.link_at_tail(*prot_tail);
-                evict_generic(prot_tail, probation_queue_);
-                return;
-            }
+        // Last resort: Main is empty or fully pinned — fall back to the window
+        // so that capacity can still be reclaimed under pin pressure.
+        auto* tiny_victim = find_eviction_victim_in_queue(tiny_queue_);
+        if (tiny_victim) {
+            static_cast<void>(evict_generic(tiny_victim, tiny_queue_));
         }
     }
 
@@ -7300,9 +8299,9 @@ protected:
         return tiny_queue_;
     }
 
-    size_type total_size() const {
-        return tiny_queue_.size() + probation_queue_.size() + protection_queue_.size();
-    }
+    /// P1-43 (fix.01 方案 A): single source of truth — see
+    /// `mm_2q::total_size()`.
+    size_type total_size() const noexcept { return map_.size(); }
 
     bool should_evict() const {
         if (max_size_ != unlimited && size() > max_size_) return true;
@@ -7319,12 +8318,13 @@ protected:
 
     size_type expected_tiny_size() const {
         auto total = max_size_ != unlimited ? max_size_ : size();
-        return std::max(size_type(1), static_cast<size_type>(total * config_.window_to_cache_size_ratio));
+        return std::max(size_type(1), static_cast<size_type>(static_cast<double>(total) * config_.window_to_cache_size_ratio));
     }
 
     size_type expected_protection_size() const {
         auto main_size = size() - tiny_queue_.size();
-        return static_cast<size_type>(main_size * config_.protection_ratio);
+        return static_cast<size_type>(
+            static_cast<double>(main_size) * config_.protection_ratio);
     }
 
     size_type expected_probation_size() const {
@@ -7346,104 +8346,81 @@ protected:
 
     /// Record access to an item, with delayed promotion support.
     /// Returns true if the item was actually promoted (moved to head).
+    ///
+    /// P1-20 (fix.01 方案 A + 方案 B): see `mm_tiny_lfu::record_access` — the
+    /// same shared `promote_item()` path and the same two
+    /// `isInMMContainer()` guards.
     bool record_access(item_ptr item, access_mode mode) {
-        assert(item != nullptr);  // F1
+        return record_access_at(item, mode, current_time_sec());
+    }
 
-        // Check updateOnWrite/updateOnRead
+    /// Record access with a pre-computed current time.
+    ///
+    /// P1-20 (fix.01 方案 A): entry guard plus re-validation under
+    /// `update_mutex_` (see `mm_tiny_lfu::record_access_at` for the rationale).
+    bool record_access_at(item_ptr item, access_mode mode, uint32_t curr) {
+        assert(item != nullptr);
+
+        // P1-20 check #1: entry guard.
+        if (!item->refcount.isInMMContainer()) [[unlikely]] {
+            return false;
+        }
+
         if ((mode == access_mode::write && !config_.update_on_write) ||
             (mode == access_mode::read && !config_.update_on_read)) {
             return false;
         }
 
-        auto curr = current_time_sec();
-
-        // D3+A3: 对齐 CacheLib——首次访问(is_accessed==false)必提升；
-        // 已访问节点仅在超 refresh time 后提升。移除 update_time>0 守卫。
         if (!item->hook.is_accessed()) {
             item->hook.set_accessed();
         } else if (curr < item->hook.update_time + lru_refresh_time_) {
-            return false;  // Not enough time since last promotion
+            return false;
         }
 
         // A5: try_lock_update 优化——若启用，则尝试加锁；失败则返回 false 跳过提升（不阻塞）。
         // 对齐 CacheLib MMLru.h:567-577。成功获取锁后正常执行提升逻辑。
-        auto promote = [this, item, curr]() {
-            // B1: 在 promote 路径上定期调整 lru_refresh_time_
-            reconfigure_locked(curr);
-
-            // Move to head in the current queue
-            auto& queue = get_queue(item->queue_id);
-            queue.move_to_head(*item);
-            item->hook.update_time = curr;
-
-            // B5: Probation->Protection promotion. The frequency check uses the
-            // count BEFORE this access's increment, aligning with CacheLib's
-            // recordAccess (MMWTinyLFU.h:868-893) which checks freq before
-            // calling updateFrequenciesLocked.
-            if (item->queue_id == kProbationQueue) {
-                try_promote_to_protection(item);
-            }
-
-            // B4: Update frequency count (equivalent to CacheLib's
-            // updateFrequenciesLocked). Called after the promotion check so the
-            // check uses the pre-increment frequency.
-            sketch_.record(item->key);
-        };
-
         if (try_lock_update_enabled()) {
             std::unique_lock<std::mutex> lock(update_mutex_.m, std::try_to_lock);
             if (!lock) {
                 stats_.try_lock_fail_count.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
-            promote();
+            // P1-20 check #2: re-validate under the lock.
+            if (!item->refcount.isInMMContainer()) [[unlikely]] {
+                return false;
+            }
+            promote_item(item, curr);
         } else {
-            promote();
+            promote_item(item, curr);
         }
 
         return true;
     }
 
-    /// Record access with a pre-computed current time.
-    bool record_access_at(item_ptr item, access_mode mode, uint32_t curr) {
-        assert(item != nullptr);
+    /// P1-20 方案 B: the single promotion implementation (shared shape with
+    /// mm_2q / mm_tiny_lfu). Callers must hold `update_mutex_` and must have
+    /// validated `isInMMContainer()`.
+    void promote_item(item_ptr item, uint32_t curr) {
+        // B1: 在 promote 路径上定期调整 lru_refresh_time_
+        reconfigure_locked(curr);
 
-        if ((mode == access_mode::write && !config_.update_on_write) ||
-            (mode == access_mode::read && !config_.update_on_read)) {
-            return false;
+        // Move to head in the current queue
+        auto& queue = get_queue(item->queue_id);
+        queue.move_to_head(*item);
+        item->hook.update_time = curr;
+
+        // B5: Probation->Protection promotion. The frequency check uses the
+        // count BEFORE this access's increment, aligning with CacheLib's
+        // recordAccess (MMWTinyLFU.h:868-893) which checks freq before
+        // calling updateFrequenciesLocked.
+        if (item->queue_id == kProbationQueue) {
+            try_promote_to_protection(item);
         }
 
-        if (!item->hook.is_accessed()) {
-            item->hook.set_accessed();
-        } else if (curr < item->hook.update_time + lru_refresh_time_) {
-            return false;
-        }
-
-        auto promote = [this, item, curr]() {
-            reconfigure_locked(curr);
-            auto& queue = get_queue(item->queue_id);
-            queue.move_to_head(*item);
-            item->hook.update_time = curr;
-
-            if (item->queue_id == kProbationQueue) {
-                try_promote_to_protection(item);
-            }
-
-            sketch_.record(item->key);
-        };
-
-        if (try_lock_update_enabled()) {
-            std::unique_lock<std::mutex> lock(update_mutex_.m, std::try_to_lock);
-            if (!lock) {
-                stats_.try_lock_fail_count.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            promote();
-        } else {
-            promote();
-        }
-
-        return true;
+        // B4: Update frequency count (equivalent to CacheLib's
+        // updateFrequenciesLocked). Called after the promotion check so the
+        // check uses the pre-increment frequency.
+        sketch_.record(item->key);
     }
 
     /// B5: Promote a Probation item to Protection if its frequency exceeds
@@ -7486,8 +8463,19 @@ protected:
     // ====================================================================
 
     template <typename V>
-    void insert_new(const Key& key, V&& value) {
+    void insert_new(const Key& key, V&& value, std::uint64_t expiry_ns = 0) {
         if (max_size_ == 0) return;
+        // P1-27: drain the Tiny window BEFORE the new item enters it.
+        // `evict()` compares the Tiny tail against the Probation tail and evicts
+        // the lower-frequency side; Tiny is the freshest part of the cache, so
+        // running the capacity loop after the insert could evict the item being
+        // inserted. Draining first also means the admission swap below operates
+        // on genuinely cold candidates.
+        while (tiny_queue_.size() > expected_tiny_size()) {
+            auto* t = tiny_queue_.tail();
+            if (!t || t->has_active_handle()) break;
+            promote_tiny_tail_to_probation();
+        }
         while (should_evict()) {
             auto old_size = size();
             evict();
@@ -7504,9 +8492,18 @@ protected:
             }
         }
 
-        // New items always enter Tiny queue
+        // New items always enter Tiny queue.
+        // P1-44: the guard must be armed before the link — see
+        // detail::insert_rollback_guard.
         auto* item = this->allocate_item(key, std::forward<V>(value));
         assert(item != nullptr);  // F1
+        // P1-31 (fix.01 方案 A): item-level expiry (see mm_lru::insert_new).
+        item->expiry_ns = expiry_ns;
+        detail::insert_rollback_guard<mm_wtiny_lfu> guard{
+            this, item, static_cast<void (*)(mm_wtiny_lfu&, item_ptr) noexcept>(
+                            [](mm_wtiny_lfu& mm, item_ptr it) noexcept {
+                                mm.get_queue(it->queue_id).remove(*it);
+                            })};
         auto curr = current_time_sec();
         item->hook.update_time = curr;
         item->hook.clear_accessed();  // Not yet accessed
@@ -7516,7 +8513,12 @@ protected:
         assert(item->hook.prev == nullptr && item->hook.next == nullptr);
         tiny_queue_.link_at_head(*item);
         item->refcount.markInMMContainer();
+        guard.linked = true;
         map_.insert(key, item);
+        guard.committed = true;
+        // P1-31: index the expiry only after the item is fully inserted, so a
+        // throw from map_.insert() cannot leave an index entry behind.
+        this->ttl_index_push(key, expiry_ns);
 
         sketch_.record(key);
         // B3: auto-grow CMS counters when cache size increases significantly.
@@ -7559,58 +8561,119 @@ protected:
         callbacks_.collect_update(item->key, item->value);
     }
 
-    /// A9 修正: 对齐 CacheLib W-TinyLFU Tiny 超容时的频率感知晋升语义。
-    /// Tiny 超容时，Tiny tail 是"候选者"（candidate）。
-    /// - 若 Probation 未满：直接晋升候选者到 Probation head。
-    /// - 若 Probation 已满：比较候选者频率 vs Probation tail 频率：
-    ///   * 候选者胜（>= with tie, configurable via newcomer_wins_on_tie）：
-    ///     淘汰 Probation tail，晋升候选者到 Probation head。
-    ///   * 候选者败：淘汰候选者（不晋升），保留 Probation tail。
-    /// 这才是真正的 W-TinyLFU admission policy（对齐 CacheLib
-    /// MMWTinyLFU.h:685-693 admitToProbation 与论文 Einziger et al., 2017）。
-    /// 之前的实现无条件晋升 + 无条件淘汰 Probation tail，会导致
-    /// 高频热键被新来者挤出缓存（test_concurrent_mm_strategies.cpp
-    /// 的 MmWTinyLfuMixedInsertUpdate 在某些调度下失败）。
+    /// P1-27 (fix.01 方案 A): port CacheLib's W-TinyLFU window→main
+    /// structure exactly (MMWTinyLFU.h:946-1002).
+    ///
+    ///   tiny overflow ⇒ UNCONDITIONAL promotion of the tiny tail into
+    ///                    Probation. The admission decision is NOT taken here.
+    ///   otherwise    ⇒ `admitToProbation`: SWAP the two tails — the
+    ///                    probation tail goes to the tiny tail, the candidate
+    ///                    goes to the probation head. The loser of the
+    ///                    frequency comparison stays in the cache; **no
+    ///                    eviction happens on this path**.
+    ///   on failure   ⇒ move the probation tail to the probation HEAD.
+    ///                    (CacheLib :970-973: a hot probation tail would
+    ///                    otherwise sit at the tail forever and block every
+    ///                    subsequent window promotion.)
+    ///
+    /// The previous implementation compared frequencies on *every* tiny
+    /// overflow and always paid a REAL eviction for the loser, so the cache
+    /// permanently under-filled by one slot per overflow; and when the loser
+    /// could not be evicted (pinned / tries exhausted) it promoted anyway,
+    /// silently bypassing the admission decision entirely.
+    ///
+    /// P1-21 (fix.01 方案 A): the promotion loop is bounded. The tiny tail can
+    /// be pinned by a live `read_handle`; the old code called the void
+    /// `evict_generic(candidate)` and then `continue`d unconditionally, so
+    /// with a pinned tiny tail and a full probation queue it spun forever
+    /// inside `insert_new()`/`get()` with no timeout and no logging. The loop
+    /// now either makes progress (promotion shrinks tiny by one) or breaks.
     void maybe_promote_from_tiny() {
-        auto expected_tiny = expected_tiny_size();
+        const auto expected_tiny = expected_tiny_size();
         while (tiny_queue_.size() > expected_tiny) {
             auto* candidate = tiny_queue_.tail();
             if (!candidate) break;
-
-            auto probation_capacity = expected_probation_size();
-            if (probation_capacity != unlimited &&
-                probation_queue_.size() >= probation_capacity) {
-                // Probation 满了：找 Probation tail 作为对照
-                auto* prob_tail = probation_queue_.tail();
-                size_t tries = 0;
-                while (prob_tail && prob_tail->has_active_handle()) {
-                    prob_tail = probation_queue_.get_prev(*prob_tail);
-                    if (++tries >= config_.eviction_search_tries) {
-                        prob_tail = nullptr;
-                        break;
-                    }
-                }
-                if (prob_tail) {
-                    auto cand_freq = sketch_.estimate(candidate->key);
-                    auto prob_freq = sketch_.estimate(prob_tail->key);
-                    bool admit = config_.newcomer_wins_on_tie
-                                     ? (cand_freq >= prob_freq)
-                                     : (cand_freq > prob_freq);
-                    if (admit) {
-                        // 候选者胜出：淘汰 Probation tail，晋升候选者
-                        evict_generic(prob_tail, probation_queue_);
-                    } else {
-                        // 候选者失败：淘汰候选者，不晋升
-                        evict_generic(candidate, tiny_queue_);
-                        continue;
-                    }
-                }
-                // 若找不到可淘汰的 Probation tail（全部被 pin），
-                // 仍走无条件晋升路径以避免死锁。
+            // A pinned candidate cannot be moved: it is alive in a caller's
+            // read_handle. Leave it where it is and stop rather than spin.
+            if (candidate->has_active_handle()) {
+                stats_.pinned_skip_count.fetch_add(1, std::memory_order_relaxed);
+                break;
             }
-            // 晋升 Tiny tail 到 Probation head
+            // Tiny overflow ⇒ unconditional promotion into Probation.
+            // `insert_new()`/`get()` already ran the top-level capacity loop
+            // (`while (should_evict()) evict()`), so moving an item from tiny
+            // to probation keeps size() <= max_size_ and needs no eviction.
             promote_tiny_tail_to_probation();
         }
+
+        // Probation is over its share ⇒ run the admission comparison. This is
+        // where the frequency decision lives now (CacheLib's
+        // maybePromoteTailLocked), not on the tiny-overflow path.
+        admit_to_probation();
+    }
+
+    /// CacheLib `admitToProbation` equivalent for the over-capacity Probation
+    /// queue: compare the probation tail against the tiny tail and SWAP them
+    /// (or rotate the probation tail to the head when it has no live pin-free
+    /// counterpart). Never evicts.
+    void admit_to_probation() {
+        const auto probation_capacity = expected_probation_size();
+        if (probation_capacity == unlimited) return;
+
+        // Bound the work: at most `eviction_search_tries` swaps per call.
+        for (size_t tries = 0; tries < config_.eviction_search_tries; ++tries) {
+            if (probation_queue_.size() <= probation_capacity) return;
+
+            auto* prob_tail = probation_queue_.tail();
+            if (!prob_tail) return;
+            if (prob_tail->has_active_handle()) {
+                stats_.pinned_skip_count.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            auto* candidate = tiny_queue_.tail();
+            if (!candidate) return;
+            if (candidate->has_active_handle()) {
+                stats_.pinned_skip_count.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            auto cand_freq = sketch_.estimate(candidate->key);
+            auto prob_freq = sketch_.estimate(prob_tail->key);
+            const bool newcomer_wins = config_.newcomer_wins_on_tie
+                                           ? (cand_freq >= prob_freq)
+                                           : (cand_freq > prob_freq);
+            if (newcomer_wins) {
+                // Winner takes the probation slot; the loser drops to the
+                // tiny tail. The cache keeps both items.
+                swap_tiny_and_probation_tails(candidate, prob_tail);
+            } else {
+                // The newcomer lost. CacheLib moves the *probation tail* to the
+                // probation head instead of evicting the newcomer, so the hot
+                // tail stops blocking window promotion while nothing is lost.
+                probation_queue_.remove(*prob_tail);
+                probation_queue_.link_at_head(*prob_tail);
+                return;
+            }
+        }
+    }
+
+    /// Swap the tiny tail and the probation tail between their queues:
+    /// the probation tail becomes the tiny tail, the candidate becomes the
+    /// probation head. Both nodes stay in the MM container (kLinked untouched)
+    /// and `size()` is unchanged — this is a slot exchange, not an eviction.
+    void swap_tiny_and_probation_tails(item_ptr candidate, item_ptr prob_tail) {
+        assert(candidate != prob_tail);
+        const uint8_t cand_qid = candidate->queue_id;
+        const uint8_t prob_qid = prob_tail->queue_id;
+        // Detach both before re-linking: link_at_* asserts !is_linked().
+        tiny_queue_.remove(*candidate);
+        probation_queue_.remove(*prob_tail);
+        // Loser (previous probation tail) → tiny tail.
+        prob_tail->queue_id = cand_qid;
+        tiny_queue_.link_at_tail(*prob_tail);
+        // Winner (the candidate) → probation head.
+        candidate->queue_id = prob_qid;
+        probation_queue_.link_at_head(*candidate);
     }
 
     void promote_tiny_tail_to_probation() {
@@ -7656,8 +8719,26 @@ protected:
     }
 
     /// B14: 原位替换节点，保留 queue_id、update_time 与 accessed 状态。
+    ///
+    /// P1-24 (fix.01 方案 A): same container-membership transfer as
+    /// `mm_lru::replace_node()` — see the long comment there. The original
+    /// version never marked `new_node` in the container and never unmarked /
+    /// retired `old_node`, leaving the queue holding a node the refcount
+    /// layer considered unlinked (un-promotable, un-removable) and leaking
+    /// the replaced node.
+    ///
+    /// Runtime preconditions: old_node in container, new_node not in
+    /// container, old_node has no active handles.
     void replace_node(item_ptr old_node, item_ptr new_node) {
         assert(old_node != nullptr && new_node != nullptr);
+        if (old_node == new_node) return;
+        if (!old_node->refcount.isInMMContainer() || new_node->refcount.isInMMContainer()) {
+            return;
+        }
+        if (old_node->has_active_handle()) {
+            return;
+        }
+        new_node->refcount.unmarkInMMContainer();
         new_node->hook.update_time = old_node->hook.update_time;
         if (old_node->hook.is_accessed()) {
             new_node->hook.set_accessed();
@@ -7667,14 +8748,23 @@ protected:
         new_node->queue_id = old_node->queue_id;
         auto& queue = get_queue(old_node->queue_id);
         queue.replace(*old_node, *new_node);
+        // P1-24: transfer container membership (old → new).
+        old_node->refcount.unmarkInMMContainer();
+        new_node->refcount.markInMMContainer();
         map_.insert_or_assign(old_node->key, new_node);
+        // P1-24: retire the detached old_node (refcount drained above).
+        detail::hazptr_domain::default_domain().retire(old_node);
     }
 
+    // P0-2 (fix.01 方案 A): see the note in mm_lru — this setter must be
+    // public so unified_cache / sharded_mm_lru can forward to it.
+public:
     /// B15: 设置淘汰谓词。
     void set_eviction_predicate(std::function<bool(const Key&, const Value&)> pred) {
         eviction_predicate_ = std::move(pred);
     }
 
+protected:
     void erase_impl(const Key& key) {
         auto ptr = map_.find(key);
         if (!ptr) return;
@@ -7683,6 +8773,71 @@ protected:
         size_type mem = calc_item_memory(item->key, item->value);
         stats_.current_memory.fetch_sub(mem);
         callbacks_.collect_evict(item->key, std::move(item->value));
+        remove_from_queue(item);
+        map_.erase(key);
+        detail::hazptr_domain::default_domain().retire(item);
+        stats_.current_size.store(total_size());
+    }
+
+    // --------------------------------------------------------------------
+    // P1-31: shared TTL index hooks (see detail/ttl_heap.hpp)
+    // --------------------------------------------------------------------
+    // Public because the CRTP mixin base (detail::mm_ttl_index_mixin) calls back
+    // into them and is not a derived class, so it cannot reach private members.
+    // They are internal contract points, not user API.
+public:
+    using ttl_probe_result = detail::ttl_heap<Key>::probe_result;
+    using ttl_base =
+        detail::mm_ttl_index_mixin<mm_wtiny_lfu<Key, Value, Hash, KeyEqual>, Key>;
+
+    ttl_probe_result ttl_probe_entry(const Key& key, std::uint64_t heap_expiry) {
+        auto ptr = map_.find(key);
+        if (!ptr) return ttl_probe_result::absent;
+        if (ptr->expiry_ns != heap_expiry) return ttl_probe_result::stale;
+        if (ptr->has_active_handle()) return ttl_probe_result::pinned;
+        return ttl_probe_result::ready;
+    }
+
+    /// O7: TTL expiration — fire on_expire (not on_evict).
+    void ttl_erase_expired(const Key& key) { erase_expired_impl(key); }
+
+    std::size_t ttl_live_count() const { return static_cast<std::size_t>(size()); }
+
+    template <typename Emit>
+    void ttl_for_each_live(Emit&& emit) const {
+        const item_list* queues[] = {&tiny_queue_, &probation_queue_, &protection_queue_};
+        for (const auto* q : queues) {
+            for (auto* curr = q->head(); curr != nullptr; curr = q->get_next(*curr)) {
+                if (curr->expiry_ns != 0) {
+                    emit(curr->key, curr->expiry_ns);
+                }
+            }
+        }
+    }
+
+    std::size_t evict_expired() {
+        cleanup_pending_deletion();
+        return ttl_base::evict_expired();
+    }
+
+    std::size_t evict_expired_n(std::size_t batch_size) {
+        if (batch_size == 0) return evict_expired();
+        cleanup_pending_deletion();
+        return ttl_base::evict_expired_n(batch_size);
+    }
+
+private:
+    /// Expiry-aware erase: same removal as `erase_impl`, but fires `on_expire`
+    /// instead of `on_evict` so TTL expiry is not misreported as capacity
+    /// eviction in the operator-facing metrics (O7).
+    void erase_expired_impl(const Key& key) {
+        auto ptr = map_.find(key);
+        if (!ptr) return;
+        auto* item = ptr;
+        if (item->has_active_handle()) return;
+        size_type mem = calc_item_memory(item->key, item->value);
+        stats_.current_memory.fetch_sub(mem);
+        callbacks_.collect_expire(item->key, std::move(item->value));
         remove_from_queue(item);
         map_.erase(key);
         detail::hazptr_domain::default_domain().retire(item);
@@ -7801,6 +8956,22 @@ struct sharded_mm_lru_config {
     /// already well-mixed.
     bool mix_shard_hash = true;
 
+    /// P1-30 (fix.01 方案 A): capacity amplification policy.
+    ///
+    /// `max_size` is the *requested* capacity. Splitting it over `num_shards`
+    /// shards requires at least one slot per shard, so a request of e.g. 10
+    /// with 64 shards cannot be honoured literally: the old behaviour silently
+    /// raised the effective capacity to 64 (6.4x the request) and reported
+    /// that fabricated number from `max_size()`, so "memory is configurable"
+    /// was not actually true.
+    ///
+    /// Default is now STRICT: `max_size < num_shards` throws
+    /// `cache_config_exception` from the constructor / setter. Set this to
+    /// `true` to explicitly opt into amplification (the shard floor then
+    /// applies and `requested_max_size()` still reports what the caller asked
+    /// for while `max_size()` reports the effective value).
+    bool allow_amplification = false;
+
     void validate() const {
         if (num_shards == 0) {
             throw std::invalid_argument("sharded_mm_lru_config: num_shards must be > 0");
@@ -7900,6 +9071,8 @@ public:
               return cfg;
           }()) {
         max_size_ = max_size;
+        // P1-30: remember what the caller asked for before any amplification.
+        requested_max_size_ = max_size;
         distribute_max_size();
     }
 
@@ -7914,6 +9087,7 @@ public:
               return cfg;
           }()) {
         max_size_ = max_size;
+        requested_max_size_ = max_size;  // P1-30
         max_memory_ = max_memory;
         distribute_max_size();
         distribute_max_memory();
@@ -8220,33 +9394,79 @@ public:
 
     /// Evict from a shard with the most items (best-effort load balancing).
     /// Uses atomic counters for shard selection — avoids acquiring shard locks.
-    void evict_lru() {
-        // Find the shard with the largest size and evict from it
-        std::size_t best_shard = 0;
+    ///
+    /// P1-23 (fix.01 方案 B): returns whether a slot was actually freed, and
+    /// increments `eviction_failed` when it was not. The `try_lock` fast path
+    /// is intentionally kept (blocking here would serialise all writers behind
+    /// one contended shard), but a failure is no longer silent: the caller can
+    /// see that no space was reclaimed and retry, and `unified_cache`'s single
+    /// admission gate acts on the result. Capacity guarantees are the caller's
+    /// job — this function only reports.
+    ///
+    /// The victim shard is now chosen by "is it over its own quota" rather
+    /// than by "is it globally the largest". Previously a shard that was way
+    /// over its per-shard quota was never preferred over a larger-but-in-quota
+    /// shard, so an overloaded shard could stay overloaded forever.
+    bool evict_lru() {
+        // Per-shard quota (the same distribution distribute_max_size() uses).
+        // A shard strictly above it is the shard to reclaim from first.
+        const size_type per_shard_quota =
+            (max_size_ == unlimited) ? unlimited : (max_size_ / num_shards_);
+
+        std::size_t best_shard = num_shards_;
         std::size_t best_size = 0;
+        bool best_over_quota = false;
         for (std::size_t i = 0; i < num_shards_; ++i) {
-            auto sz = shards_[i]->stats().current_size.load(std::memory_order_relaxed);
-            if (sz > best_size) {
-                best_size = sz;
+            const auto sz = static_cast<size_type>(
+                shards_[i]->stats().current_size.load(std::memory_order_relaxed));
+            if (sz == 0) continue;
+            const bool over_quota =
+                per_shard_quota != unlimited && sz > per_shard_quota;
+            // Prefer any over-quota shard over any in-quota shard; within the
+            // same class, prefer the largest.
+            if (best_shard == num_shards_ ||
+                (over_quota && !best_over_quota) ||
+                (over_quota == best_over_quota && sz > best_size)) {
                 best_shard = i;
+                best_size = sz;
+                best_over_quota = over_quota;
             }
         }
-        if (best_size > 0) {
-            // Acquire the per-shard write lock before evicting. A concurrent
-            // set()/flush() on the same shard holds the shard lock and can
-            // mutate the LRU list / hash chain; calling shard->evict_lru()
-            // without the lock races with it. We cannot rely on the caller's
-            // global stripe lock here (unified_cache::evict()) because per-key
-            // operations use per-shard mutexes, which are a separate lock
-            // domain. Use try_lock so this best-effort eviction never blocks:
-            // if the shard is contended, skip this round — a later call will
-            // retry. (Note: shards_[best_shard]->evict_lru() is mm_lru's
-            // per-shard eviction, which expects the caller to hold the shard
-            // write lock — the callers in insert_new() already do.)
-            auto lock = try_acquire_shard_write_lock(best_shard);
-            if (!lock) return;
-            shards_[best_shard]->evict_lru();
+        if (best_shard == num_shards_) {
+            // Nothing to evict anywhere — count it as a failed eviction so a
+            // caller looping until it frees space terminates.
+            detail::note_eviction_failed(shards_[0]->stats());
+            return false;
         }
+
+        // Acquire the per-shard write lock before evicting. A concurrent
+        // set()/flush() on the same shard holds the shard lock and can
+        // mutate the LRU list / hash chain; calling shard->evict_lru()
+        // without the lock races with it. We cannot rely on the caller's
+        // global stripe lock here (unified_cache::evict()) because per-key
+        // operations use per-shard mutexes, which are a separate lock
+        // domain. Use try_lock so this best-effort eviction never blocks:
+        // if the shard is contended, report the failure — a later call will
+        // retry. (Note: shards_[best_shard]->evict_lru() is mm_lru's
+        // per-shard eviction, which expects the caller to hold the shard
+        // write lock — the callers in insert_new() already do.)
+        auto lock = try_acquire_shard_write_lock(best_shard);
+        if (!lock) {
+            // P1-23 方案 B: contention is reported, not swallowed.
+            detail::note_eviction_failed(shards_[best_shard]->stats());
+            return false;
+        }
+        const auto size_before = static_cast<size_type>(
+            shards_[best_shard]->stats().current_size.load(std::memory_order_relaxed));
+        shards_[best_shard]->evict_lru();
+        const auto size_after = static_cast<size_type>(
+            shards_[best_shard]->stats().current_size.load(std::memory_order_relaxed));
+        if (size_after >= size_before) {
+            // Every candidate in the shard was pinned/rejected.
+            detail::note_eviction_failed(shards_[best_shard]->stats());
+            return false;
+        }
+        return true;
     }
 
     // --------------------------------------------------------------------
@@ -8273,7 +9493,22 @@ public:
         return total;
     }
 
+    /// Effective capacity actually enforced (after any explicitly-allowed
+    /// per-shard amplification). P1-30: use `requested_max_size()` for the
+    /// value the caller passed.
     size_type max_size() const noexcept { return max_size_; }
+
+    /// P1-30 (fix.01 方案 A): the capacity the caller asked for, before the
+    /// per-shard floor. Equal to `max_size()` unless the caller passed
+    /// `allow_amplification = true` AND requested fewer slots than shards.
+    size_type requested_max_size() const noexcept { return requested_max_size_; }
+
+    /// P1-30: true when the effective capacity exceeds the requested one
+    /// because the caller explicitly allowed amplification.
+    bool capacity_amplified() const noexcept {
+        return max_size_ != unlimited && requested_max_size_ != unlimited &&
+               max_size_ > requested_max_size_;
+    }
 
     size_type max_memory() const noexcept { return max_memory_; }
 
@@ -8305,16 +9540,29 @@ public:
     }
 
     void max_size(size_type new_max) {
+        // P1-30: this setter is now strict too — it throws (rather than
+        // silently amplifying) unless the config explicitly allows it. Capture
+        // the previous state first so the strong exception guarantee holds:
+        // distribute_max_size() throws before mutating any shard.
+        const size_type prev_max = max_size_;
+        const size_type prev_requested = requested_max_size_;
         max_size_ = new_max;
-        distribute_max_size();
+        requested_max_size_ = new_max;
+        try {
+            distribute_max_size();
+        } catch (...) {
+            max_size_ = prev_max;
+            requested_max_size_ = prev_requested;
+            throw;
+        }
     }
 
-    /// P2-1: Strict variant of max_size() — throws std::invalid_argument
-    /// when `new_max < num_shards_`. This prevents the silent capacity
-    /// amplification that the lenient `max_size()` performs to keep
-    /// every shard reachable. Use this when the caller wants hard
-    /// capacity guarantees (e.g. memory-bounded caches where 6.4x
-    /// overshoot would cause OOM).
+    /// P2-1 / P1-30: always-strict variant of `max_size()`. Kept for backward
+    /// compatibility — since P1-30 the plain `max_size()` setter is strict as
+    /// well (unless `config.allow_amplification` is set), so this is now
+    /// equivalent to `max_size()` for the default configuration. It still
+    /// throws `std::invalid_argument` (the historical exception type) rather
+    /// than `cache_config_exception`.
     ///
     /// Recommended minimum: `new_max >= num_shards_ * 16` so each shard
     /// has at least 16 slots of headroom for skewed distributions.
@@ -8328,6 +9576,7 @@ public:
                 "or raise new_max to >= num_shards.");
         }
         max_size_ = new_max;
+        requested_max_size_ = new_max;  // P1-30
         distribute_max_size();
     }
 
@@ -8359,8 +9608,13 @@ public:
 
     iterator begin() noexcept { return shards_[0]->begin(); }
     iterator end() noexcept { return shards_[0]->end(); }
-    const_iterator begin() const noexcept { return shards_[0]->begin(); }
-    const_iterator end() const noexcept { return shards_[0]->end(); }
+    // P0-2 (fix.01 方案 A): unique_ptr::operator-> is const-qualified but
+    // returns a *non-const* T*, so `shards_[0]->begin()` inside a const member
+    // function selected mm_lru's non-const begin() and returned
+    // shard_type::iterator where shard_type::const_iterator was declared.
+    // std::as_const forces the const overload, restoring const-correctness.
+    const_iterator begin() const noexcept { return std::as_const(*shards_[0]).begin(); }
+    const_iterator end() const noexcept { return std::as_const(*shards_[0]).end(); }
 
     // --------------------------------------------------------------------
     // Statistics and callbacks
@@ -8376,6 +9630,10 @@ public:
         std::size_t total_current_size = 0, total_current_memory = 0;
         std::size_t total_write_lock_wait = 0, total_try_lock_fail = 0;
         std::size_t total_eviction_search = 0, total_pinned_skip = 0;
+        // P1-23: aggregate the eviction-failure counter across shards when the
+        // cache_stats field is available (it lives in core.hpp; this header must
+        // not hard-depend on it).
+        std::size_t total_eviction_failed = 0;
         // P1-1: Rehash and TLS ring flush aggregation.
         std::size_t total_rehash_count = 0, total_rehash_migrated = 0;
         std::uint64_t total_rehash_time_ns = 0;
@@ -8392,6 +9650,7 @@ public:
             total_try_lock_fail += s.try_lock_fail_count.load(std::memory_order_relaxed);
             total_eviction_search += s.eviction_search_steps.load(std::memory_order_relaxed);
             total_pinned_skip += s.pinned_skip_count.load(std::memory_order_relaxed);
+            total_eviction_failed += detail::load_eviction_failed(s);
             total_rehash_count += s.rehash_count.load(std::memory_order_relaxed);
             total_rehash_time_ns += s.rehash_total_time_ns.load(std::memory_order_relaxed);
             total_rehash_migrated += s.rehash_migrated_items.load(std::memory_order_relaxed);
@@ -8410,6 +9669,7 @@ public:
         total.try_lock_fail_count.store(total_try_lock_fail, std::memory_order_relaxed);
         total.eviction_search_steps.store(total_eviction_search, std::memory_order_relaxed);
         total.pinned_skip_count.store(total_pinned_skip, std::memory_order_relaxed);
+        detail::store_eviction_failed(total, total_eviction_failed);
         total.rehash_count.store(total_rehash_count, std::memory_order_relaxed);
         total.rehash_total_time_ns.store(total_rehash_time_ns, std::memory_order_relaxed);
         total.rehash_migrated_items.store(total_rehash_migrated, std::memory_order_relaxed);
@@ -8862,7 +10122,12 @@ private:
     size_type max_size_ = unlimited;
     size_type max_memory_ = unlimited;
 
-    /// P2-1: one-shot warning flag for silent max_size amplification.
+    /// P1-30 (fix.01 方案 A): the capacity the CALLER asked for, before the
+    /// per-shard floor was applied. When `allow_amplification == false` the
+    /// two values are always equal (an undersized request throws instead).
+    /// When it is `true`, `max_size()` reports the effective value and this
+    /// reports the request, so the two are distinguishable in diagnostics.
+    size_type requested_max_size_ = unlimited;
     /// When `max_size_ < num_shards_`, distribute_max_size() silently
     /// raises max_size_ to num_shards_ so every shard has at least one
     /// slot. This flag ensures the stderr warning fires at most once
@@ -8907,18 +10172,29 @@ private:
     /// Distribute max_size across shards. Each shard gets max_size / num_shards_.
     /// If max_size is unlimited, each shard also gets unlimited.
     ///
-    /// P0-A fix: when `max_size < num_shards_`, every shard still receives
-    /// a minimum quota of 1 (and `max_size_` is raised to `num_shards_`).
-    /// Without this floor, a well-mixed hash would route keys to 0-quota
-    /// shards and silently reject every insert — the dual of the R-9 hot
-    /// shard problem. The original R-9 design relied on `std::hash<int>`
-    /// being the identity function so keys 0..N-1 landed on the first N
-    /// shards (the only ones with capacity); changing the default hash to
-    /// a well-mixed function (P0-A) broke that hidden assumption. Lifting
-    /// every shard to quota 1 makes the cache usable with any hash, at
-    /// the cost of a slightly larger effective capacity when the caller
-    /// requested `max_size < num_shards_` — an acceptable trade for
-    /// correctness (silently dropping inserts is never acceptable).
+    /// P0-A fix: when `max_size < num_shards_`, every shard must still receive
+    /// a minimum quota of 1. Without this floor, a well-mixed hash would route
+    /// keys to 0-quota shards and silently reject every insert — the dual of
+    /// the R-9 hot shard problem. The original R-9 design relied on
+    /// `std::hash<int>` being the identity function so keys 0..N-1 landed on
+    /// the first N shards (the only ones with capacity); changing the default
+    /// hash to a well-mixed function (P0-A) broke that hidden assumption.
+    ///
+    /// P1-30 (fix.01 方案 A): the floor is no longer applied SILENTLY.
+    ///
+    ///   - default (`config_.allow_amplification == false`): requesting
+    ///     `max_size < num_shards` throws `cache_config_exception`. The caller
+    ///     asked for a hard capacity the shard layout cannot honour, and
+    ///     quietly multiplying it by up to `num_shards` is exactly the
+    ///     "memory is configurable" failure P1-30 describes.
+    ///   - `config_.allow_amplification == true`: the caller has explicitly
+    ///     accepted the floor. `max_size_` is raised to `num_shards_`,
+    ///     `requested_max_size_` keeps the original ask, and the existing
+    ///     one-shot stderr warning still fires.
+    ///
+    /// The two numbers are separately reportable: `max_size()` returns the
+    /// effective (post-floor) capacity, `requested_max_size()` returns what
+    /// the caller passed.
     void distribute_max_size() {
         if (max_size_ == unlimited) {
             for (auto& shard : shards_) {
@@ -8926,15 +10202,18 @@ private:
             }
             return;
         }
-        // P0-A: enforce per-shard minimum quota of 1.
         if (max_size_ < num_shards_) {
-            // P2-1: Warn once when max_size is silently amplified to
-            // num_shards_. Operators asking for e.g. max_size=10 with
-            // 64 shards end up with 64 effective slots — 6.4x the
-            // requested capacity. The warning fires at most once per
-            // sharded_mm_lru instance so repeated set_max_size() calls
-            // don't spam stderr. Use the strict API (set_max_size_strict)
-            // to make this a hard error instead of a silent amplification.
+            if (!config_.allow_amplification) {
+                throw cache_config_exception(
+                    "sharded_mm_lru: max_size (" + std::to_string(max_size_) +
+                    ") < num_shards (" + std::to_string(num_shards_) +
+                    "); refusing to silently amplify capacity. Either raise "
+                    "max_size to >= num_shards, lower num_shards, or pass "
+                    "allow_amplification = true in sharded_mm_lru_config to "
+                    "explicitly accept the per-shard floor of 1.");
+            }
+            // P1-30 方案 A: amplification only on explicit request. Warn once
+            // so the operator can see the effective/requested ratio.
             warn_max_size_amplified_once(max_size_, num_shards_);
             max_size_ = num_shards_;
         }

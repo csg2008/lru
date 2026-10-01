@@ -170,7 +170,9 @@ TEST(TieredCacheThunderingHerdTest, HundredConcurrentSameKeyMissInvokesBackendOn
     std::atomic<bool> go{false};
 
     for (int i = 0; i < kThreads; ++i) {
-        threads.emplace_back([&, i]() {
+        // P0-3: `i` is not referenced inside the lambda, so it must not be
+        // captured (-Wunused-lambda-capture).
+        threads.emplace_back([&]() {
             ready.fetch_add(1, std::memory_order_acq_rel);
             while (!go.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -574,10 +576,13 @@ TEST(MemoryStorageBackendConcurrencyTest, SixtyFourThreadsNoDeadlockOrCorruption
     }
     go.store(true, std::memory_order_release);
 
-    // Wait for writers to finish.
-    for (int i = 0; i < kWriters; ++i) threads[i].join();
+    // Wait for writers to finish, then stop the readers.
+    // P0-3: iterate with iterators instead of an int index into the vector, so
+    // no signed/unsigned conversion is needed for threads[i].
+    const auto readers_begin = threads.begin() + kWriters;
+    for (auto it = threads.begin(); it != readers_begin; ++it) it->join();
     stop_readers.store(true, std::memory_order_release);
-    for (int i = kWriters; i < kWriters + kReaders; ++i) threads[i].join();
+    for (auto it = readers_begin; it != threads.end(); ++it) it->join();
 
     EXPECT_EQ(read_mismatch.load(), 0u)
         << "readers must never observe a torn or stale value";

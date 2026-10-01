@@ -39,6 +39,26 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64|i686|i386|x86")
     endif()
 endif()
 
+# P0-3: the slab allocator's free list is a 128-bit tagged pointer
+# (std::atomic<allocation_class::tagged_ptr>, see memory.hpp). GCC does not
+# always inline 16-byte atomic load/compare-exchange even with -mcx16: on targets
+# where it emits calls to __atomic_load_16 / __atomic_compare_exchange_16 (MinGW
+# UCRT64 does), those live in libatomic and must be linked explicitly. Clang and
+# MSVC provide them without a separate library. This is an INTERFACE requirement
+# because lru is header-only: downstream consumers need the same linkage.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    find_library(LRU_ATOMIC_LIBRARY NAMES atomic)
+    if(LRU_ATOMIC_LIBRARY)
+        target_link_libraries(lru_cache INTERFACE ${LRU_ATOMIC_LIBRARY})
+        message(STATUS "LRU Cache: linking libatomic for GCC 128-bit CAS (${LRU_ATOMIC_LIBRARY})")
+    else()
+        message(WARNING
+            "LRU Cache: libatomic not found. GCC may fail to link the 128-bit "
+            "tagged-pointer CAS in the slab allocator (undefined reference to "
+            "__atomic_load_16 / __atomic_compare_exchange_16).")
+    endif()
+endif()
+
 option(LRU_ENABLE_CPP23 "Enable C++23 features" OFF)
 if(LRU_ENABLE_CPP23)
     target_compile_features(lru_cache INTERFACE cxx_std_23)
@@ -216,11 +236,30 @@ if(LRU_DEBUG)
     message(STATUS "LRU Cache: LRU_DEBUG instrumentation enabled")
 endif()
 
-# Internal warning target for tests/examples/benchmarks; not exported.
-add_library(lru_cache_warnings INTERFACE)
+# ---------------------------------------------------------------------------
+# Warning configuration (P0-3, fix.01 §9.2 P0-T6 / 方案 A + B)
+#
+# Goals:
+#   1. This project's own targets (tests/examples/benchmarks) must build with
+#      the full strict warning set AND -Werror, by default. Warnings are no
+#      longer allowed to accumulate silently.
+#   2. Consumers of lru::cache must see the SAME warning set, so a header
+#      warning surfaces in downstream builds too. -Werror is deliberately NOT
+#      propagated through the exported INTERFACE target: target_compile_options
+#      INTERFACE applies to *every* file that links the target (not just files
+#      including lru.hpp), so forcing -Werror there would break unrelated
+#      downstream code. Consumers that want the same hard gate can set
+#      LRU_WARNINGS_AS_ERRORS=ON explicitly.
+#   3. Both behaviours have explicit escape hatches for downstream users.
+# ---------------------------------------------------------------------------
+option(LRU_STRICT_WARNINGS
+    "Apply the project's strict warning set to lru::cache consumers" ON)
+option(LRU_WARNINGS_AS_ERRORS
+    "Treat compiler warnings as errors in this project's own targets" ON)
 
+set(_lru_warning_flags "")
 if(MSVC)
-    target_compile_options(lru_cache_warnings INTERFACE
+    list(APPEND _lru_warning_flags
         /W4
         /permissive-
         /w14640
@@ -242,7 +281,7 @@ if(MSVC)
         /w14928
     )
 else()
-    target_compile_options(lru_cache_warnings INTERFACE
+    list(APPEND _lru_warning_flags
         -Wall
         -Wextra
         -Wpedantic
@@ -261,7 +300,25 @@ else()
     )
 endif()
 
-option(LRU_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+# Shared warning set: reaches downstream consumers through lru::cache.
+if(LRU_STRICT_WARNINGS)
+    target_compile_options(lru_cache INTERFACE ${_lru_warning_flags})
+    message(STATUS "LRU Cache: strict warning set applied to lru::cache consumers")
+else()
+    message(STATUS "LRU Cache: strict warning set NOT applied to consumers (LRU_STRICT_WARNINGS=OFF)")
+endif()
+
+# Internal carrier for tests/examples/benchmarks (not exported). It re-exports
+# lru::cache so internal executables link ONLY this target and each flag is
+# applied exactly once per translation unit.
+add_library(lru_cache_warnings INTERFACE)
+target_link_libraries(lru_cache_warnings INTERFACE lru::cache)
+
+if(NOT LRU_STRICT_WARNINGS)
+    # Consumers opted out, but this project's own targets must still be strict.
+    target_compile_options(lru_cache_warnings INTERFACE ${_lru_warning_flags})
+endif()
+
 if(LRU_WARNINGS_AS_ERRORS)
     if(MSVC)
         target_compile_options(lru_cache_warnings INTERFACE /WX)
@@ -269,7 +326,11 @@ if(LRU_WARNINGS_AS_ERRORS)
         target_compile_options(lru_cache_warnings INTERFACE -Werror)
     endif()
     message(STATUS "LRU Cache: warnings treated as errors")
+else()
+    message(STATUS "LRU Cache: warnings are NOT errors (LRU_WARNINGS_AS_ERRORS=OFF)")
 endif()
+
+unset(_lru_warning_flags)
 
 # Helper to apply sanitizer flags consistently.
 #
@@ -323,8 +384,10 @@ endfunction()
 # Helper for internal executables (tests/examples/benchmarks).
 function(lru_add_internal_executable target)
     add_executable(${target} ${ARGN})
-    target_link_libraries(${target} PRIVATE lru::cache)
     target_compile_features(${target} PRIVATE cxx_std_20)
+    # lru_cache_warnings re-exports lru::cache (strict shared warning set) and
+    # additionally adds -Werror for this project's own targets. Linking it alone
+    # keeps the warning flags applied exactly once per translation unit.
     target_link_libraries(${target} PRIVATE lru_cache_warnings)
     lru_add_sanitizers(${target})
 endfunction()

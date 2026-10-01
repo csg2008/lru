@@ -8,6 +8,7 @@
 //   - Rehash stress under sustained load
 
 #include "lru.hpp"
+#include "test_helpers.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <atomic>
@@ -25,7 +26,7 @@ namespace {
 std::vector<int> generate_zipf_keys(std::size_t n, std::size_t key_space,
                                      double skew = 0.99,
                                      unsigned seed = 42) {
-    std::mt19937 rng(seed);
+    auto rng = lru_test::seed_rng(seed);
     std::vector<double> cumulative;
     cumulative.reserve(key_space);
     double sum = 0.0;
@@ -57,7 +58,7 @@ std::vector<int> generate_zipf_keys(std::size_t n, std::size_t key_space,
 TEST(ChaosZipfWorkload, HitRateUnderRealisticAccessPattern) {
     lru::striped_cache<int, std::string> cache(1000);
     const std::size_t key_space = 500;
-    const std::size_t num_threads = 8;
+    constexpr std::size_t num_threads = 8;   // split evenly: writers + readers
     const std::size_t ops_per_thread = 5000;
 
     // Pre-populate cache with half the keys
@@ -127,9 +128,12 @@ TEST(ChaosMemoryWatermark, CriticalModeRejectsInsertions) {
             auto size_before = cache.size();
             cache.set(i + 100000, "should_be_rejected");
             auto size_after = cache.size();
-            // Size should not grow (insertion rejected)
-            // Note: it might grow slightly if the item replaced an existing one,
-            // but net new items should be rejected.
+            // Size should not grow (insertion rejected).
+            // Note: it might grow by one if the key replaced an existing item,
+            // but net new items must be rejected.
+            // P0-3: this assertion is what size_before/size_after exist for.
+            EXPECT_LE(size_after, size_before + 1)
+                << "critical-mode set() must not grow the cache";
             break;
         }
     }
@@ -198,11 +202,11 @@ TEST(ChaosThreadExit, ConcurrentAccessWithThreadLifecycle) {
     std::vector<std::thread> threads;
     for (std::size_t t = 0; t < num_threads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             for (std::size_t i = 0; i < ops_per_thread && !stop.load(); ++i) {
-                int key = static_cast<int>(rng() % 1000);
+                int key = static_cast<int>(lru_test::rng_int(rng) % 1000);
                 // Mix of reads and writes
-                if (rng() % 3 == 0) {
+                if (lru_test::rng_int(rng) % 3 == 0) {
                     cache.set(key, std::to_string(key));
                 } else {
                     auto h = cache.try_get(key);
@@ -230,7 +234,7 @@ TEST(ChaosThreadExit, ConcurrentAccessWithThreadLifecycle) {
 
 TEST(ChaosBulkGet, ConcurrentBulkGetAndSet) {
     lru::striped_cache<int, std::string> cache(2000);
-    const std::size_t num_threads = 8;
+    constexpr std::size_t num_threads = 8;   // split evenly: writers + readers
 
     // Pre-populate
     for (int i = 0; i < 1000; ++i) {
@@ -243,11 +247,11 @@ TEST(ChaosBulkGet, ConcurrentBulkGetAndSet) {
 
     // Writer threads
     std::vector<std::thread> writers;
-    for (std::size_t t = 0; t < 4; ++t) {
+    for (std::size_t t = 0; t < num_threads / 2; ++t) {
         writers.emplace_back([&]() {
-            std::mt19937 rng(123);
+            auto rng = lru_test::seed_rng(123);
             while (!stop.load()) {
-                int key = static_cast<int>(rng() % 1500);
+                int key = static_cast<int>(lru_test::rng_int(rng) % 1500);
                 cache.set(key, std::to_string(key));
                 ++set_count;
             }
@@ -256,14 +260,14 @@ TEST(ChaosBulkGet, ConcurrentBulkGetAndSet) {
 
     // Bulk reader threads
     std::vector<std::thread> readers;
-    for (std::size_t t = 0; t < 4; ++t) {
+    for (std::size_t t = 0; t < num_threads / 2; ++t) {
         readers.emplace_back([&]() {
-            std::mt19937 rng(456);
+            auto rng = lru_test::seed_rng(456);
             while (!stop.load()) {
                 std::vector<int> keys;
                 keys.reserve(20);
                 for (int i = 0; i < 20; ++i) {
-                    keys.push_back(static_cast<int>(rng() % 1500));
+                    keys.push_back(static_cast<int>(lru_test::rng_int(rng) % 1500));
                 }
                 auto results = cache.bulk_get(keys.begin(), keys.end());
                 EXPECT_EQ(results.size(), keys.size());
@@ -297,7 +301,7 @@ TEST(ChaosRehashStress, ConcurrentInsertionTriggersRehash) {
     lru::sharded_mm_lru_config cfg;
     cfg.expected_items = 1;  // tiny initial buckets -> force rehash
     lru::striped_cache<int, std::string> cache(100000, cfg);
-    const std::size_t num_threads = 8;
+    constexpr std::size_t num_threads = 8;   // split evenly: writers + readers
     const std::size_t items_per_thread = 2000;
 
     std::vector<std::thread> threads;
@@ -378,10 +382,10 @@ TEST(ChaosMixedWorkload, ReadHeavyWithBurstyWrites) {
     std::vector<std::thread> threads;
     for (std::size_t t = 0; t < num_threads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(static_cast<unsigned>(t));
+            auto rng = lru_test::seed_rng(static_cast<unsigned>(t));
             std::uniform_real_distribution<double> uniform(0.0, 1.0);
             for (std::size_t i = 0; i < ops_per_thread; ++i) {
-                int key = static_cast<int>(rng() % 2000);
+                int key = static_cast<int>(lru_test::rng_int(rng) % 2000);
                 if (uniform(rng) < write_ratio) {
                     cache.set(key, std::to_string(key));
                     ++total_writes;

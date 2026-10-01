@@ -89,43 +89,6 @@
 #endif
 
 namespace lru::detail {
-
-// ============================================================================
-// Spinlock — lightweight exclusive lock for per-bucket synchronization
-// ============================================================================
-
-class spinlock {
-public:
-    spinlock() noexcept = default;
-    spinlock(const spinlock&) = delete;
-    spinlock& operator=(const spinlock&) = delete;
-
-    void lock() noexcept {
-        while (state_.exchange(1, std::memory_order_acquire) != 0) {
-            LRU_SPIN_PAUSE();
-        }
-    }
-
-    void unlock() noexcept {
-        state_.store(0, std::memory_order_release);
-    }
-
-    bool try_lock() noexcept {
-        uint32_t expected = 0;
-        return state_.compare_exchange_strong(
-            expected, 1, std::memory_order_acquire, std::memory_order_relaxed);
-    }
-
-    bool is_locked() const noexcept {
-        return state_.load(std::memory_order_relaxed) != 0;
-    }
-
-private:
-    std::atomic<uint32_t> state_{0};
-};
-
-struct alignas(64) aligned_spinlock : spinlock {};
-
 // ============================================================================
 // Shared spinlock — lightweight shared/exclusive lock for per-bucket
 // synchronization, allowing concurrent readers on the same bucket.
@@ -190,14 +153,38 @@ public:
     }
 
     void unlock() {
-        state_.fetch_and(~(kWriterFlag | kWriterWaitFlag), std::memory_order_release);
+        const uint32_t prev =
+            state_.fetch_and(~(kWriterFlag | kWriterWaitFlag), std::memory_order_release);
         // P0-1: Clear the starvation timer so the next queued writer
         // records a fresh start time. Without this, the stale timestamp
         // from a previous queueing episode would make the next queued
         // writer appear "already starved" and flip the lock to
         // effectively writer-fair.
         writer_wait_start_ns_.store(0, std::memory_order_release);
-        do_wake_all();
+        // P1-1 (fix.01 方案 A): do_wake_all() is a real kernel call
+        // (WakeByAddressAll on Windows, futex_wake on Linux) and this is a
+        // per-bucket lock, so waking unconditionally costs one syscall on every
+        // write unlock even when nobody is waiting.
+        //
+        // Correctness requires more care than simply mirroring unlock_shared():
+        // a *blocked reader* is not visible in the state word at all (the state
+        // has no "reader waiting" bit), so `prev` alone cannot prove that no
+        // reader is queued. What makes the guard safe is the wait primitive:
+        //
+        //   - native wait (WaitOnAddress / futex / ulock) is a compare-and-wait
+        //     on the address, so the state change performed by the fetch_and
+        //     below releases every waiter by itself — no wake is needed;
+        //   - the std::condition_variable fallback is a pure notify/wait, so a
+        //     queued reader (or writer) stays blocked unless we notify.
+        //
+        // Therefore: skip the kernel wake only when no waiter flag is set AND we
+        // are on a self-releasing wait primitive. On the CV fallback keep the
+        // unconditional notify — there is no syscall to save there anyway (the
+        // cost is a mutex, not a kernel transition).
+        const bool waiter_visible = (prev & (kWriterWaitFlag | kReaderMask)) != 0;
+        if (waiter_visible || !native_wait_ops::available()) {
+            do_wake_all();
+        }
     }
 
     bool try_lock() noexcept {
@@ -495,30 +482,6 @@ private:
     std::condition_variable cv_;
 };
 
-/// RAII scoped guard for shared (reader) locking of shared_spinlock.
-/// Supports both blocking lock_shared() and try_lock_shared() modes.
-class shared_scoped_lock {
-public:
-    /// Blocking shared lock: calls lock_shared() unconditionally.
-    explicit shared_scoped_lock(shared_spinlock& m) noexcept
-        : m_(&m), locked_(true) { m_->lock_shared(); }
-
-    /// Try-shared lock: calls try_lock_shared(); check operator bool().
-    shared_scoped_lock(shared_spinlock& m, std::try_to_lock_t) noexcept
-        : m_(&m), locked_(m_->try_lock_shared()) {}
-
-    ~shared_scoped_lock() { if (locked_ && m_) m_->unlock_shared(); }
-
-    shared_scoped_lock(const shared_scoped_lock&) = delete;
-    shared_scoped_lock& operator=(const shared_scoped_lock&) = delete;
-
-    explicit operator bool() const noexcept { return locked_; }
-
-private:
-    shared_spinlock* m_ = nullptr;
-    bool locked_ = false;
-};
-
 struct alignas(64) aligned_shared_spinlock : shared_spinlock {};
 
 // ============================================================================
@@ -785,38 +748,6 @@ public:
     using deallocate_fn = void(*)(void*);
 
     static constexpr size_type entry_overhead = EmbeddedChain ? 0 : sizeof(value_type);
-
-    // ========================================================================
-    // Bucket lock — RAII guard for a single bucket's spinlock (exclusive)
-    // ========================================================================
-    class bucket_lock {
-    public:
-        explicit bucket_lock(aligned_spinlock& spin) noexcept
-            : spin_(&spin), owns_(true) { spin_->lock(); }
-        bucket_lock() noexcept : spin_(nullptr), owns_(false) {}
-        ~bucket_lock() { if (owns_ && spin_) spin_->unlock(); }
-
-        bucket_lock(bucket_lock&& other) noexcept
-            : spin_(other.spin_), owns_(other.owns_) {
-            other.owns_ = false; other.spin_ = nullptr;
-        }
-        bucket_lock& operator=(bucket_lock&& other) noexcept {
-            if (this != &other) {
-                if (owns_ && spin_) spin_->unlock();
-                spin_ = other.spin_; owns_ = other.owns_;
-                other.owns_ = false; other.spin_ = nullptr;
-            }
-            return *this;
-        }
-        bucket_lock(const bucket_lock&) = delete;
-        bucket_lock& operator=(const bucket_lock&) = delete;
-
-        void unlock() noexcept { if (owns_ && spin_) { spin_->unlock(); owns_ = false; } }
-        bool owns_lock() const noexcept { return owns_; }
-    private:
-        aligned_spinlock* spin_;
-        bool owns_;
-    };
 
     // ========================================================================
     // Shared bucket lock — RAII guard for shared (reader) access
@@ -1187,8 +1118,11 @@ public:
                     // the shared-lock slow path, which is rehash-safe.
                 }
                 // Slow path: shared lock (RMW, cache line bouncing)
-                auto sl = seqlock_.load(std::memory_order_acquire);
-                size_type idx = h & bucket_mask_.load(std::memory_order_relaxed);
+                // bucket_mask_ is read with acquire: a rehash publishes the
+                // new mask with a release store after swapping the array, so
+                // a relaxed load could pair the new mask with the old array
+                // on a weakly-ordered target (ARM/Power).
+                size_type idx = h & bucket_mask_.load(std::memory_order_acquire);
                 auto guard = lock_bucket_shared(idx);
                 return find_node_embedded(key, idx);
             } else {
@@ -1205,8 +1139,11 @@ public:
                             return node ? &(node->value) : nullptr;
                     }
                 }
-                auto sl = seqlock_.load(std::memory_order_acquire);
-                size_type idx = h & bucket_mask_.load(std::memory_order_relaxed);
+                // bucket_mask_ is read with acquire: a rehash publishes the
+                // new mask with a release store after swapping the array, so
+                // a relaxed load could pair the new mask with the old array
+                // on a weakly-ordered target (ARM/Power).
+                size_type idx = h & bucket_mask_.load(std::memory_order_acquire);
                 auto guard = lock_bucket_shared(idx);
                 return find_locked(key, idx);
             }
@@ -1338,8 +1275,11 @@ public:
                     // the shared-lock slow path, which is rehash-safe.
                 }
                 // Slow path: shared lock (RMW, cache line bouncing)
-                auto sl = seqlock_.load(std::memory_order_acquire);
-                size_type idx = h & bucket_mask_.load(std::memory_order_relaxed);
+                // bucket_mask_ is read with acquire: a rehash publishes the
+                // new mask with a release store after swapping the array, so
+                // a relaxed load could pair the new mask with the old array
+                // on a weakly-ordered target (ARM/Power).
+                size_type idx = h & bucket_mask_.load(std::memory_order_acquire);
                 auto guard = const_cast<concurrent_hash_table*>(this)->lock_bucket_shared(idx);
                 return find_node_embedded(key, idx);
             } else {
@@ -1356,8 +1296,11 @@ public:
                             return node ? &(node->value) : nullptr;
                     }
                 }
-                auto sl = seqlock_.load(std::memory_order_acquire);
-                size_type idx = h & bucket_mask_.load(std::memory_order_relaxed);
+                // bucket_mask_ is read with acquire: a rehash publishes the
+                // new mask with a release store after swapping the array, so
+                // a relaxed load could pair the new mask with the old array
+                // on a weakly-ordered target (ARM/Power).
+                size_type idx = h & bucket_mask_.load(std::memory_order_acquire);
                 auto guard = const_cast<concurrent_hash_table*>(this)->lock_bucket_shared(idx);
                 return find_locked(key, idx);
             }
@@ -1974,8 +1917,6 @@ public:
                         if ((v1 & 1u) == 0) {
                             uint16_t match_mask = f14_detail::f14_match_tags(chunk.tags, tag)
                                                 & chunk.load_occupied_mask_acquire();
-                            bool found_in_inline = false;
-                            Value found_node = nullptr;
                             while (match_mask) {
                                 int slot = f14_detail::ctz16(match_mask);
                                 match_mask &= static_cast<uint16_t>(match_mask - 1);
@@ -2164,7 +2105,6 @@ public:
                         size_type idx = h & bucket_mask_.load(std::memory_order_acquire);
                         Value curr = buckets_[idx].embed_head.load(std::memory_order_acquire);
                         hazslot.protect(curr);
-                        bool found = false;
                         Value found_node = nullptr;
                         int walk_steps = 0;
                         while (curr) {
@@ -2187,7 +2127,6 @@ public:
                                 continue;
                             }
                             if (equal_(curr->key, key)) {
-                                found = true;
                                 found_node = curr;
                                 break;
                             }
@@ -2458,7 +2397,6 @@ public:
                         size_type idx = h & bucket_mask_.load(std::memory_order_acquire);
                         Value curr = buckets_[idx].embed_head.load(std::memory_order_acquire);
                         hazslot.protect(curr);
-                        bool found = false;
                         Value found_node = nullptr;
                         int walk_steps = 0;
                         while (curr) {
@@ -2475,7 +2413,6 @@ public:
                                 continue;
                             }
                             if (equal_(curr->key, key)) {
-                                found = true;
                                 found_node = curr;
                                 break;
                             }
@@ -2670,8 +2607,11 @@ public:
                         if (sl1 == sl2 && (v1 == v2) && (v1 & 1u) == 0) return found;
                     }
                 }
-                auto sl = seqlock_.load(std::memory_order_acquire);
-                size_type idx = h & bucket_mask_.load(std::memory_order_relaxed);
+                // bucket_mask_ is read with acquire: a rehash publishes the
+                // new mask with a release store after swapping the array, so
+                // a relaxed load could pair the new mask with the old array
+                // on a weakly-ordered target (ARM/Power).
+                size_type idx = h & bucket_mask_.load(std::memory_order_acquire);
                 auto guard = const_cast<concurrent_hash_table*>(this)->lock_bucket_shared(idx);
                 return find_node_embedded(key, idx) != nullptr;
             } else {
@@ -2687,8 +2627,11 @@ public:
                         if (sl1 == sl2 && (v1 == v2) && (v1 & 1u) == 0) return found;
                     }
                 }
-                auto sl = seqlock_.load(std::memory_order_acquire);
-                size_type idx = h & bucket_mask_.load(std::memory_order_relaxed);
+                // bucket_mask_ is read with acquire: a rehash publishes the
+                // new mask with a release store after swapping the array, so
+                // a relaxed load could pair the new mask with the old array
+                // on a weakly-ordered target (ARM/Power).
+                size_type idx = h & bucket_mask_.load(std::memory_order_acquire);
                 auto guard = const_cast<concurrent_hash_table*>(this)->lock_bucket_shared(idx);
                 return find_node(key, idx) != nullptr;
             }
@@ -2795,12 +2738,15 @@ public:
         const size_type h = hash_(key);
         rehash_if_needed(h);
         const size_type idx = bucket_for_hash(h);
-        auto guard = lock_bucket(idx);
+        // Named `outer_guard` so the per-iteration `guard` declared inside
+        // the incremental-rehash loop below does not shadow it (-Wshadow).
+        // The outer lock is released before entering that loop.
+        auto outer_guard = lock_bucket(idx);
 
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware insert
             if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
-                guard.unlock();
+                outer_guard.unlock();
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -2956,7 +2902,7 @@ public:
                 // it, causing a self-deadlock under sharded_mm_lru + segmented
                 // hash table + incremental rehash when per-segment load factor
                 // exceeded the overload threshold and triggered rehash mid-insert.
-                guard.unlock();
+                outer_guard.unlock();
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -3058,12 +3004,14 @@ public:
         const size_type h = hash_(key);
         rehash_if_needed(h);
         const size_type idx = bucket_for_hash(h);
-        auto guard = lock_bucket(idx);
+        // See insert(): the per-iteration `guard` in the incremental-rehash
+        // loop below would otherwise shadow this one.
+        auto outer_guard = lock_bucket(idx);
 
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware insert_or_assign
             if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
-                guard.unlock();
+                outer_guard.unlock();
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -3268,7 +3216,7 @@ public:
             if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
                 // P-FIX (deadlock): Release the bucket lock acquired above before
                 // entering the dual-array for(;;) loop — same fix as insert()/erase().
-                guard.unlock();
+                outer_guard.unlock();
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -3429,12 +3377,14 @@ public:
     bool erase(const Key& key) {
         const size_type h = hash_(key);
         const size_type idx = bucket_for_hash(h);
-        auto guard = lock_bucket(idx);
+        // See insert(): the per-iteration `guard` in the incremental-rehash
+        // loop below would otherwise shadow this one.
+        auto outer_guard = lock_bucket(idx);
 
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware erase
             if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
-                guard.unlock();
+                outer_guard.unlock();
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -3702,7 +3652,7 @@ public:
                 // entering the dual-array for(;;) loop — same fix as insert().
                 // Without this, lock_bucket(old_idx) in the not-yet-migrated
                 // branch deadlocks on the already-held bucket lock.
-                guard.unlock();
+                outer_guard.unlock();
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -4044,7 +3994,16 @@ public:
     }
 
     float max_load_factor() const noexcept { return max_load_factor_; }
-    void max_load_factor(float ml) noexcept { max_load_factor_ = ml; }
+
+    /// Set the mandatory-rehash load factor.
+    ///
+    /// Also re-derives the emergency overload threshold, which must stay
+    /// below it (see rehash_if_needed()). Call set_hash_overload_threshold()
+    /// afterwards to override the derived value.
+    void max_load_factor(float ml) noexcept {
+        max_load_factor_ = ml;
+        hash_overload_threshold_.store(ml * 0.8f, std::memory_order_release);
+    }
 
     // ========================================================================
     // Rehash
@@ -4060,11 +4019,18 @@ public:
     }
 
     void rehash_if_needed() {
-        // T13.3: Configurable overload threshold. Check this BEFORE the
-        // max_load_factor_ early return so the application gets early
-        // warning *before* rehash is strictly required. The default 2.0
-        // matches the historical hardcoded warning threshold; users can
-        // lower it (e.g. 1.5) for latency-sensitive workloads.
+        // Configurable overload threshold — the point at which the table
+        // rehashes early, before max_load_factor_ is reached, to bound chain
+        // length and tail latency under sustained insert pressure.
+        //
+        // It MUST stay below max_load_factor_: rehash_if_needed() rehashes
+        // when EITHER threshold is crossed, so a lower threshold makes the
+        // higher one unreachable. The previous default of 2.0 broke that
+        // relationship for F14 mode, where max_load_factor_ is 10 (items per
+        // 14-slot chunk): every F14 table was rehashed as soon as it held 2
+        // items per chunk, so it was permanently sized for ~5x the chunks it
+        // needed, with ~12 of every 14 slots empty. The default is now
+        // derived from max_load_factor_ so the two can no longer drift apart.
         //
         // The callback fires on every insert that observes overload —
         // callers should deduplicate inside the callback if they only
@@ -4074,14 +4040,6 @@ public:
         // episode (via hash_overload_warned_) to prevent log spam when
         // the table is persistently overloaded. The flag is cleared when
         // load_factor drops back below the threshold.
-        //
-        // T13.3 (revised): When load_factor exceeds the overload threshold,
-        // trigger an emergency rehash immediately (rather than waiting until
-        // max_load_factor_ is reached). This bounds the worst-case chain
-        // length and tail latency under sustained insert pressure. The
-        // emergency rehash respects the incremental_rehash_ setting — if
-        // incremental rehash is enabled, the expansion proceeds incrementally
-        // (no writer stall); otherwise it falls back to a blocking rehash.
         const float current_lf = load_factor();
         const float threshold = hash_overload_threshold_.load(std::memory_order_acquire);
         const bool overloaded = current_lf > threshold;
@@ -4110,8 +4068,11 @@ public:
                           << " exceeds overload threshold " << threshold
                           << ". Consider increasing expected_items for better performance.\n";
             }
-        } else {
+        } else if (hash_overload_warned_.load(std::memory_order_relaxed)) {
             // Clear the flag so the next overload episode warns again.
+            // Guarded by a relaxed load so the common (not-overloaded) path
+            // is a plain read: an unconditional store here wrote to a
+            // process-wide cache line on every single insert.
             hash_overload_warned_.store(false, std::memory_order_relaxed);
         }
 
@@ -4125,12 +4086,13 @@ public:
             return;
         }
 
-        // T13.3: Trigger emergency rehash when load_factor exceeds the
-        // overload threshold (even if max_load_factor_ hasn't been reached
-        // yet). This bounds chain length and tail latency.
-        // Also trigger when load_factor exceeds max_load_factor_ (the
-        // historical mandatory-rehash trigger).
-        const bool mandatory_rehash = load_factor() > max_load_factor_;
+        // Rehash when the load factor exceeds either the emergency threshold
+        // (bounds chain length and tail latency) or max_load_factor_ (the
+        // historical mandatory trigger). Reuse the load factor already
+        // computed above instead of calling load_factor() a second time —
+        // each call re-reads size() and bucket_count() atomically and does a
+        // float division, on the insert path.
+        const bool mandatory_rehash = current_lf > max_load_factor_;
         if (!overloaded && !mandatory_rehash) return;
 
         // T13.3: For emergency rehash, double the bucket count. For
@@ -4233,6 +4195,40 @@ public:
         return hash_overload_events_.load(std::memory_order_relaxed);
     }
 
+    /// RAII claim on the single-threaded blocking-rehash path.
+    ///
+    /// Two threads that both observe an over-threshold load factor would
+    /// each allocate a new bucket array, each migrate only the buckets whose
+    /// locks it happened to win first, and each install its own array — and
+    /// whichever array is installed second takes the other's already-
+    /// migrated keys with it when the stale one is retired. Keys are lost.
+    ///
+    /// The incremental paths have always been guarded on rehash_begin
+    /// (rehash_in_progress_ / rehash_migrating_); the blocking paths were
+    /// not. rehash_migrating_ is reused here because the two modes are
+    /// mutually exclusive by configuration (it is read as a plain bool, so a
+    /// blocking rehash can never contend with an incremental migration for
+    /// it).
+    class blocking_rehash_claim {
+    public:
+        explicit blocking_rehash_claim(std::atomic<bool>& flag) noexcept
+            : flag_(flag) {
+            bool expected = false;
+            acquired_ = flag_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel);
+        }
+        ~blocking_rehash_claim() {
+            if (acquired_) flag_.store(false, std::memory_order_release);
+        }
+        blocking_rehash_claim(const blocking_rehash_claim&) = delete;
+        blocking_rehash_claim& operator=(const blocking_rehash_claim&) = delete;
+        [[nodiscard]] bool acquired() const noexcept { return acquired_; }
+
+    private:
+        std::atomic<bool>& flag_;
+        bool acquired_;
+    };
+
     void rehash(size_type new_bucket_count) {
         new_bucket_count = next_power_of_two(new_bucket_count);
         if (new_bucket_count <= bucket_count()) return;
@@ -4260,6 +4256,8 @@ public:
             // T11.3: Blocking rehash — every concurrent writer will stall on
             // the chunk locks acquired below. Count this so users can detect
             // that they should enable incremental rehash.
+            blocking_rehash_claim claim(rehash_migrating_);
+            if (!claim.acquired()) return;  // another thread is already rehashing
             rehash_blocked_writes_count_.fetch_add(1, std::memory_order_relaxed);
             // Blocking rehash: acquire ALL chunk exclusive locks
             std::vector<exclusive_bucket_lock> locks;
@@ -4415,6 +4413,8 @@ public:
                 // T11.3: Blocking rehash — every concurrent writer will stall
                 // on the bucket locks acquired below. Count this so users can
                 // detect that they should enable incremental rehash.
+                blocking_rehash_claim claim(rehash_migrating_);
+                if (!claim.acquired()) return;  // another thread is already rehashing
                 rehash_blocked_writes_count_.fetch_add(1, std::memory_order_relaxed);
                 // Blocking rehash (original behavior)
                 std::vector<exclusive_bucket_lock> locks;
@@ -5451,23 +5451,20 @@ private:
         return nullptr;
     }
 
-    /// Find an empty slot (empty or tombstone) in a chunk.
+    /// Find a free slot (empty or tombstone) in a chunk.
     /// Returns slot index [0, kCapacity), or -1 if all slots are occupied.
+    ///
+    /// `~occupied_mask` already names every free slot; reading its lowest
+    /// set bit does in one instruction what the previous 14-iteration linear
+    /// scan did in fourteen — which defeated the point of keeping an
+    /// occupancy bitmap beside the tag array at all. Preferring "clean
+    /// empty" slots over tombstones was also a no-op: kTagTombstone is
+    /// written but never read anywhere, so the two kinds of free slot are
+    /// indistinguishable to tag matching.
     int find_f14_empty_slot(size_type chunk_idx) const {
-        auto& chunk = chunks_[chunk_idx];
-        // Prefer empty slots over tombstones for better SIMD filtering
-        uint16_t empty_mask = static_cast<uint16_t>(~chunk.occupied_mask & f14_detail::kFullMask);
-        // Check for slots with kTagEmpty first (clean empty, not tombstone)
-        for (int i = 0; i < f14_detail::kChunkCapacity; ++i) {
-            if (chunk.tags[i] == f14_detail::kTagEmpty && !(chunk.occupied_mask & (1u << i))) {
-                return i;
-            }
-        }
-        // Fall back to tombstone slots
-        if (empty_mask) {
-            return f14_detail::ctz16(empty_mask);
-        }
-        return -1; // All slots occupied
+        const uint16_t empty_mask = static_cast<uint16_t>(
+            ~chunks_[chunk_idx].occupied_mask & f14_detail::kFullMask);
+        return empty_mask ? f14_detail::ctz16(empty_mask) : -1;
     }
 
     /// Find an empty slot in a new (empty) chunk during rehash.
@@ -5902,7 +5899,13 @@ private:
     // T13.1: Configurable overload threshold and counter. Padded to
     // avoid false sharing with the rehash counters above (which are
     // updated on every rehash, while these are read on every insert).
-    alignas(64) std::atomic<float> hash_overload_threshold_{2.0f};
+    //
+    // Derived from max_load_factor_ (declared immediately above, so it is
+    // already initialized) rather than hardcoded: rehash_if_needed() fires
+    // on whichever threshold is crossed first, so an independent constant
+    // silently makes max_load_factor_ unreachable whenever it is lower.
+    // Keep the two in step via max_load_factor(float).
+    alignas(64) std::atomic<float> hash_overload_threshold_{max_load_factor_ * 0.8f};
     alignas(64) std::atomic<std::size_t> hash_overload_events_{0};
     // T13.2: User-registered callback invoked when load_factor exceeds
     // the overload threshold. Invoked from the rehash hot path, so it

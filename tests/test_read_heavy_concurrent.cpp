@@ -47,10 +47,10 @@ void run_read_heavy_concurrent(CacheT& c, int key_space,
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 7919 + 1);
+            auto rng = lru_test::seed_rng(t * 7919 + 1);
             for (int i = 0; i < ops_per_thread; ++i) {
-                int key = rng() % key_space;
-                if (rng() % 100 < 5) {
+                int key = lru_test::rng_int(rng) % key_space;
+                if (lru_test::rng_int(rng) % 100 < 5) {
                     // 5% writes: update existing key with canonical value
                     c.set(key, key * 10);
                 } else {
@@ -90,10 +90,10 @@ void run_concurrent_with_rehash(CacheT& c, int key_space,
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 31337 + 7);
+            auto rng = lru_test::seed_rng(t * 31337 + 7);
             for (int i = 0; i < ops_per_thread; ++i) {
-                int key = rng() % key_space;
-                int op = rng() % 10;
+                int key = lru_test::rng_int(rng) % key_space;
+                int op = lru_test::rng_int(rng) % 10;
                 if (op < 7) {
                     c.set(key, key * 10);
                 } else {
@@ -201,10 +201,10 @@ TEST(ReadHeavyConcurrent, ProductionCacheSustainedReadHeavy) {
     std::vector<std::thread> threads;
     for (int t = 0; t < 16; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 7919 + 1);
+            auto rng = lru_test::seed_rng(t * 7919 + 1);
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = rng() % key_space;
-                if (rng() % 100 < 5) {
+                int key = lru_test::rng_int(rng) % key_space;
+                if (lru_test::rng_int(rng) % 100 < 5) {
                     c.set(key, key * 10);
                 } else {
                     auto h = c.try_get(key);

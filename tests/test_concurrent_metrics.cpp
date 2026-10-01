@@ -184,9 +184,14 @@ TEST(ConcurrentMetrics, LatencyHistogramConcurrentRecord) {
 // be a lower bound (Count-Min Sketch property).
 // ============================================================================
 TEST(ConcurrentMetrics, CountMinSketchConcurrentAdd) {
+    // P1-25: the sketch is now parameterised like CacheLib's —
+    // (capacity, window_multiplier, error_threshold, hash_count). The old
+    // (error_rate, confidence) pair gave a 42-counter table regardless of
+    // capacity; these settings ask for a table sized for 10000 items.
     count_min_sketch<int> sketch(/*capacity=*/10000,
-                                  /*error_rate=*/0.1,
-                                  /*confidence=*/0.95);
+                                  /*window_multiplier=*/32,
+                                  /*error_threshold=*/5.0,
+                                  /*hash_count=*/4);
 
     constexpr int kThreads = 8;
     constexpr int kAccessesPerThread = 1000;

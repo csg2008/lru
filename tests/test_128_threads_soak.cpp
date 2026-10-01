@@ -60,7 +60,7 @@ TEST(OneTwentyEightThreadsSoak, ReadHeavyNoCorruption) {
     std::atomic<std::uint64_t> errors{0};
 
     auto worker = [&](unsigned int seed) {
-        std::mt19937 rng(seed);
+        auto rng = lru_test::seed_rng(seed);
         std::uniform_int_distribution<int> key_dist(0, 9'999);
         std::uniform_int_distribution<int> op_dist(0, 99);  // 99% read
 

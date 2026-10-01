@@ -4,11 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-Header-only C++20 LRU cache library (v4.0.0), inspired by Facebook's CacheLib architecture. It provides multiple eviction strategies (LRU, 2Q, TinyLFU, W-TinyLFU, FIFO), thread-safe variants, TTL support, serialization, memory monitoring, slab allocation, compact cache, compressed pointers, tiered storage, warm cache, shared memory backend, pooled cache, and related utilities.
+Header-only C++20 LRU cache library (v1.0.0), inspired by Facebook's CacheLib architecture. It provides multiple eviction strategies (LRU, 2Q, TinyLFU, W-TinyLFU, FIFO), thread-safe variants, TTL support, serialization, memory monitoring, slab allocation, compact cache, compressed pointers, tiered storage, warm cache, shared memory backend, pooled cache, and related utilities.
 
 ## Build, test, and run (Windows MSYS2 Clang64)
 
-The local development workflow assumes the MSYS2 Clang64 toolchain at `E:\app\msys64`. Run build commands inside `E:\app\msys64\usr\bin\bash.exe` with the Clang64 toolchain on `PATH`.
+The local development workflow assumes the MSYS2 Clang64 toolchain at `E:\GCC\msys64` (Clang64 binaries in `E:\GCC\msys64\clang64\bin`). Run build commands inside `E:\GCC\msys64\usr\bin\bash.exe` with the Clang64 toolchain on `PATH`. (An older revision of this file pointed at `E:\app\msys64`, which does not exist on this machine.)
+
+**Toolchain matrix used for verification**
+
+| Toolchain | Path | Role |
+|---|---|---|
+| Clang 22 (MSYS2 Clang64) | `E:\GCC\msys64\clang64\bin` | **Primary**: builds, tests, ASan/UBSan (UCRT64 GCC has no `libasan` runtime) |
+| GCC 16.2 (MSYS2 UCRT64) | `E:\GCC\msys64\ucrt64\bin` | **Secondary**: `-Werror` portability gate only — must also build warning-free, but is *not* the sanitizer toolchain |
+
+Both toolchains must build all targets with zero warnings under `-Werror`; GCC-only diagnostics (`-Wcomment`, `-Wclass-memaccess`, `-Wcast-function-type`, `-Wvolatile`, and `int x = unsigned % literal` sign conversions) are **not** reported by Clang, so a Clang-only build is not sufficient evidence of warning cleanliness.
+
+**GCC linkage requirement**: with GCC, the slab allocator's 128-bit tagged-pointer CAS emits calls to `__atomic_load_16` / `__atomic_compare_exchange_16`, which live in `libatomic`. `CMakeLists.txt` links it automatically for GNU compilers; **consumers that do not use CMake must add `-latomic` themselves** (Clang and MSVC do not need it).
 
 - ccache is available; set `CC`/`CXX` to use it.
 - Prefer Debug builds for iteration speed.
@@ -203,7 +214,7 @@ The library is header-only. The key headers and their roles:
 - `mm.hpp` — Eviction strategy implementations: `mm_lru`, `mm_2q`, `mm_tiny_lfu`, `mm_wtiny_lfu`, `mm_fifo`, and `sharded_mm_lru`. Includes slab allocator mixin, overflow policy, access mode.
 - `detail/foundation.hpp` — Internal utilities: type traits helpers, string formatting, periodic worker, striped mutex, integer sequence helpers.
 - `detail/refcount.hpp` — CAS-lockfree reference counting with embedded flags (64-bit atomic word: 5 flags + 3 admin_ref + 32 access_ref). Overflow is prevented via check-and-refuse: `incRef()` returns `kIncFailedOverflow` when `access_ref` reaches `kAccessRefMax`, letting callers (e.g. `read_handle` ctor) produce an empty handle instead of saturating silently.
-- `detail/hazptr.hpp` — Lightweight hazard pointer mechanism for deferred reclamation. v4.2: lock-free retire path, TLS slot cache, hazptr_obj_base for zero-alloc retirement.
+- `detail/hazptr.hpp` — Lightweight hazard pointer mechanism for deferred reclamation. Lock-free retire path, TLS slot cache, hazptr_obj_base for zero-alloc retirement.
 - `detail/epoch_reclamation.hpp` — Epoch-based reclamation (EBR), faster read-path than hazard pointers. Lock-free retire, TLS slot caching, compatible with hazptr_obj_base.
 - `detail/latency_histogram.hpp` — Log-linear latency histogram with 512 lock-free atomic buckets. 16 sub-buckets per power-of-2 octave, ≤6.25% precision.
 - `detail/intrusive_list.hpp` — Intrusive doubly-linked list used by all MM strategies; nodes embed prev/next/updateTime/refcount hooks. Supports compressed pointer hooks.

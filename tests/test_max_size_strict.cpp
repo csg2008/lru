@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
-// P2-1: max_size silent amplification warning + set_max_size_strict API.
+// P2-1 / P1-30: capacity amplification policy + set_max_size_strict API.
 //
 // Validates:
-//   1. striped_cache(max_size=10, num_stripes=64) silently amplifies
-//      max_size to num_shards (64) — verified via size() capacity.
+//   1. P1-30: an undersized striped capacity is never silently amplified —
+//      the shard/stripe count is derived from the requested capacity instead
+//      (方案 B), and an EXPLICIT shard layout that cannot be honoured throws
+//      (方案 A).
 //   2. max_size_strict(N) with N < num_shards throws std::invalid_argument.
 //   3. max_size_strict(N) with N >= num_shards succeeds and applies.
 //   4. max_size_strict(unlimited) succeeds (no amplification check).
@@ -18,32 +20,73 @@
 
 using namespace lru;
 
+
 // ============================================================================
-// TC-P2-1a: Silent amplification of undersized max_size
+// TC-P2-1a: P1-30 — undersized capacity is never silently amplified
 // ============================================================================
-TEST(MaxSizeStrict, SilentlyAmplifiesUndersizedMaxSize) {
-    // striped_cache(10, 64) — requested max_size=10, num_stripes=64.
-    // distribute_max_size() raises max_size_ to 64 so every shard has
-    // at least one slot. This is the "lenient" behavior; the warning
-    // goes to stderr (not testable here without capturing stderr).
-    striped_cache<int, int> c{10, 64};
-    // The amplification raises effective capacity to num_shards (64).
+TEST(MaxSizeStrict, ShrinksShardCountInsteadOfAmplifying) {
+    // P1-30 (fix.01 方案 A + 方案 B): `striped_cache<int,int> c{10}` used to be
+    // laid out over `default_num_stripes` (64) shards, which silently raised
+    // the effective capacity to 64 (6.4x the request) and made max_size()
+    // report a value the caller never asked for.
+    //
+    // 方案 A makes silent amplification a hard error; 方案 B removes the need
+    // for it in the common one-argument case by deriving the SHARD count from
+    // the requested capacity (stripes stay as requested — they are the lock
+    // granularity, not a capacity bound).
+    striped_cache<int, int> c{10};
+    EXPECT_EQ(c.max_size(), 10u);
+    EXPECT_EQ(c.requested_max_size(), 10u);
+    EXPECT_LE(c.num_shards(), 10u);
+    EXPECT_EQ(c.num_stripes(), 64u);
+
+    // A request that matches the shard count is accepted unchanged.
+    striped_cache<int, int> ok{64, 64};
+    EXPECT_EQ(ok.max_size(), 64u);
+
+    // Largest requests are accepted and honoured verbatim.
+    striped_cache<int, int> big{1024, 64};
+    EXPECT_EQ(big.max_size(), 1024u);
+    EXPECT_EQ(big.requested_max_size(), 1024u);
+}
+
+// ============================================================================
+// TC-P2-1a2: P1-30 — an explicit shard layout still refuses amplification
+// ============================================================================
+TEST(MaxSizeStrict, ThrowsWhenExplicitShardLayoutCannotBeHonoured) {
+    // When the shard count is supplied explicitly through the MM config there
+    // is nothing to shrink: asking for 8 slots across 64 shards must fail
+    // loudly rather than being multiplied into 64 slots.
+    sharded_mm_lru_config cfg;
+    cfg.num_shards = 64;
+    EXPECT_THROW((striped_cache<int, int>(8, cfg)), cache_config_exception);
+
+    // ...unless the caller explicitly accepts the per-shard floor.
+    cfg.allow_amplification = true;
+    EXPECT_NO_THROW((striped_cache<int, int>(8, cfg)));
+}
+
+// ============================================================================
+// TC-P2-1a3: P1-30 — explicit opt-in restores the documented amplification
+// ============================================================================
+TEST(MaxSizeStrict, AmplifiesWhenExplicitlyAllowed) {
+    // With allow_amplification = true the per-shard floor of one slot applies
+    // and the effective capacity is raised to num_shards. The two numbers stay
+    // separately reportable: max_size() = effective, requested_max_size() =
+    // what the caller asked for.
+    sharded_mm_lru_config cfg;
+    cfg.num_shards = 64;
+    cfg.allow_amplification = true;
+    striped_cache<int, int> c(10, cfg);
+    EXPECT_EQ(c.requested_max_size(), 10u);
     EXPECT_EQ(c.max_size(), 64u);
 
-    // Inserting 10 keys must not be *silently rejected globally* — the
-    // P0-A fix guarantees every shard can hold at least one item, so a
-    // well-mixed hash can always place each key somewhere. However, the
-    // per-shard quota is 1, so when two keys hash to the same shard one
-    // of them is evicted (10 keys over 64 shards collide with ~30%
-    // probability under a well-mixed hash). Assert the lenient behavior:
-    // inserts succeed, at least one item survives, and every surviving
-    // item holds the correct value.
+    // Every shard has at least one slot, so no insert is silently dropped
+    // for landing on a zero-quota shard.
     for (int i = 0; i < 10; ++i) {
         c.set(i, i * 10);
     }
-    // At least one insert survived (no silent global rejection).
     EXPECT_GT(c.size(), 0u);
-    // Every surviving key must hold the correct value.
     for (int i = 0; i < 10; ++i) {
         auto h = c.try_get(i);
         if (h) {

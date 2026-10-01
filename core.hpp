@@ -595,12 +595,39 @@ public:
             std::lock_guard<std::mutex> lock(async_mutex_);
             const std::size_t max_sz = async_queue_max_size_;
             const overflow_policy policy = async_overflow_policy_;
-            // Record the queue size before enqueuing this batch so that on
-            // kReject we can roll back only the events added here, preserving
-            // events enqueued by previous flush_pending() calls that the
-            // worker thread has not yet dispatched.
-            const std::size_t queue_size_before = async_queue_.size();
 
+            // P1-35 (fix.01 方案 A): under kReject, decide BEFORE touching the
+            // queue.
+            //
+            // The previous flow pushed events into the queue one by one (moving
+            // the key/value OUT of `drained` as it went) and, on the first
+            // failure, truncated the queue back with `resize(queue_size_before)`
+            // and fell through to synchronous dispatch for "the full batch".
+            // That loses events in two ways:
+            //   1. every event already pushed in this batch is removed from the
+            //      queue by the rollback, but its key/value were already moved
+            //      out of `drained` — so the synchronous fallback dispatches
+            //      them EMPTY (event lost), and
+            //   2. `resize()` truncates by position, so it can only be reasoned
+            //      about at all while the worker cannot interleave.
+            // Deciding up front leaves both the queue and `drained` untouched,
+            // so the synchronous fallback dispatches the batch intact. This is
+            // also what the policy means: "reject the whole batch, do not
+            // partially enqueue".
+            const std::size_t batch_size = drained.hits.size() +
+                                           drained.misses.size() +
+                                           drained.inserts.size() +
+                                           drained.evicts.size() +
+                                           drained.updates.size() +
+                                           drained.expires.size() +
+                                           drained.rejects.size();
+            bool rejected = false;
+            if (policy == overflow_policy::kReject && max_sz != 0 &&
+                async_queue_.size() + batch_size > max_sz) {
+                // Refuse the whole batch; the queue is left exactly as it was so
+                // the worker still dispatches everything queued previously.
+                rejected = true;
+            } else {
             auto push_event = [&](async_event&& evt) {
                 if (max_sz == 0 || async_queue_.size() < max_sz) {
                     async_queue_.push_back(std::move(evt));
@@ -622,7 +649,8 @@ public:
                 return false;  // unreachable
             };
 
-            bool rejected = false;
+            // NOTE: `rejected` is declared before the kReject pre-check above —
+            // do not shadow it here, or the early-reject decision is lost.
             for (auto& e : drained.hits) {
                 if (!push_event(async_event{callback_event_kind::hit,
                                             std::move(e.key),
@@ -692,15 +720,21 @@ public:
                 }
             }
             if (rejected) {
-                // kReject policy: roll back only the events we enqueued in
-                // this batch (preserving previously-enqueued events for the
-                // worker to dispatch), then fall through to synchronous
-                // dispatch for the full batch.
-                async_queue_.resize(queue_size_before);
+                // P1-35 (fix.01 方案 A): the queue was never touched in this
+                // path (the kReject decision was taken before the first push),
+                // so there is nothing to roll back. `drained` still owns every
+                // event intact, and the synchronous dispatch below will deliver
+                // the whole batch — neither lost nor duplicated.
+                //
+                // The `resize(queue_size_before)` rollback that used to be here
+                // was both unnecessary and harmful: by that point some events had
+                // already been moved out of `drained` into the queue, so removing
+                // them from the queue destroyed them outright.
             } else {
                 async_cv_.notify_one();
                 return;
             }
+            }  // end: non-early-reject enqueue path
         }
 
         // Synchronous dispatch path (original behavior).
@@ -959,15 +993,32 @@ private:
     };
 
     /// Start the async dispatch worker thread.
+    ///
+    /// P1-35 (fix.01 方案 A): the worker's lifetime is protected by
+    /// `async_worker_mutex_`. Previously this exchanged `async_mode_` and then
+    /// assigned `async_worker_` with no synchronization, so two threads calling
+    /// `set_async_mode()` concurrently could both observe "not running" and then
+    /// double-assign the unique_ptr — leaking one std::thread object (whose
+    /// destructor on a joinable thread calls std::terminate) — or join a thread
+    /// the other had already moved away. The mode flag is now re-checked under
+    /// the lock, so the transition happens exactly once.
     void start_async_worker() {
-        if (async_mode_.exchange(true, std::memory_order_acq_rel)) {
-            return;  // already running
+        std::lock_guard<std::mutex> lock(async_worker_mutex_);
+        if (async_mode_.load(std::memory_order_acquire)) {
+            return;  // already running (re-checked under the lock)
         }
+        async_mode_.store(true, std::memory_order_release);
         async_worker_ = std::make_unique<std::thread>([this] { async_worker_loop(); });
     }
 
     /// Stop the async dispatch worker thread and drain remaining events.
+    ///
+    /// P1-35: serialized against start_async_worker() by async_worker_mutex_, so
+    /// the join/reset pair cannot race another thread's start. Lock order is
+    /// async_worker_mutex_ -> async_mutex_ (via drain_async_queue); nothing takes
+    /// them in the opposite order.
     void stop_async_worker() {
+        std::lock_guard<std::mutex> lock(async_worker_mutex_);
         if (!async_mode_.exchange(false, std::memory_order_acq_rel)) {
             return;  // not running
         }
@@ -1273,6 +1324,10 @@ private:
     mutable std::mutex async_mutex_;
     std::condition_variable async_cv_;
     std::deque<async_event> async_queue_;
+    // P1-35: dedicated mutex for the worker thread's *lifetime*. async_mutex_
+    // protects the queue only, and is not held while joining, so the two cannot
+    // deadlock: the order is always async_worker_mutex_ -> async_mutex_.
+    mutable std::mutex async_worker_mutex_;
     std::unique_ptr<std::thread> async_worker_;
 
     // P0-1: async queue backpressure
@@ -1586,6 +1641,34 @@ struct alignas(64) sharded_handle_counter {
         shards[0].value.store(v, mo);
     }
 
+    /// P1-36 (fix.01 方案 A): reset to zero by subtracting what each shard
+    /// currently holds, instead of overwriting with 0.
+    ///
+    /// `store(0)` is not safe against concurrent updates and the unsafe direction
+    /// is the dangerous one: an increment that arrives on a non-zero shard while
+    /// `store()` is wiping it is silently DISCARDED, so
+    /// `cache_stats::active_handle_count` can read 0 while a `read_handle` is
+    /// still alive. That counter gates safe teardown (the destructor waits for it
+    /// to reach 0), so under-reporting is a use-after-free rather than a stats
+    /// error.
+    ///
+    /// `fetch_sub(load())` removes only what the reset actually observed, leaving
+    /// anything that arrived concurrently in place, and lets concurrent inc/dec
+    /// interleave correctly on each shard.
+    ///
+    /// Note the reset is inherently approximate for handles created/destroyed
+    /// concurrently with it (a "reset" has no well-defined meaning for in-flight
+    /// events); what matters is that it never *loses* a decrement needed to reach
+    /// zero, nor an increment that proves a handle is still alive.
+    void reset() noexcept {
+        for (std::size_t i = 0; i < kNumShards; ++i) {
+            const std::size_t observed = shards[i].value.load(std::memory_order_relaxed);
+            if (observed != 0) {
+                shards[i].value.fetch_sub(observed, std::memory_order_relaxed);
+            }
+        }
+    }
+
     std::size_t exchange(std::size_t v,
                          std::memory_order mo = std::memory_order_seq_cst) noexcept {
         std::size_t old = load(mo);
@@ -1642,6 +1725,20 @@ struct handle_release_notifier {
     std::mutex mtx;
     std::condition_variable cv;
     std::atomic<bool> shutdown_in_progress{false};
+    /// P1-33 (fix.01 方案 A): cleared by the owning cache's destructor.
+    ///
+    /// A `read_handle` can outlive its cache: the documented shutdown flow
+    /// (`shutdown_and_wait()`) waits at most 5 s, prints a CRITICAL warning and
+    /// then lets destruction proceed. A handle released after that used to write
+    /// into the destroyed cache's `cache_stats` (`active_handle_count.fetch_sub`)
+    /// and to reach this notifier through it — a heap use-after-free on a
+    /// documented path.
+    ///
+    /// The notifier itself is process-lifetime (the cache allocates it once and
+    /// never frees it), so a handle may safely dereference it even after the
+    /// cache is gone; this flag then tells the handle to stop touching
+    /// cache-owned state.
+    std::atomic<bool> cache_alive{true};
 };
 
 /// Thread-safe cache statistics (lock-free using atomics).
@@ -1690,6 +1787,11 @@ struct cache_stats {
     // Eviction pressure diagnostics
     padded_atomic_size eviction_search_steps{};    // total steps in find_eviction_victim()
     padded_atomic_size pinned_skip_count{};        // times pinned items were skipped during eviction
+    // P1-23 (fix.01 方案 B): number of eviction attempts that freed nothing
+    // (e.g. the only victim candidates were pinned, or a per-shard try_lock
+    // failed). A rising value means the cache can silently exceed max_size, so
+    // it is the operator-visible signal that capacity enforcement degraded.
+    padded_atomic_size eviction_failed{};
 
     // TTL diagnostics
     padded_atomic_size ttl_expired_count{};        // total expired items cleaned up
@@ -1781,7 +1883,13 @@ struct cache_stats {
     // which is unreachable in practice but possible in pathological
     // handle-leak scenarios. Operators should alert on any non-zero
     // value: it almost certainly indicates a handle leak in user code.
-    padded_atomic_size incRef_overflow_count{};
+    // P1-34 (fix.01 方案 A): `mutable` so const read paths (notably the const
+    // `unified_cache::peek()`) can account a refcount-saturation event the same
+    // way the non-const paths do. `std::atomic::fetch_add` is non-const, so
+    // without this a const method cannot bump the counter at all — which is
+    // exactly why `peek()` used to report saturation as an ordinary miss.
+    // Logically const: it is a statistics counter, not observable state.
+    mutable padded_atomic_size incRef_overflow_count{};
 
     // Latency histograms (ns) for get() and set() hot paths.
     // mutable: record() is logically const (atomic counters).
@@ -1796,10 +1904,22 @@ struct cache_stats {
     // to find an eviction victim (indicates pinned-item pressure).
     mutable detail::latency_histogram eviction_search_steps_hist{};
 
-    // P1-4: Runtime toggle for latency tracking. When disabled,
-    // scope_latency_timer skips clock reads entirely, saving ~10-20%
-    // on hot-path overhead. Default: enabled for backward compatibility.
-    std::atomic<bool> latency_tracking_enabled{true};
+    // Runtime toggle for latency tracking. When disabled, the per-operation
+    // scope_latency_timer skips both clock reads and the histogram update.
+    //
+    // Default: DISABLED. The timer costs two steady_clock::now() calls plus
+    // a histogram bucket RMW on every get()/set(). Measured on the hot path
+    // of a hit-dominated workload, that is +68% per-operation latency
+    // (~90ns of the ~120ns added, on a machine where a raw lookup is ~50ns).
+    // A "high-performance" cache cannot pay that by default; the
+    // documentation's "~10-20%" estimate understated it by roughly 4x.
+    //
+    // Enable with set_latency_tracking(true) when P50/P95/P99 percentiles
+    // are actually being scraped. set_latency_sample_rate(rate) reduces the
+    // histogram cost on high-throughput paths, but the clock reads are paid
+    // per operation regardless of the sample rate, so sampling is not a
+    // substitute for turning tracking off.
+    std::atomic<bool> latency_tracking_enabled{false};
 
     /// SeqLock for consistent_snapshot() — allows lock-free reads of
     /// multiple atomic counters while writers (reset) are rare.
@@ -1831,6 +1951,7 @@ struct cache_stats {
         , try_lock_fail_count(other.try_lock_fail_count.load(std::memory_order_relaxed))
         , eviction_search_steps(other.eviction_search_steps.load(std::memory_order_relaxed))
         , pinned_skip_count(other.pinned_skip_count.load(std::memory_order_relaxed))
+        , eviction_failed(other.eviction_failed.load(std::memory_order_relaxed))
         , ttl_expired_count(other.ttl_expired_count.load(std::memory_order_relaxed))
         , ttl_cleanup_backlog(other.ttl_cleanup_backlog.load(std::memory_order_relaxed))
         , ttl_checked_count(other.ttl_checked_count.load(std::memory_order_relaxed))
@@ -1872,6 +1993,7 @@ struct cache_stats {
         , try_lock_fail_count(other.try_lock_fail_count.load(std::memory_order_relaxed))
         , eviction_search_steps(other.eviction_search_steps.load(std::memory_order_relaxed))
         , pinned_skip_count(other.pinned_skip_count.load(std::memory_order_relaxed))
+        , eviction_failed(other.eviction_failed.load(std::memory_order_relaxed))
         , ttl_expired_count(other.ttl_expired_count.load(std::memory_order_relaxed))
         , ttl_cleanup_backlog(other.ttl_cleanup_backlog.load(std::memory_order_relaxed))
         , ttl_checked_count(other.ttl_checked_count.load(std::memory_order_relaxed))
@@ -1898,10 +2020,13 @@ struct cache_stats {
 
     cache_stats& operator=(const cache_stats& other) {
         if (this != &other) {
-            // Use seqlock write guards on both sides to prevent torn reads
-            // from consistent_snapshot() during assignment.
-            detail::seqlock::write_guard lhs_guard(snapshot_lock_);
-            detail::seqlock::write_guard rhs_guard(other.snapshot_lock_);
+            // Guard both sides against torn reads from
+            // consistent_snapshot(). The two seqlocks must be claimed in
+            // address order: two threads running `a = b` and `b = a`
+            // concurrently would otherwise take them in opposite orders and
+            // hang. See dual_seqlock_write_guard().
+            detail::dual_seqlock_write_guard both_guards(
+                snapshot_lock_, other.snapshot_lock_);
             hits.value.store(other.hits.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
             misses.value.store(other.misses.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
             insertions.value.store(other.insertions.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -1918,6 +2043,7 @@ struct cache_stats {
             try_lock_fail_count.store(other.try_lock_fail_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
             eviction_search_steps.store(other.eviction_search_steps.load(std::memory_order_relaxed), std::memory_order_relaxed);
             pinned_skip_count.store(other.pinned_skip_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        eviction_failed.store(other.eviction_failed.load(std::memory_order_relaxed), std::memory_order_relaxed);
             ttl_expired_count.store(other.ttl_expired_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
             ttl_cleanup_backlog.store(other.ttl_cleanup_backlog.load(std::memory_order_relaxed), std::memory_order_relaxed);
             ttl_checked_count.store(other.ttl_checked_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -1946,10 +2072,13 @@ struct cache_stats {
 
     cache_stats& operator=(cache_stats&& other) {
         if (this != &other) {
-            // Use seqlock write guards on both sides to prevent torn reads
-            // from consistent_snapshot() during assignment.
-            detail::seqlock::write_guard lhs_guard(snapshot_lock_);
-            detail::seqlock::write_guard rhs_guard(other.snapshot_lock_);
+            // Guard both sides against torn reads from
+            // consistent_snapshot(). The two seqlocks must be claimed in
+            // address order: two threads running `a = b` and `b = a`
+            // concurrently would otherwise take them in opposite orders and
+            // hang. See dual_seqlock_write_guard().
+            detail::dual_seqlock_write_guard both_guards(
+                snapshot_lock_, other.snapshot_lock_);
             hits.value.store(other.hits.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
             misses.value.store(other.misses.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
             insertions.value.store(other.insertions.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -1966,6 +2095,7 @@ struct cache_stats {
             try_lock_fail_count.store(other.try_lock_fail_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
             eviction_search_steps.store(other.eviction_search_steps.load(std::memory_order_relaxed), std::memory_order_relaxed);
             pinned_skip_count.store(other.pinned_skip_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        eviction_failed.store(other.eviction_failed.load(std::memory_order_relaxed), std::memory_order_relaxed);
             ttl_expired_count.store(other.ttl_expired_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
             ttl_cleanup_backlog.store(other.ttl_cleanup_backlog.load(std::memory_order_relaxed), std::memory_order_relaxed);
             ttl_checked_count.store(other.ttl_checked_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -2046,6 +2176,9 @@ struct cache_stats {
             snap.try_lock_fail_count.store(try_lock_fail_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
             snap.eviction_search_steps.store(eviction_search_steps.load(std::memory_order_relaxed), std::memory_order_relaxed);
             snap.pinned_skip_count.store(pinned_skip_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            // P1-23: include the eviction-failure counter in the consistent
+            // snapshot so it survives seqlock validation together with the rest.
+            snap.eviction_failed.store(eviction_failed.load(std::memory_order_relaxed), std::memory_order_relaxed);
             snap.ttl_expired_count.store(ttl_expired_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
             snap.ttl_cleanup_backlog.store(ttl_cleanup_backlog.load(std::memory_order_relaxed), std::memory_order_relaxed);
             snap.ttl_checked_count.store(ttl_checked_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -2115,10 +2248,15 @@ struct cache_stats {
         try_lock_fail_count.store(0, std::memory_order_relaxed);
         eviction_search_steps.store(0, std::memory_order_relaxed);
         pinned_skip_count.store(0, std::memory_order_relaxed);
+        eviction_failed.store(0, std::memory_order_relaxed);
         ttl_expired_count.store(0, std::memory_order_relaxed);
         ttl_cleanup_backlog.store(0, std::memory_order_relaxed);
         ttl_checked_count.store(0, std::memory_order_relaxed);
-        active_handle_count.store(0, std::memory_order_relaxed);
+        // P1-36 (fix.01 方案 A): reset the sharded handle counter by subtracting
+        // what each shard observed. `store(0)` could discard a concurrent
+        // increment and make the count read 0 while handles were still alive,
+        // which the teardown path relies on.
+        active_handle_count.reset();
         tls_ring_backlog.store(0, std::memory_order_relaxed);
         tls_ring_dropped_promotions.value.store(0, std::memory_order_relaxed);
         // T13.1: hash_overload_events is a counter — reset on reset_counters().
@@ -2144,14 +2282,25 @@ struct cache_stats {
         max_memory.store(unlimited, std::memory_order_relaxed);
         hash_load_factor.store(0.0f, std::memory_order_relaxed);
         max_chain_length.store(0, std::memory_order_relaxed);
-        // T13.1: reset_all() resets counters AND configuration.
-        hash_overload_threshold.store(2.0f, std::memory_order_relaxed);
+        // hash_overload_threshold is deliberately NOT reset here. It is a
+        // reported copy of the hash table's own setting, refreshed by
+        // refresh_hash_stats(), and the table derives it from its
+        // max_load_factor at construction (see
+        // concurrent_hash_table::rehash_if_needed). Writing a hardcoded
+        // constant here made the reported value disagree with the value in
+        // use until the next refresh — and writing 0.0f would be worse still,
+        // since a zero threshold reports every insert as overloaded.
         hash_overload_events.store(0, std::memory_order_relaxed);
         write_lock_wait_count.store(0, std::memory_order_relaxed);
         try_lock_fail_count.store(0, std::memory_order_relaxed);
         eviction_search_steps.store(0, std::memory_order_relaxed);
         pinned_skip_count.store(0, std::memory_order_relaxed);
-        active_handle_count.store(0, std::memory_order_relaxed);
+        eviction_failed.store(0, std::memory_order_relaxed);
+        // P1-36 (fix.01 方案 A): reset the sharded handle counter by subtracting
+        // what each shard observed. `store(0)` could discard a concurrent
+        // increment and make the count read 0 while handles were still alive,
+        // which the teardown path relies on.
+        active_handle_count.reset();
         tls_ring_backlog.store(0, std::memory_order_relaxed);
         tls_ring_dropped_promotions.value.store(0, std::memory_order_relaxed);
         reclaim_pending_count.store(0, std::memory_order_relaxed);
@@ -2214,7 +2363,8 @@ struct cache_stats {
             && write_lock_wait_count.load(std::memory_order_relaxed) == other.write_lock_wait_count.load(std::memory_order_relaxed)
             && try_lock_fail_count.load(std::memory_order_relaxed) == other.try_lock_fail_count.load(std::memory_order_relaxed)
             && eviction_search_steps.load(std::memory_order_relaxed) == other.eviction_search_steps.load(std::memory_order_relaxed)
-            && pinned_skip_count.load(std::memory_order_relaxed) == other.pinned_skip_count.load(std::memory_order_relaxed);
+            && pinned_skip_count.load(std::memory_order_relaxed) == other.pinned_skip_count.load(std::memory_order_relaxed)
+            && eviction_failed.load(std::memory_order_relaxed) == other.eviction_failed.load(std::memory_order_relaxed);
     }
 
     bool operator!=(const cache_stats& other) const noexcept {
@@ -2279,6 +2429,10 @@ struct cache_stats {
             std::memory_order_relaxed);
         result.pinned_skip_count.store(
             pinned_skip_count.load(std::memory_order_relaxed) + other.pinned_skip_count.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        // P1-23: aggregate the eviction-failure counter like the other counters.
+        result.eviction_failed.store(
+            eviction_failed.load(std::memory_order_relaxed) + other.eviction_failed.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
         // P1-10: TTL counters aggregated across shards.
         result.ttl_expired_count.store(
@@ -2613,6 +2767,13 @@ public:
     read_handle(T* value, detail::refcount_with_flags* refcount,
                 cache_stats* per_cache_stats = nullptr) noexcept
         : value_(value), refcount_(refcount), per_cache_stats_(per_cache_stats) {
+        // P1-33 (fix.01 方案 A): capture the release notifier while the cache is
+        // provably alive. It is process-lifetime, so release() may dereference it
+        // even if this handle outlives the cache — which is exactly what the
+        // documented "shutdown_and_wait() timed out, destroy anyway" path does.
+        // A raw pointer (not a shared_ptr) keeps the hot path free of an extra
+        // refcount operation.
+        notifier_ = per_cache_stats_ ? per_cache_stats_->release_notifier : nullptr;
         if (refcount_) {
             auto result = refcount_->incRef();
             if (result != detail::IncResult::kIncOk) {
@@ -2636,6 +2797,9 @@ public:
     read_handle(T* value, detail::refcount_with_flags* refcount, pre_pinned_t,
                 cache_stats* per_cache_stats = nullptr) noexcept
         : value_(value), refcount_(refcount), per_cache_stats_(per_cache_stats) {
+        // P1-33: see the primary constructor — capture the process-lifetime
+        // notifier while the cache is alive.
+        notifier_ = per_cache_stats_ ? per_cache_stats_->release_notifier : nullptr;
         // refcount already incremented by caller — no incRef() needed
         if (refcount_) {
             inc_active_count_debug();
@@ -2794,7 +2958,19 @@ public:
         if (refcount_) {
             refcount_->decRef();
             dec_active_count_debug();
-            if (per_cache_stats_) {
+            // P1-33 (fix.01 方案 A): `notifier_` is a process-lifetime object
+            // captured while the cache was alive, so it is safe to read here even
+            // if this handle outlived its cache. `cache_alive` then tells us
+            // whether cache-owned state (per_cache_stats_) still exists.
+            //
+            // Previously this dereferenced per_cache_stats_ unconditionally — and
+            // reached the notifier *through* it — which is a use-after-free for a
+            // handle released after a timed-out shutdown_and_wait() let the cache
+            // be destroyed.
+            const bool cache_alive =
+                (notifier_ == nullptr) ||
+                notifier_->cache_alive.load(std::memory_order_acquire);
+            if (cache_alive && per_cache_stats_) {
                 per_cache_stats_->active_handle_count.fetch_sub(1, std::memory_order_relaxed);
                 // T-G10: If the owning cache is shutting down and this was
                 // the last active handle, wake up `shutdown_and_wait()` so
@@ -2802,7 +2978,7 @@ public:
                 // interval. The shutdown_in_progress load is a single
                 // relaxed atomic — essentially free on the hot path when
                 // no shutdown is in progress (the common case).
-                auto* notifier = per_cache_stats_->release_notifier;
+                auto* notifier = notifier_ ? notifier_ : per_cache_stats_->release_notifier;
                 if (notifier &&
                     notifier->shutdown_in_progress.load(std::memory_order_acquire) &&
                     per_cache_stats_->active_handle_count.load(std::memory_order_acquire) == 0) {
@@ -2868,6 +3044,11 @@ public:
             per_cache_stats_->active_handle_count.fetch_sub(1, std::memory_order_relaxed);
         }
         per_cache_stats_ = stats;
+        // P1-33 (fix.01 方案 A): (re)capture the notifier while the cache that
+        // owns `stats` is still alive. This is the single funnel through which
+        // handles returned by peek_for_get() acquire their stats pointer, so
+        // capturing here covers every internally-produced handle.
+        notifier_ = per_cache_stats_ ? per_cache_stats_->release_notifier : nullptr;
         // Attach to new stats (increment if non-null and handle is live).
         if (per_cache_stats_ && refcount_) {
             per_cache_stats_->active_handle_count.fetch_add(1, std::memory_order_relaxed);
@@ -2878,6 +3059,20 @@ private:
     T* value_ = nullptr;
     detail::refcount_with_flags* refcount_ = nullptr;
     cache_stats* per_cache_stats_ = nullptr;  // Task 11: optional per-cache stats
+    /// P1-33 (fix.01 方案 A): the owning cache's release notifier, captured at
+    /// construction / attach time while the cache is provably alive.
+    ///
+    /// It is a *process-lifetime* object (the cache allocates it once and never
+    /// frees it), so release() may dereference it even after the cache itself is
+    /// gone; `notifier_->cache_alive` then says whether cache-owned state is
+    /// still valid. A raw pointer keeps the hot path free of an extra atomic
+    /// refcount operation, which a shared_ptr control block would have added to
+    /// every single get().
+    ///
+    /// Null for handles whose state was only copied from another handle: those
+    /// fall back to the previous behaviour (the cache is still alive in every
+    /// path that can produce them).
+    handle_release_notifier* notifier_ = nullptr;
 
     // P2-2: Sharded active-handle counter. 64 cache-line-aligned atomics
     // keyed by TLS shard index. Each thread picks a shard on first use
@@ -2917,17 +3112,74 @@ private:
         return tls_shard;
     }
 
+    /// P1-3 (fix.01 方案 B): thread-local accumulator for the global
+    /// active-handle counter.
+    ///
+    /// Previously every `read_handle` construction/destruction performed one
+    /// sharded atomic RMW on `s_active_count_shards_`, on top of the per-cache
+    /// `active_handle_count` update — two cross-thread atomics per handle, on
+    /// the hottest read path in the library.
+    ///
+    /// The global counter exists purely as a diagnostic (`active_count()`), and
+    /// `unified_cache` already maintains an exact per-cache counter via
+    /// `per_cache_stats_`, so immediate visibility of the global value is not
+    /// required. Increments and decrements are therefore accumulated in a
+    /// signed thread-local delta and published only when the batch fills. A
+    /// balanced create/destroy workload cancels out entirely and never touches
+    /// shared memory — the same "batch locally, publish in chunks" strategy
+    /// `tls_ring` uses for `total_backlog()`.
+    ///
+    /// Accuracy: `active_count()` publishes the calling thread's pending delta
+    /// before summing, so a caller always sees its own contribution; other
+    /// threads' contributions can lag by up to kActiveCountBatch each. That is
+    /// acceptable for a diagnostic — shutdown safety uses the per-cache counter
+    /// (`unified_cache::active_handle_count()`), not this one.
+    static constexpr std::ptrdiff_t kActiveCountBatch = 64;
+
+    struct active_count_tls {
+        std::ptrdiff_t pending = 0;
+
+        /// Flush on thread exit so a short-lived thread's net contribution is
+        /// not lost (mirrors tls_ring's backup-buffer-on-exit behaviour).
+        ~active_count_tls() noexcept { flush(); }
+
+        void flush() noexcept {
+            if (pending == 0) return;
+            const std::size_t idx = active_count_shard_index();
+            if (pending > 0) {
+                s_active_count_shards_[idx].count.fetch_add(
+                    static_cast<std::size_t>(pending), std::memory_order_relaxed);
+            } else {
+                s_active_count_shards_[idx].count.fetch_sub(
+                    static_cast<std::size_t>(-pending), std::memory_order_relaxed);
+            }
+            pending = 0;
+        }
+    };
+
+    static active_count_tls& active_count_tls_ref() noexcept {
+        static thread_local active_count_tls tls;
+        return tls;
+    }
+
     static void sharded_active_count_inc() noexcept {
-        const std::size_t idx = active_count_shard_index();
-        s_active_count_shards_[idx].count.fetch_add(1, std::memory_order_relaxed);
+        auto& tls = active_count_tls_ref();
+        if (++tls.pending >= kActiveCountBatch) {
+            tls.flush();
+        }
     }
 
     static void sharded_active_count_dec() noexcept {
-        const std::size_t idx = active_count_shard_index();
-        s_active_count_shards_[idx].count.fetch_sub(1, std::memory_order_relaxed);
+        auto& tls = active_count_tls_ref();
+        if (--tls.pending <= -kActiveCountBatch) {
+            tls.flush();
+        }
     }
 
     static std::size_t sum_sharded_active_count() noexcept {
+        // P1-3: publish this thread's un-flushed delta first, so the caller's own
+        // contribution is always reflected in the result.
+        active_count_tls_ref().flush();
         std::size_t total = 0;
         for (std::size_t i = 0; i < kActiveCountShards; ++i) {
             total += s_active_count_shards_[i].count.load(std::memory_order_relaxed);

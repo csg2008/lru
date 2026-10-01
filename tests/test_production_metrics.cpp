@@ -52,6 +52,11 @@ TEST(ProductionLatencyHistogram, EmptyHistogram) {
 
 TEST(ProductionLatencyHistogram, GetRecordsLatency) {
     cache<int, std::string> c(10);
+    // Latency tracking is off by default (it costs two clock reads plus a
+    // histogram update per operation), so the histogram only fills once the
+    // caller opts in.
+    EXPECT_FALSE(c.is_latency_tracking_enabled());
+    c.set_latency_tracking(true);
     c.set(1, "a");
     c.get(1);
     auto stats = c.stats_snapshot();
@@ -60,6 +65,7 @@ TEST(ProductionLatencyHistogram, GetRecordsLatency) {
 
 TEST(ProductionLatencyHistogram, SetRecordsLatency) {
     cache<int, std::string> c(10);
+    c.set_latency_tracking(true);
     c.set(1, "a");
     auto stats = c.stats_snapshot();
     EXPECT_GE(stats.set_latency.count(), 1u);
@@ -279,10 +285,22 @@ TEST(ProductionMetricsCache, BackgroundWorkerRefreshes) {
 }
 
 // T13.1: set_hash_overload_threshold() configures the threshold.
-TEST(HashOverloadThreshold, DefaultIsTwo) {
+//
+// The default is DERIVED from max_load_factor_, not an independent constant:
+// rehash_if_needed() rehashes when either threshold is crossed, so a lower
+// emergency threshold makes the higher mandatory one unreachable. With both
+// hardcoded (2.0 vs 4.0 for chain mode / 10.0 for F14) the F14 table was
+// permanently sized for ~5x the chunks it needed.
+TEST(HashOverloadThreshold, DefaultIsDerivedFromMaxLoadFactor) {
     cache<int, std::string> c(100);
     auto snap = c.stats_snapshot();
-    EXPECT_FLOAT_EQ(snap.hash_overload_threshold.load(), 2.0f);
+    // Chain mode: max_load_factor 4.0 x 0.8.
+    EXPECT_FLOAT_EQ(snap.hash_overload_threshold.load(), 3.2f);
+    // Whatever the probing style, the emergency threshold must stay strictly
+    // below the mandatory one — otherwise rehash_if_needed() rehashes on the
+    // lower threshold first and the higher one can never fire, which is how
+    // F14 tables ended up sized for 5x the chunks they needed.
+    EXPECT_LT(snap.hash_overload_threshold.load(), 4.0f);
 }
 
 TEST(HashOverloadThreshold, SetThresholdPropagatesToHashStats) {

@@ -89,6 +89,14 @@ class compact_cache;
 /// without worrying about void return types.
 struct noop_lock {
     noop_lock(...) noexcept {}
+    /// User-provided (empty) destructor on purpose. Callers write
+    /// `auto lock = acquire_...()` uniformly across lock policies; under
+    /// `single_threaded_policy` that variable has no observable effect, so
+    /// the compiler reports -Wunused-variable at every such call site
+    /// (~30 of them), which breaks -Werror builds of single-threaded
+    /// caches. A non-trivial destructor marks the type as RAII-shaped,
+    /// which is exactly what it is.
+    ~noop_lock() noexcept {}
     bool owns_lock() const noexcept { return true; }
 };
 
@@ -133,6 +141,10 @@ struct single_threaded_policy {
 
     static constexpr bool is_thread_safe = false;
     static constexpr bool is_striped = false;
+    // P0-1: every lock policy declares a default stripe count so that
+    // unified_cache can initialise its striped-mutex storage uniformly and
+    // directly (no factory + no reliance on copy elision). 0 == "not striped".
+    static constexpr std::size_t default_num_stripes = 0;
 };
 
 /// Thread-safe lock policy using distributed_shared_mutex.
@@ -152,6 +164,8 @@ struct thread_safe_policy {
 
     static constexpr bool is_thread_safe = true;
     static constexpr bool is_striped = false;
+    // P0-1: see single_threaded_policy::default_num_stripes.
+    static constexpr std::size_t default_num_stripes = 0;
 };
 
 /// Thread-safe lock policy with striped locking for per-key concurrency.
@@ -1071,10 +1085,19 @@ private:
     >;
 
     /// Striped mutex storage. Only present for striped policies.
+    /// P0-1 (fix.01 方案 C): the non-striped branch is detail::no_striped_mutex
+    /// rather than std::tuple<>, so that this member can be *directly*
+    /// initialised from a stripe count in every constructor. That removes the
+    /// static factory whose returned prvalue of the member type required
+    /// guaranteed copy elision for a [[no_unique_address]] member — which GCC
+    /// does not implement (PR98995), making all striped aliases uncompilable
+    /// under g++. detail::no_striped_mutex is an empty class with no member
+    /// functions, so it preserves the result of every
+    /// `if constexpr (requires { striped_mutex_.foo(); })` probe.
     using striped_mutex_storage = std::conditional_t<
         is_striped,
         typename lock_policy::striped_mutex_type,
-        std::tuple<>
+        detail::no_striped_mutex
     >;
 
 public:
@@ -1087,6 +1110,13 @@ public:
     }
 
     ~unified_cache() {
+        // P1-33 (fix.01 方案 A): tell every outstanding read_handle that this
+        // cache's own state (per_cache_stats_) is about to go away, BEFORE any
+        // teardown below. The notifier is process-lifetime, so handles may still
+        // dereference it safely; they will simply stop touching cache-owned
+        // state. Without this, a handle released after the bounded 5 s wait below
+        // (which prints CRITICAL and proceeds anyway) wrote into freed memory.
+        active_handle_notifier_->cache_alive.store(false, std::memory_order_release);
         // P1-4: One-time hint for high-frequency scrapers that did not
         // enable metrics cache. If stats_snapshot() was called more than
         // 10 times and the metrics cache worker is not running, the user
@@ -1107,44 +1137,47 @@ public:
             }
         }
         try {
-            // Task 11: mark the cache closed first so concurrent get()/set()
-            // reject operations while we tear down. shutdown() is idempotent
-            // and also stops the TTL cleaner + drain worker + final flush.
+            // Mark the cache closed first so concurrent get()/set() reject
+            // operations while we tear down. shutdown() is idempotent and also
+            // stops the TTL cleaner + drain worker and runs a final flush.
             shutdown();
-            // P-LOW-1 (T-H5): Defensive wait for outstanding read_handles
-            // before tearing down the MM. shutdown() already rejects new
-            // operations, but handles acquired before shutdown() may still
-            // be live on other threads. Without this wait, destroying mm_
-            // while a handle still references an item is a UAF. The 5s
-            // timeout is the O10 default — long enough to ride out slow
-            // handle release under realistic load, short enough that a
-            // genuinely stuck handle doesn't hang process teardown.
-            // shutdown_and_wait() is safe to call here: it re-invokes
-            // shutdown() (idempotent no-op) and, if handle tracking is
-            // unreliable in this build, returns false immediately without
-            // blocking. No exception is thrown on timeout.
+            // Bounded wait for outstanding read_handles before tearing down the
+            // MM. shutdown() already rejects new operations, but handles
+            // acquired before it may still be live on other threads; destroying
+            // mm_ while a handle references an item is a use-after-free. The 5s
+            // budget rides out slow handle release under realistic load without
+            // hanging process teardown indefinitely.
             //
-            // G6: If the wait times out (drained == false), mm_ destruction
-            // will UAF. Debug builds catch this via the assert below; Release
-            // builds log a CRITICAL error so the operator can diagnose the
-            // inevitable crash. The proper fix is for the caller to invoke
-            // shutdown_and_wait() explicitly and check the return value
-            // before letting the cache go out of scope.
-            const bool drained = shutdown_and_wait(std::chrono::seconds(5));
-            if (!drained) {
-                // G6: destroying mm_ while a handle still references an item
-                // is a use-after-free. Debug builds assert; Release builds
-                // must not silently corrupt memory — abort loudly so the
-                // leaked handle / hung thread surfaces instead of UB.
+            // The destructor is a SAFETY NET, not an enforcement point. It must
+            // never terminate the process: a library that calls std::abort()
+            // cannot be embedded in a host that needs to degrade gracefully,
+            // and the failure cannot be caught, logged or correlated by that
+            // host. The two failure modes are therefore reported distinctly and
+            // neither is fatal:
+            //
+            //   tracking_disabled — the caller opted out of handle accounting
+            //     (set_per_cache_handle_tracking(false) together with
+            //     read_handle<T>::enable_global_handle_tracking(false)). We have
+            //     no information, so there is nothing to report or act on.
+            //
+            //   timeout — handles really are outstanding. That is a caller
+            //     contract violation; log the evidence needed to find the
+            //     leaking thread and proceed. Callers that need a hard guarantee
+            //     must call shutdown_and_wait_detailed() explicitly and act on
+            //     the returned shutdown_status before the cache goes out of
+            //     scope.
+            const auto teardown_status =
+                shutdown_and_wait_detailed(std::chrono::seconds(5));
+            if (teardown_status == shutdown_status::timeout) {
                 std::fprintf(stderr,
-                    "[lru] CRITICAL (G6): unified_cache destructor timed out "
-                    "waiting for %zu outstanding read_handles after 5s — "
-                    "destroying mm_ now would cause use-after-free. Call "
-                    "shutdown_and_wait() explicitly and check the return "
-                    "value before letting the cache go out of scope.\n",
+                    "[lru] CRITICAL: unified_cache destroyed with %zu "
+                    "outstanding read_handle(s) after a 5s drain wait — those "
+                    "handles will dangle once mm_ is destroyed. A thread is "
+                    "holding a read_handle across cache destruction; join that "
+                    "thread, or call shutdown_and_wait_detailed() and act on "
+                    "the result before the cache goes out of scope.\n",
                     static_cast<std::size_t>(active_handle_count()));
                 std::fflush(stderr);
-                std::abort();
             }
             // P-CRIT-1 (T-C1): Defensive belt-and-suspenders — in case
             // shutdown() was never called by the user (cache went out of
@@ -1242,8 +1275,9 @@ public:
     }
 
     explicit unified_cache(size_type max_size)
-        : mm_(max_size)
-        , striped_mutex_(make_default_striped_mutex()) {
+        : mm_(max_size, make_sharded_config_for_stripes(
+                            lock_policy::default_num_stripes, max_size))
+        , striped_mutex_(lock_policy::default_num_stripes) {
         if constexpr (Trait::is_compact) {
             compact_storage_.reset(max_size);
         }
@@ -1258,8 +1292,26 @@ public:
     /// here: both constructors would have equivalent template-parameter lists
     /// and be rejected as redeclarations.)
     explicit unified_cache(size_type max_size, size_type num_stripes) requires (is_striped)
-        : mm_(max_size, make_sharded_config_for_stripes(num_stripes))
-        , striped_mutex_(make_striped_mutex(num_stripes)) {
+        : mm_(max_size, make_sharded_config_for_stripes(num_stripes, max_size))
+        , striped_mutex_(static_cast<std::size_t>(num_stripes)) {
+        if constexpr (Trait::is_compact) {
+            compact_storage_.reset(max_size);
+        }
+        init_production_features();
+    }
+
+    /// P1-30 (fix.01 方案 A): striped constructor with an explicit
+    /// capacity-amplification opt-in.
+    ///
+    /// Default is strict: `max_size < num_shards` throws
+    /// `cache_config_exception`. Pass `allow_amplification = true` to accept
+    /// the per-shard floor of one slot (effective capacity becomes
+    /// `num_shards`; `requested_max_size()` still reports `max_size`).
+    explicit unified_cache(size_type max_size, size_type num_stripes,
+                           bool allow_amplification) requires (is_striped)
+        : mm_(max_size, make_sharded_config_for_stripes(num_stripes, num_stripes,
+                                                        max_size, allow_amplification))
+        , striped_mutex_(static_cast<std::size_t>(num_stripes)) {
         if constexpr (Trait::is_compact) {
             compact_storage_.reset(max_size);
         }
@@ -1282,7 +1334,7 @@ public:
     explicit unified_cache(size_type max_size, size_type num_stripes, size_type num_shards)
         requires (is_striped)
         : mm_(max_size, make_sharded_config_for_stripes(num_stripes, num_shards))
-        , striped_mutex_(make_striped_mutex(num_stripes)) {
+        , striped_mutex_(static_cast<std::size_t>(num_stripes)) {
         if constexpr (Trait::is_compact) {
             compact_storage_.reset(max_size);
         }
@@ -1291,7 +1343,7 @@ public:
 
     unified_cache(size_type max_size, size_type max_memory) requires (!is_striped)
         : mm_(max_size, max_memory)
-        , striped_mutex_(make_default_striped_mutex()) {
+        , striped_mutex_(lock_policy::default_num_stripes) {
         if constexpr (Trait::is_compact) {
             compact_storage_.reset(max_size);
         }
@@ -1303,14 +1355,14 @@ public:
         requires (!std::is_arithmetic_v<std::remove_cvref_t<MMConfig>>)
     unified_cache(size_type max_size, const MMConfig& config)
         : mm_(max_size, config)
-        , striped_mutex_(make_default_striped_mutex()) {
+        , striped_mutex_(lock_policy::default_num_stripes) {
         init_production_features();
     }
 
     template <typename MMConfig>
     unified_cache(size_type max_size, size_type max_memory, const MMConfig& config)
         : mm_(max_size, max_memory, config)
-        , striped_mutex_(make_default_striped_mutex()) {
+        , striped_mutex_(lock_policy::default_num_stripes) {
         init_production_features();
     }
 
@@ -1323,7 +1375,7 @@ public:
                   size_type max_size = unlimited,
                   size_type max_memory = unlimited)
         : mm_(max_size, max_memory)
-        , striped_mutex_(make_default_striped_mutex()) {
+        , striped_mutex_(lock_policy::default_num_stripes) {
         for (const auto& [k, v] : init) {
             mm_.set(k, v);
         }
@@ -1338,7 +1390,7 @@ public:
                   size_type max_size = unlimited,
                   size_type max_memory = unlimited)
         : mm_(max_size, max_memory)
-        , striped_mutex_(make_default_striped_mutex()) {
+        , striped_mutex_(lock_policy::default_num_stripes) {
         for (; first != last; ++first) {
             mm_.set(first->first, first->second);
         }
@@ -1352,27 +1404,19 @@ public:
     // --------------------------------------------------------------------
 
 private:
-    /// Helper: construct the default striped_mutex (or empty tuple).
-    static striped_mutex_storage make_default_striped_mutex() {
-        if constexpr (is_striped) {
-            return typename lock_policy::striped_mutex_type(lock_policy::default_num_stripes);
-        } else {
-            return std::tuple<>{};
-        }
-    }
-
-    /// Helper: construct a striped_mutex with a custom num_stripes count.
-    static striped_mutex_storage make_striped_mutex(size_type num_stripes) {
-        if constexpr (is_striped) {
-            if (num_stripes == 0) {
-                throw std::invalid_argument("unified_cache: num_stripes must be > 0");
-            }
-            return typename lock_policy::striped_mutex_type(num_stripes);
-        } else {
-            (void)num_stripes;  // silence unused-parameter warning
-            return std::tuple<>{};
-        }
-    }
+    // P0-1 (fix.01 方案 C): the former make_default_striped_mutex() /
+    // make_striped_mutex() static factories have been removed. They returned a
+    // prvalue of `striped_mutex_storage` (the member type) into a
+    // [[no_unique_address]] member initialiser, which requires guaranteed copy
+    // elision; GCC does not apply it (PR98995), so the deleted move constructor
+    // of lazy_striped_mutex broke every striped alias under g++. Constructors
+    // now initialise `striped_mutex_(<stripe count>)` directly — see
+    // detail::no_striped_mutex for how the non-striped case is handled.
+    //
+    // The num_stripes > 0 validation that make_striped_mutex() used to perform
+    // is preserved: lazy_striped_mutex's constructor throws
+    // std::invalid_argument for 0 stripes, and the non-striped placeholder
+    // ignores the count.
 
     /// Build a sharded_mm_lru_config with num_shards = num_stripes.
     ///
@@ -1381,8 +1425,49 @@ private:
     /// set independently of `num_stripes`. The two-arg overload defaults
     /// `num_shards = num_stripes` for backwards compatibility; the
     /// three-arg overload allows explicit decoupling.
-    static auto make_sharded_config_for_stripes(size_type num_stripes) {
-        return make_sharded_config_for_stripes(num_stripes, num_stripes);
+    static auto make_sharded_config_for_stripes(size_type num_stripes,
+                                                  size_type max_size) {
+        return make_sharded_config_for_stripes(num_stripes, num_stripes, max_size);
+    }
+
+    /// P1-30: minimum slots per shard for an auto-derived layout. See
+    /// shards_for_capacity(). A quota of 1 makes a sharded cache unable to hold
+    /// two colliding keys, so it silently under-delivers the capacity it
+    /// reports; the auto-derived layout keeps at least this many slots per
+    /// shard, while still respecting a caller-supplied shard/stripe count as an
+    /// upper bound.
+    static constexpr size_type kMinItemsPerShard = 2;
+
+    /// P1-30 (方案 B, the "auto-shrink" complement to 方案 A): how many shards /
+    /// stripes to use for a requested capacity.
+    ///
+    /// A sharded cache cannot hold `max_size` items in fewer than `num_shards`
+    /// shards: each shard carries its own quota, so `max_size < num_shards`
+    /// either silently multiplies the effective capacity (the P1-30 defect) or
+    /// must throw. Deriving the layout from the requested capacity preserves the
+    /// caller's capacity INTENT with no amplification and no error.
+    ///
+    /// Two bounds apply, and both are needed:
+    ///
+    ///  1. `shards <= max_size` — otherwise some shard necessarily has a zero
+    ///     slot budget and its keys can never be stored.
+    ///  2. `max_size / shards >= kMinItemsPerShard` — this is the important one
+    ///     for *correctness* at small capacities. With a quota of 1, two keys
+    ///     that hash to the same shard can never coexist, so a nominally
+    ///     10-slot cache silently holds far fewer than 10 items (a 3-key test
+    ///     fixture with a well-mixed hash loses items ~30% of the time). The
+    ///     quota floor makes the reported capacity actually reachable.
+    static size_type shards_for_capacity(size_type requested_shards,
+                                         size_type max_size) noexcept {
+        if (max_size == unlimited) return requested_shards;
+        // Bound 1: at most one shard per slot.
+        size_type shards = requested_shards > max_size ? max_size : requested_shards;
+        // Bound 2: keep at least kMinItemsPerShard slots in every shard.
+        const size_type by_quota = max_size / kMinItemsPerShard;
+        if (by_quota < shards) shards = by_quota;
+        // Always keep one shard.
+        if (shards == 0) shards = 1;
+        return shards;
     }
 
     /// P2-3 (T3.4): Build a sharded_mm_lru_config with decoupled
@@ -1390,22 +1475,41 @@ private:
     /// per-shard locks, `num_shards` is forced equal to `num_stripes`
     /// (preserving the historical safety constraint).
     static auto make_sharded_config_for_stripes(size_type num_stripes,
-                                                  size_type num_shards) {
+                                                  size_type num_shards,
+                                                  size_type max_size,
+                                                  bool allow_amplification = false) {
         using mm_t = typename std::decay_t<decltype(mm_)>;
+        // P1-30 (方案 B): never give the MM more shards than there are slots,
+        // and keep a usable per-shard quota. See shards_for_capacity().
+        size_type effective_shards = shards_for_capacity(num_shards, max_size);
         // For MMs without per-shard locks, num_shards MUST equal
         // num_stripes (otherwise concurrent access via different stripes
         // would corrupt the shard). Force the equality here.
-        const size_type effective_num_shards =
-            has_per_shard_lock_v<mm_t> ? num_shards : num_stripes;
+        const size_type effective_num_shards = has_per_shard_lock_v<mm_t>
+                                                   ? effective_shards
+                                                   : shards_for_capacity(num_stripes, max_size);
         if constexpr (requires { typename mm_t::config_type; }) {
             using cfg = typename mm_t::config_type;
             cfg c;
             if constexpr (requires { c.num_shards = effective_num_shards; }) {
                 c.num_shards = effective_num_shards;
             }
+            // P1-30 (fix.01 方案 A): propagate the explicit amplification
+            // opt-in. Default false ⇒ an undersized max_size throws instead of
+            // being silently multiplied by up to num_shards.
+            if constexpr (requires { c.allow_amplification = allow_amplification; }) {
+                c.allow_amplification = allow_amplification;
+            }
             return c;
         } else {
-            return sharded_mm_lru_config{.num_shards = effective_num_shards};
+            // Constructed and assigned rather than designated-initialized:
+            // sharded_mm_lru_config carries the per-shard lru_config too, and
+            // a partial designated initializer leaves it implicit (warns, and
+            // hides which fields are actually being set).
+            sharded_mm_lru_config cfg;
+            cfg.num_shards = effective_num_shards;
+            cfg.allow_amplification = allow_amplification;
+            return cfg;
         }
     }
 
@@ -1542,7 +1646,18 @@ private:
         // busy-polling. read_handle::release() reaches the notifier through
         // per_cache_stats_->release_notifier and calls notify_all() when the
         // last handle is dropped during shutdown.
-        per_cache_stats_.release_notifier = &active_handle_notifier_;
+        //
+        // P1-33 (fix.01 方案 A): the notifier is allocated once and deliberately
+        // NEVER freed (process lifetime). A read_handle may outlive this cache —
+        // the documented shutdown_and_wait() path gives up after 5 s, warns, and
+        // destroys anyway — and it keeps a raw pointer to the notifier so it can
+        // check `cache_alive` without touching cache-owned memory. That check is
+        // only possible if the notifier itself can never dangle. This mirrors the
+        // process-lifetime strategy used for the hazptr/EBR domains (P1-11).
+        if (!active_handle_notifier_) {
+            active_handle_notifier_ = new handle_release_notifier();
+        }
+        per_cache_stats_.release_notifier = active_handle_notifier_;
     }
 
 public:
@@ -1558,9 +1673,19 @@ public:
     /// Set a value provider for automatic fetch-on-miss.
     /// When get_or_fetch() or operator[] encounters a cache miss,
     /// this function is called to generate the value, which is then stored.
+    ///
+    /// P1-45 (fix.01 方案 A): the provider is published through an RCU-style
+    /// atomic shared_ptr, the same pattern already used for
+    /// `slow_query_callback_` / `trace_callback_`. Previously this took the
+    /// global write lock to assign a plain `std::function`, while the miss path
+    /// read it under the per-key lock — so the write lock bought nothing (the
+    /// two accesses did not exclude each other) and the miss path paid an extra
+    /// global lock acquisition plus a `std::function` copy that may allocate.
+    /// Readers now take one snapshot and are guaranteed to see either the old or
+    /// the new callable, never a partially-constructed one.
     void set_value_provider(std::function<Value(const Key&)> provider) {
-        auto lock = acquire_write_lock();
-        value_provider_ = std::move(provider);
+        value_provider_.store(
+            std::make_shared<std::function<Value(const Key&)>>(std::move(provider)));
     }
 
     // --------------------------------------------------------------------
@@ -1587,6 +1712,13 @@ public:
     /// background worker) so it should be fast and non-blocking. For
     /// expensive logging, queue to a separate thread inside the callback.
     void set_slow_query_callback(slow_query_callback_type callback) {
+        // This callback is driven by the per-operation latency the RAII
+        // scope_latency_timer measures, and latency tracking is OFF by
+        // default (see cache_stats::latency_tracking_enabled). Without this
+        // line, registering a slow-query callback would silently never fire:
+        // the measured latency stays 0 and never crosses the threshold.
+        // A feature the caller explicitly turned on must not be inert.
+        set_latency_tracking(true);
         // RCU-style swap: publish a new shared_ptr atomically. Concurrent
         // readers load the old pointer and finish their invocation safely
         // before the old shared_ptr is destroyed.
@@ -1638,6 +1770,11 @@ public:
     /// readers finish their invocation on the old callback safely before
     /// it's destroyed.
     void set_trace_callback(trace_callback_type callback) {
+        // The trace callback receives the measured latency, which is only
+        // produced while latency tracking is on (off by default). Enable it
+        // here for the same reason as set_slow_query_callback(): a callback
+        // the caller registered must actually receive data.
+        set_latency_tracking(true);
         std::shared_ptr<trace_callback_type> new_cb =
             std::make_shared<trace_callback_type>(std::move(callback));
         std::shared_ptr<trace_callback_type> old_cb =
@@ -2358,6 +2495,15 @@ public:
                 std::string("unified_cache::") + fn_name +
                 ": cache is shut down");
         }
+        // P1-40 (fix.01 方案 A): a transactional snapshot (save_atomic) quiesces
+        // the cache for its duration. Writes are rejected then too — the whole
+        // point of the snapshot is that nothing mutates while it serializes —
+        // but unlike shutdown this state is reversible via resume().
+        if (is_quiesced()) {
+            throw cache_closed_exception(
+                std::string("unified_cache::") + fn_name +
+                ": cache is quiesced for a transactional snapshot");
+        }
         if (is_memory_critical()) {
             return pre_write_result::kRejectInsert;
         }
@@ -2372,10 +2518,63 @@ public:
         return is_shutdown();
     }
 
+    /// P1-38 (fix.01 方案 A): report a write that was dropped because the cache
+    /// is in critical memory mode.
+    ///
+    /// `set()` and friends used to `return;` on that rejection, so a caller of
+    /// the `void`-returning API could not tell a rejected insert from a
+    /// successful one — it only observed "I wrote it but cannot read it back".
+    /// The rejection is now reported through the library's existing reject
+    /// channel (`collect_reject`, the same one the overflow policy uses and
+    /// which AGENTS.md documents as "fired when an insert is rejected"), so it
+    /// reaches the user's on_reject callback and the per-shard callback ring.
+    ///
+    /// Only invoked on the rejection path, never on the hot path.
+    void report_write_rejected(const Key& key, const Value& value) {
+        if constexpr (is_striped) {
+            if constexpr (requires { mm_.shard_for(key); }) {
+                const std::size_t s = mm_.shard_for(key);
+                mm_.shard(s).callbacks().collect_reject(key, value);
+                return;
+            }
+        }
+        mm_.callbacks().collect_reject(key, value);
+    }
+
+    /// P1-34 (fix.01 方案 A): centralised handling of "the handle is empty
+    /// because the item's access_ref counter saturated".
+    ///
+    /// `read_handle` construction is noexcept and degrades to an EMPTY handle on
+    /// any `incRef()` failure, which is indistinguishable from a cache miss.
+    /// Only `get()`/`try_get()`/`get_or_fetch()` used to notice, and they each
+    /// re-implemented the check; `peek()`/`get_shared()`/`get_with_ttl()`
+    /// reported saturation as an ordinary miss — so it surfaced only as a lower
+    /// hit rate while `incRef_overflow_count` stayed 0. That is silent data loss
+    /// with no operator signal.
+    ///
+    /// `incRef()` already publishes the reason in a thread-local
+    /// (`detail::tls_last_incRef_result()`), which is refreshed on every exit
+    /// path, so no new mechanism is needed — this wrapper makes all read paths
+    /// consume it identically.
+    ///
+    /// @return true if the miss was actually a saturation event.
+    bool note_peek_overflow_if_any(std::size_t shard_idx) const {
+        if (!detail::tls_last_incRef_was_overflow()) return false;
+        if constexpr (is_striped) {
+            mm_.shard(shard_idx).stats().incRef_overflow_count.value.fetch_add(
+                1, std::memory_order_relaxed);
+        } else {
+            mm_.stats().incRef_overflow_count.value.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
     template <typename V>
     void set(const Key& key, V&& value) {
         // P-HIGH-3 (T-H2): Unified pre-write validation.
         if (pre_write_check("set") == pre_write_result::kRejectInsert) {
+            // P1-38 (fix.01 方案 A): make the drop observable instead of silent.
+            report_write_rejected(key, value);
             return;
         }
         // T14.1: Compact path — delegate to embedded compact_cache.
@@ -2423,10 +2622,19 @@ public:
 
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
-            if (!check_memory_admission(key, value)) return;
+            // P1-38 (fix.01 方案 A): pre_write_check() ran before the lock, so a
+            // concurrent shutdown() could have landed in between; without this
+            // re-check the mutation would proceed into mm_ while the cache is
+            // being torn down.
+            if (recheck_shutdown_in_lock()) return;
+            if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return; }
             // Task D: overflow enforcement (skip when kAllowGrowth — default).
-            if (!apply_overflow_policy_for_set(key, shard_idx)) return;
+            if (!apply_overflow_policy_for_set(key, shard_idx)) { report_write_rejected(key, value); return; }
+            const auto size_before = mm_.size();
             mm_.set(key, std::forward<V>(value));
+            // P1-19 (方案 B): the single admission gate — see
+            // enforce_capacity_after_insert().
+            enforce_capacity_after_insert(key, size_before);
             trace_hit = true;  // O1: set succeeded
             // P1-3 / T-H1: Check memory pressure after insertion — may
             // enter critical mode if this insertion pushed us over the
@@ -2437,10 +2645,15 @@ public:
         } else {
             flush_guard fg{mm_};
             auto lock = acquire_write_lock_for_key(key);
-            if (!check_memory_admission(key, value)) return;
+            // P1-38: see the striped branch above.
+            if (recheck_shutdown_in_lock()) return;
+            if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return; }
             // Task D: overflow enforcement (skip when kAllowGrowth — default).
-            if (!apply_overflow_policy_for_set(key, 0)) return;
+            if (!apply_overflow_policy_for_set(key, 0)) { report_write_rejected(key, value); return; }
+            const auto size_before = mm_.size();
             mm_.set(key, std::forward<V>(value));
+            // P1-19 (方案 B): the single admission gate.
+            enforce_capacity_after_insert(key, size_before);
             trace_hit = true;  // O1: set succeeded
             // P1-3 / T-H1: Check memory pressure after insertion.
             oom_evt = check_memory_pressure();
@@ -2478,6 +2691,61 @@ public:
             compact().set(key, std::forward<V>(value));
             return;
         }
+
+        // Compute absolute expiry as nanoseconds since steady_clock epoch.
+        // ttl <= 0 means "no TTL" — store 0 (the sentinel for no expiration).
+        // TTL jitter (default ±10%) is applied to prevent thundering-herd
+        // avalanches when many keys share the same nominal TTL.
+        std::uint64_t expiry_ns = 0;
+        if (ttl > std::chrono::duration<Rep, Period>::zero()) {
+            auto effective_ttl = ttl;
+            if (ttl_jitter_enabled_.load(std::memory_order_relaxed) &&
+                ttl_jitter_pct_ > 0.0) {
+                effective_ttl = detail::apply_ttl_jitter(ttl, ttl_jitter_pct_);
+            }
+            auto now = std::chrono::steady_clock::now();
+            auto expiry = now + std::chrono::duration_cast<
+                std::chrono::steady_clock::duration>(effective_ttl);
+            expiry_ns = static_cast<std::uint64_t>(expiry.time_since_epoch().count());
+        }
+        set_with_expiry_ns_impl(key, std::forward<V>(value), expiry_ns);
+    }
+
+    /// P1-31 (fix.01): store a value with an absolute expiry expressed the same
+    /// way the MM layer stores it — nanoseconds since the steady_clock epoch,
+    /// 0 meaning "no TTL".
+    ///
+    /// Why this exists: `ttl_cache<V>` keeps the expiry in its value layer
+    /// (`ttl_entry::expiry`) and used to hand the underlying `unified_cache` a
+    /// plain `set()`, so the item's own `expiry_ns` stayed 0 and the only way
+    /// the cache layer could sweep expired entries was to walk the whole cache
+    /// under a read lock (`evict_expired_via_ttl_entry_scan`). `ttl_cache` now
+    /// computes the expiry once and hands the SAME absolute value to both
+    /// layers, which lets every MM strategy's O(log n) index do the sweep.
+    ///
+    /// This bypasses the ±jitter randomization on purpose: the caller is a
+    /// translation layer that must keep the item-level expiry bit-identical to
+    /// the value-layer expiry, and it applies its own jitter once, above both.
+    template <typename V>
+    void set_with_absolute_expiry(const Key& key, V&& value,
+                                  std::uint64_t expiry_ns) {
+        if (pre_write_check("set_with_absolute_expiry") ==
+            pre_write_result::kRejectInsert) {
+            return;
+        }
+        if constexpr (Trait::is_compact) {
+            compact().set(key, std::forward<V>(value));
+            return;
+        }
+        set_with_expiry_ns_impl(key, std::forward<V>(value), expiry_ns);
+    }
+
+private:
+    /// Body shared by `set_with_ttl()` and `set_with_absolute_expiry()`.
+    /// `expiry_ns` is the finished absolute deadline (0 = no TTL).
+    template <typename V>
+    void set_with_expiry_ns_impl(const Key& key, V&& value,
+                                 std::uint64_t expiry_ns) {
         // P1-1 (T2.2): Drain TLS ring before write lock — see set().
         maybe_drain_tls_ring_pre_evict();
         const std::size_t shard_idx = [&]() -> std::size_t {
@@ -2504,50 +2772,44 @@ public:
             stats_ref.latency_tracking_enabled.load(std::memory_order_relaxed),
             &set_latency_ns);
 
-        // Compute absolute expiry as nanoseconds since steady_clock epoch.
-        // ttl <= 0 means "no TTL" — store 0 (the sentinel for no expiration).
-        // TTL jitter (default ±10%) is applied to prevent thundering-herd
-        // avalanches when many keys share the same nominal TTL.
-        std::uint64_t expiry_ns = 0;
-        if (ttl > std::chrono::duration<Rep, Period>::zero()) {
-            auto effective_ttl = ttl;
-            if (ttl_jitter_enabled_.load(std::memory_order_relaxed) &&
-                ttl_jitter_pct_ > 0.0) {
-                effective_ttl = detail::apply_ttl_jitter(ttl, ttl_jitter_pct_);
-            }
-            auto now = std::chrono::steady_clock::now();
-            auto expiry = now + std::chrono::duration_cast<
-                std::chrono::steady_clock::duration>(effective_ttl);
-            expiry_ns = static_cast<std::uint64_t>(expiry.time_since_epoch().count());
-        }
-
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
-            if (!check_memory_admission(key, value)) return;
+            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            if (recheck_shutdown_in_lock()) return;
+            if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return; }
             if (!apply_overflow_policy_for_set(key, shard_idx)) return;
+            const auto size_before = mm_.size();
             if constexpr (requires { mm_.set_with_expiry(key, value, expiry_ns); }) {
                 mm_.set_with_expiry(key, std::forward<V>(value), expiry_ns);
             } else {
                 mm_.set(key, std::forward<V>(value));
             }
+            // P1-19 (方案 B): the single admission gate.
+            enforce_capacity_after_insert(key, size_before);
             trace_hit = true;  // O1: set succeeded
             maybe_report_memory_to_monitor();
             flush_shard_pending(shard_idx);
         } else {
             flush_guard fg{mm_};
             auto lock = acquire_write_lock_for_key(key);
-            if (!check_memory_admission(key, value)) return;
+            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            if (recheck_shutdown_in_lock()) return;
+            if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return; }
             if (!apply_overflow_policy_for_set(key, 0)) return;
+            const auto size_before = mm_.size();
             if constexpr (requires { mm_.set_with_expiry(key, value, expiry_ns); }) {
                 mm_.set_with_expiry(key, std::forward<V>(value), expiry_ns);
             } else {
                 mm_.set(key, std::forward<V>(value));
             }
+            // P1-19 (方案 B): the single admission gate.
+            enforce_capacity_after_insert(key, size_before);
             trace_hit = true;  // O1: set succeeded
             maybe_report_memory_to_monitor();
         }
     }
 
+public:
     template <typename V>
     bool add(const Key& key, V&& value) {
         // P-HIGH-3 (T-H2): Unified pre-write validation (previously missing
@@ -2568,7 +2830,9 @@ public:
         }();
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
-            if (!check_memory_admission(key, value)) return false;
+            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            if (recheck_shutdown_in_lock()) return false;
+            if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return false; }
             // Task D: overflow enforcement (skip when kAllowGrowth — default).
             if (!apply_overflow_policy_for_set(key, shard_idx)) return false;
             auto result = mm_.add(key, std::forward<V>(value));
@@ -2578,7 +2842,9 @@ public:
         } else {
             flush_guard fg{mm_};
             auto lock = acquire_write_lock_for_key(key);
-            if (!check_memory_admission(key, value)) return false;
+            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            if (recheck_shutdown_in_lock()) return false;
+            if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return false; }
             // Task D: overflow enforcement (skip when kAllowGrowth — default).
             if (!apply_overflow_policy_for_set(key, 0)) return false;
             auto result = mm_.add(key, std::forward<V>(value));
@@ -2653,7 +2919,11 @@ public:
             throw cache_closed_exception(
                 "unified_cache::get_or_fetch: cache is shut down");
         }
-        std::function<Value(const Key&)> provider;
+        // P1-45 (fix.01 方案 A): RCU snapshot of the value provider. Holding a
+        // shared_ptr copy guarantees the callable stays alive for this whole
+        // call even if another thread replaces it concurrently, and the callable
+        // can never be observed half-constructed.
+        std::shared_ptr<std::function<Value(const Key&)>> provider;
         // Task B: cache shard_idx once per call to avoid redundant hash.
         const std::size_t shard_idx = [&]() -> std::size_t {
             if constexpr (is_striped) return mm_.shard_for(key);
@@ -2713,13 +2983,14 @@ public:
                         flush_shard_pending(shard_idx);
                         return *handle2;
                     }
-                    if (!value_provider_) {
+                    // P1-45: one RCU snapshot (see set_value_provider()).
+                    provider = value_provider_.load();
+                    if (!provider || !*provider) {
                         mm_.shard(shard_idx).stats().register_miss();
                         mm_.shard(shard_idx).callbacks().collect_miss(key);
                         flush_shard_pending(shard_idx);
                         throw cache_config_exception("get_or_fetch: no value provider set");
                     }
-                    provider = value_provider_;
                     mm_.shard(shard_idx).stats().register_miss();
                     mm_.shard(shard_idx).callbacks().collect_miss(key);
                     flush_shard_pending(shard_idx);
@@ -2769,12 +3040,13 @@ public:
                         mm_.callbacks().collect_hit(key, *handle2);
                         return *handle2;
                     }
-                    if (!value_provider_) {
+                    // P1-45: one RCU snapshot (see set_value_provider()).
+                    provider = value_provider_.load();
+                    if (!provider || !*provider) {
                         mm_.stats().register_miss();
                         mm_.callbacks().collect_miss(key);
                         throw cache_config_exception("get_or_fetch: no value provider set");
                     }
-                    provider = value_provider_;
                     mm_.stats().register_miss();
                     mm_.callbacks().collect_miss(key);
                 }
@@ -2782,14 +3054,15 @@ public:
         }
         // T-G3: When singleflight is enabled, delegate to the provider-aware
         // overload so concurrent misses for the same key are coalesced.
-        // The provider has already been copied out under the read lock, so
-        // we can safely pass it by reference here.
+        // P1-45: `provider` is a shared_ptr snapshot, so the lambda below keeps
+        // the callable alive by co-owning it (a reference capture would dangle if
+        // the lambda outlived this frame).
         if (singleflight_enabled_.load(std::memory_order_acquire)) {
             return get_or_fetch(key,
-                [&provider](const Key& k) -> Value { return provider(k); });
+                [provider](const Key& k) -> Value { return (*provider)(k); });
         }
         // Phase 2: Call provider outside any lock
-        Value v = provider(key);
+        Value v = (*provider)(key);
         // P1-1 (T2.2): Drain TLS ring before write lock — see set().
         // The provider ran outside the lock; this thread may have
         // accumulated TLS ring entries from prior get() calls.
@@ -3783,6 +4056,14 @@ public:
 
         if constexpr (is_striped) {
             handle = mm_.peek_for_get(key);
+            if (!handle && detail::tls_last_incRef_was_overflow()) {
+                // P1-34 (fix.01 方案 A): found but unpinnable (access_ref
+                // saturated) — account for it and retry once instead of
+                // reporting a miss. See note_peek_overflow_if_any().
+                note_peek_overflow_if_any(shard_idx);
+                std::this_thread::yield();
+                handle = mm_.peek_for_get(key);
+            }
             if (!handle) {
                 mm_.shard(shard_idx).stats().register_miss();
                 mm_.shard(shard_idx).callbacks().collect_miss(key);
@@ -3820,6 +4101,12 @@ public:
         } else {
             flush_guard fg{mm_};
             handle = mm_.peek_for_get(key);
+            if (!handle && detail::tls_last_incRef_was_overflow()) {
+                // P1-34 (fix.01 方案 A): see the striped branch above.
+                note_peek_overflow_if_any(shard_idx);
+                std::this_thread::yield();
+                handle = mm_.peek_for_get(key);
+            }
             if (!handle) {
                 mm_.stats().register_miss();
                 mm_.callbacks().collect_miss(key);
@@ -4001,7 +4288,9 @@ public:
         } else {
             flush_guard fg{mm_};
             auto lock = acquire_write_lock_for_key(key);
-            if (!check_memory_admission(key, value)) return;
+            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            if (recheck_shutdown_in_lock()) return;
+            if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return; }
             if (!apply_overflow_policy_for_set(key, 0)) return;
             mm_.set(key, std::forward<V>(value));
             trace_hit = true;  // O1: set succeeded
@@ -4242,7 +4531,46 @@ public:
     std::vector<std::optional<read_handle<Value>>> get_multi(std::span<const Key> keys) {
         std::vector<std::optional<read_handle<Value>>> results(keys.size());
 
-        if constexpr (is_striped) {
+        if constexpr (has_per_shard_lock_v<mm_type>) {
+            // P1-2 (fix.01 方案 A): for `sharded_mm_lru` we MUST acquire the
+            // per-shard WRITE lock — exactly as set_multi() already does — and
+            // not the stripe lock. `mm_.promote()` moves the item in the
+            // intrusive list and takes no lock of its own (sharded_mm_lru::
+            // promote forwards straight to the shard's mm_lru::promote), while
+            // a concurrent set()/remove() on the same shard holds that shard's
+            // lock. The stripe lock is a different lock, so the previous code
+            // left the two operations mutually unprotected: list corruption and
+            // the same item retired twice (use-after-free / double-free).
+            //
+            // Single-key get()/try_get() already route through
+            // try_acquire_write_lock_for_hash() → mm_.acquire_shard_write_lock(),
+            // so this branch restores the symmetry that was missing here.
+            ankerl::unordered_dense::map<std::size_t, std::vector<std::size_t>> groups;
+            for (std::size_t i = 0; i < keys.size(); ++i) {
+                const std::size_t hash = Hash{}(keys[i]);
+                groups[mm_.shard_for_hash(hash)].push_back(i);
+            }
+            for (auto& [shard_idx, idxs] : groups) {
+                auto lock = mm_.acquire_shard_write_lock(shard_idx);
+                for (auto i : idxs) {
+                    const auto& key = keys[i];
+                    auto h = mm_.peek_for_get(key);
+                    if (h) {
+                        mm_.promote(key);
+                        mm_.shard(shard_idx).stats().register_hit();
+                        mm_.shard(shard_idx).callbacks().collect_hit(key, *h);
+                        attach_handle_stats_if_enabled(h);
+                    } else {
+                        mm_.shard(shard_idx).stats().register_miss();
+                        mm_.shard(shard_idx).callbacks().collect_miss(key);
+                    }
+                    if (h) {
+                        results[i].emplace(std::move(h));
+                    }
+                }
+                flush_shard_pending(shard_idx);
+            }
+        } else if constexpr (is_striped) {
             // P1-4: group by (stripe, shard) pair. Previously keys were
             // grouped by stripe only and the shard_idx was cached from
             // the first key — that assumed stripe_idx == shard_idx, which
@@ -4380,6 +4708,16 @@ public:
             else return 0;
         }();
         auto h = mm_.peek_for_get(key);
+        if (!h && detail::tls_last_incRef_was_overflow()) {
+            // P1-34 (fix.01 方案 A): the item WAS found but could not be pinned
+            // because its access_ref counter saturated. Account for it (the
+            // counter is what operators alert on) and retry once — saturation is
+            // transient, since the pinning handles are being released. Without
+            // this the event was reported as a plain miss.
+            note_peek_overflow_if_any(shard_idx);
+            std::this_thread::yield();
+            h = mm_.peek_for_get(key);
+        }
         if (h) {
             // Task C: attach per-cache stats if enabled.
             attach_handle_stats_if_enabled(h);
@@ -5403,12 +5741,13 @@ public:
         // (no cache, age is meaningless — operators should check the
         // segmented_hash_table flag first).
         info.diagnostics_cache_age_ms = diagnostics_cache_age_ms();
-        // P1-3: Surface the hazptr drain worker state so operators
-        // can verify (via a single diagnostics dump) that the worker
-        // is running. When false, retire_obj() emits a one-shot
-        // stderr warning on first call.
-        info.drain_worker_started =
-            detail::hazptr_domain::default_domain().is_drain_started();
+        // P1-3: Surface the drain worker state so operators can verify (via
+        // a single diagnostics dump) that reclamation is actually running
+        // for THIS cache. Reports the cache's own worker handles rather
+        // than the process-global "was a worker ever started" flag, which
+        // is monotonic and would read 1 even after this cache stopped its
+        // worker.
+        info.drain_worker_started = is_event_drain_running();
         // P1-2: Surface the active fairness mode so operators can
         // verify (via a single diagnostics dump) whether the cache is
         // running writer_fair (default, prevents writer starvation) or
@@ -5610,7 +5949,10 @@ public:
         append_kv("hazptr_max_slot_count", info.hazptr_max_slot_count);
         {
             char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.4f", info.hazptr_slot_usage_ratio);
+            // Explicit double cast: snprintf's %f takes a double, so the
+            // float would be promoted implicitly (-Wdouble-promotion).
+            std::snprintf(buf, sizeof(buf), "%.4f",
+                          static_cast<double>(info.hazptr_slot_usage_ratio));
             out.append("hazptr_slot_usage_ratio: ");
             out.append(buf);
             out.push_back('\n');
@@ -5727,7 +6069,8 @@ public:
         };
         auto append_kv_f_field = [&](std::string_view k, float v) {
             char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.4f", v);
+            // Explicit double cast — snprintf's %f takes a double.
+            std::snprintf(buf, sizeof(buf), "%.4f", static_cast<double>(v));
             out.append("\""); out.append(k); out.append("\": ");
             out.append(buf); out.append(", ");
         };
@@ -5937,12 +6280,28 @@ public:
         return result;
     }
 
-    /// T18.2: Identify the top-N shards by memory consumption rather than
+    /// T18.2: Identify the top-N shards by accounted memory rather than
     /// access volume. Useful for detecting memory imbalance caused by a few
-    /// shards holding disproportionately large values (e.g. a hot key with
-    /// a large payload, or skew in value-size distribution). The returned
-    /// vector carries the same fields as hot_shards() — only the sort key
-    /// differs (memory_usage descending instead of total_accesses).
+    /// shards holding disproportionately many items.
+    ///
+    /// IMPORTANT — what `memory_usage` measures. It is
+    /// `sum(item_overhead + key_size_fn(key) * 2 + value_size_fn(value))`,
+    /// i.e. the per-item struct overhead plus whatever size hooks the caller
+    /// registered via `mm_lru_config::key_size_fn` / `value_size_fn`. It is
+    /// NOT RSS and NOT the real byte size of the stored data:
+    ///
+    ///   - with no size hooks registered, a `std::string` contributes
+    ///     `sizeof(std::string)` (32 on most ABIs), not its length, so a
+    ///     shard holding 4096-byte strings is not ranked above a shard
+    ///     holding 8-byte strings;
+    ///   - slab allocator internal fragmentation is not included, so a
+    ///     `value_size_fn` that returns the true payload size still
+    ///     under-reports what the allocator actually reserved.
+    ///
+    /// It is a reliable ranking signal only when the caller registers size
+    /// hooks that reflect the real payload. The returned vector otherwise
+    /// carries the same fields as hot_shards() — only the sort key differs
+    /// (memory_usage descending instead of total_accesses).
     ///
     /// \param top_n Maximum number of hot shards to return (default: 5).
     /// \return Sorted vector of shard statistics. Empty for non-sharded caches.
@@ -6086,7 +6445,22 @@ public:
             return read_handle<const Value>(const_cast<Value*>(&ref->get()), nullptr, nullptr);
         }
         if constexpr (detail::has_peek_v<mm_type, Key>) {
-            return mm_.peek(key);
+            read_handle<const Value> h = mm_.peek(key);
+            if (!h && detail::tls_last_incRef_was_overflow()) {
+                // P1-34 (fix.01 方案 A): the item exists but could not be pinned
+                // (access_ref saturated), which is NOT the same as a miss.
+                // Account for it and retry once — saturation is transient, since
+                // the pinning handles are being released. The counter is mutable
+                // so this const method can record it.
+                const std::size_t shard_idx = [&]() -> std::size_t {
+                    if constexpr (is_striped) return mm_.shard_for(key);
+                    else return 0;
+                }();
+                note_peek_overflow_if_any(shard_idx);
+                std::this_thread::yield();
+                h = mm_.peek(key);
+            }
+            return h;
         } else {
             return {};
         }
@@ -6128,6 +6502,22 @@ public:
         return mm_.max_memory();
     }
 
+    /// P1-30 (fix.01 方案 A): the capacity the CALLER requested, before any
+    /// per-shard amplification. When the cache was constructed with
+    /// `allow_amplification = true` and asked for fewer slots than shards,
+    /// this reports the original request while `max_size()` reports the
+    /// effective (amplified) value. Otherwise the two are identical.
+    size_type requested_max_size() const {
+        if constexpr (Trait::is_compact) {
+            return compact().max_size();
+        }
+        if constexpr (requires { mm_.requested_max_size(); }) {
+            return mm_.requested_max_size();
+        } else {
+            return mm_.max_size();
+        }
+    }
+
     size_type current_memory() const {
         // T14.1: Compact path.
         if constexpr (Trait::is_compact) {
@@ -6153,7 +6543,20 @@ public:
         if constexpr (is_striped) {
             if constexpr (requires { mm_.num_shards(); }) {
                 for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
-                    auto lock = striped_mutex_.make_shared_lock(i);
+                    // P1-37 (fix.01 方案 A): take the lock that actually protects
+                    // shard i. For sharded_mm_lru that is the PER-SHARD lock, not
+                    // the stripe lock — the stripe lock is a different lock and
+                    // does not exclude a writer inside mm_.shard(i), so the
+                    // "consistent state" claim in the comment above was false.
+                    // This function gates safe teardown (the destructor consults
+                    // it), so reading a half-updated shard here can wrongly
+                    // report "no active handles" and let the cache be destroyed
+                    // while a handle is live.
+                    //
+                    // acquire_read_lock_for_shard() routes to the per-shard lock
+                    // when one exists and falls back to the stripe lock
+                    // otherwise, so the same call is correct for both layouts.
+                    auto lock = acquire_read_lock_for_shard(i);
                     if (mm_.shard(i).has_active_handles()) return true;
                 }
                 return false;
@@ -6482,16 +6885,23 @@ public:
     /// P2-3: Strictly-atomic cross-shard snapshot.
     ///
     /// Sequence:
-    ///   1. shutdown_and_wait(timeout) — reject new ops, drain TLS rings,
-    ///      wait for active read_handle count to drop to 0.
+    ///   1. quiesce(timeout) — reject new writes (they throw
+    ///      cache_closed_exception), drain TLS rings, and wait for the active
+    ///      read_handle count to drop to 0. P1-40: this is REVERSIBLE, so unlike
+    ///      the previous shutdown_and_wait() the cache is still usable after the
+    ///      snapshot — see step 4.
     ///   2. acquire_read_lock_all_shards() — hold all 64 per-shard read locks
-    ///      simultaneously. Combined with shutdown, no writer can mutate any
+    ///      simultaneously. Combined with quiesce, no writer can mutate any
     ///      shard, so the snapshot reflects a single instant T0 across shards.
     ///   3. Serialize every shard under the locks (same binary format as
     ///      save_per_shard()).
-    ///   4. Release locks; cache remains in shutdown state. The cache
-    ///      cannot be re-opened — construct a new cache and load_per_shard()
-    ///      to resume service.
+    ///   4. Release locks and resume(). **The cache returns to service** —
+    ///      readable and writable. (Historically this step left the cache
+    ///      permanently shut down, which meant a scheduled backup silently took
+    ///      the cache out of service until the process restarted; the surrounding
+    ///      docs had always promised otherwise. `resume()` runs from an RAII
+    ///      guard, so the timeout path below resumes too and cannot leave the
+    ///      cache silently unable to accept writes.)
     ///
     /// Trade-off vs save_per_shard(): strictly consistent but blocks all
     /// writers for the duration of serialization — use only when a
@@ -7034,7 +7444,7 @@ public:
         }
         // T-G10: Signal handle-release path that shutdown is in progress,
         // so the last read_handle::release() notifies shutdown_and_wait().
-        active_handle_notifier_.shutdown_in_progress.store(true, std::memory_order_release);
+            active_handle_notifier_->shutdown_in_progress.store(true, std::memory_order_release);
         // T-G10 subtask 4: stop the OS memory sampler so its background
         // thread doesn't race with teardown. Idempotent no-op if never
         // started.
@@ -7170,6 +7580,21 @@ public:
         std::chrono::duration<Rep, Period> timeout,
         std::chrono::milliseconds /*poll_interval*/ = std::chrono::milliseconds(1)) {
         shutdown();
+        return wait_for_handles_to_drain(timeout);
+    }
+
+    /// P1-40 (fix.01 方案 A): wait for every outstanding `read_handle` to be
+    /// released WITHOUT closing the cache.
+    ///
+    /// Extracted from `shutdown_and_wait()` so the reversible quiesce path
+    /// reuses exactly the same wait — including the condition_variable wakeup
+    /// that `read_handle::release()` performs — instead of duplicating it.
+    ///
+    /// @return true if all handles drained within the timeout. False also when
+    ///         the counters cannot be trusted (tracking disabled); the caller
+    ///         must then use `force_wait_handles()` or join its own threads.
+    template <typename Rep, typename Period>
+    bool wait_for_handles_to_drain(std::chrono::duration<Rep, Period> timeout) {
         // T4.1: cannot reliably count handles without any tracking source.
         if (!tracking_reliable_for_wait()) {
             return false;  // caller must use force_wait_handles() instead
@@ -7180,7 +7605,7 @@ public:
         // waiting out the full timeout. A 10ms ceiling on wait_for guards
         // against lost-wakeup races (e.g. the notify firing between the
         // predicate check and the wait).
-        auto& n = active_handle_notifier_;
+        auto& n = *active_handle_notifier_;
         std::unique_lock<std::mutex> lk(n.mtx);
         auto deadline = std::chrono::steady_clock::now() + timeout;
         while (active_handle_count() > 0) {
@@ -7193,6 +7618,50 @@ public:
             }
         }
         return true;
+    }
+
+    /// P1-40 (fix.01 方案 A): reversibly take the cache out of service for a
+    /// transactional snapshot.
+    ///
+    /// `save_atomic()` used to call `shutdown_and_wait()`, which sets `closed_`
+    /// **permanently**: a single backup job silently removed the cache from
+    /// service until the process was restarted. `quiesce()` establishes the same
+    /// two guarantees the snapshot actually needs — no new writers, and no
+    /// outstanding handles that could observe a half-serialized state — without
+    /// the irreversible part:
+    ///
+    ///   * new writes are rejected while quiesced (they throw
+    ///     `cache_closed_exception`, exactly as during shutdown);
+    ///   * readers that already hold a handle may finish, which is what lets the
+    ///     drain wait terminate;
+    ///   * `resume()` restores service, and `is_shutdown()` stays false.
+    ///
+    /// On failure the flag is rolled back BEFORE returning, so a timeout cannot
+    /// leave the cache silently unable to accept writes — that would be worse
+    /// than the old behaviour, which at least reported itself via
+    /// `is_shutdown()`.
+    ///
+    /// @return true if all outstanding handles drained within the timeout.
+    template <typename Rep, typename Period>
+    bool quiesce(std::chrono::duration<Rep, Period> timeout) {
+        quiesced_.store(true, std::memory_order_release);
+        if (!wait_for_handles_to_drain(timeout)) {
+            quiesced_.store(false, std::memory_order_release);
+            return false;
+        }
+        return true;
+    }
+
+    /// P1-40: restore service after a `quiesce()`. Idempotent and safe to call
+    /// on a cache that was never quiesced (including from an exception path).
+    void resume() noexcept {
+        quiesced_.store(false, std::memory_order_release);
+    }
+
+    /// P1-40: true while a transactional snapshot holds the cache quiesced.
+    /// Distinct from `is_shutdown()`, which is permanent.
+    bool is_quiesced() const noexcept {
+        return quiesced_.load(std::memory_order_acquire);
     }
 
     /// T4.1: Result of a shutdown wait operation. Distinguishes between
@@ -7219,7 +7688,7 @@ public:
             return shutdown_status::tracking_disabled;
         }
         // T-G10: condition_variable wait — see shutdown_and_wait().
-        auto& n = active_handle_notifier_;
+            auto& n = *active_handle_notifier_;
         std::unique_lock<std::mutex> lk(n.mtx);
         auto deadline = std::chrono::steady_clock::now() + timeout;
         while (active_handle_count() > 0) {
@@ -7666,7 +8135,7 @@ private:
             double sum = 0.0;
             for (float lf : shard_lf) {
                 if (lf > worst) worst = lf;
-                sum += lf;
+                sum += static_cast<double>(lf);  // explicit, -Wdouble-promotion
             }
             const double avg = sum / static_cast<double>(num_shards);
             // P95: nearest-rank method on the sorted (ascending) series.
@@ -7846,10 +8315,12 @@ private:
         out.append(std::to_string(static_cast<std::size_t>(get_fairness_mode())));
         out.push_back('\n');
 
-        // P1-3: Drain worker state (1=running, 0=stopped). When 0,
-        // retire_obj() emits a one-shot stderr warning on first call.
-        // Operators alert on 0 for any cache that should be long-running.
-        append("# HELP lru_drain_worker_started Whether the hazptr drain worker has been started (1=yes, 0=no). When 0, retire_obj() emits a one-shot stderr warning.");
+        // Drain worker state for THIS cache (1=running, 0=stopped). True
+        // means retired objects are being reclaimed; operators alert on 0
+        // for any cache that should be long-running. (The underlying hazptr
+        // domain flag is process-global and monotonic, so it cannot answer
+        // this question per cache — see is_drain_worker_started().)
+        append("# HELP lru_drain_worker_started Whether this cache has a drain worker running and reclaiming retired objects (1=yes, 0=no). Alert on 0 for long-running caches.");
         append("# TYPE lru_drain_worker_started gauge");
         out.append("lru_drain_worker_started ");
         out.append(std::to_string(
@@ -8484,17 +8955,24 @@ public:
     /// order bounds the residual pending list to one reclaim tick's
     /// worth (≤250ms).
     ///
-    /// P1-8: Only reset the global drain_started flag when THIS cache
-    /// actually started a drain worker. The flag is process-global
-    /// (default hazptr domain), but ordinary single-threaded caches
-    /// (e.g. block_cache_layer's mm_lru) never call start_event_drain()
-    /// — they only call stop_event_drain() during shutdown. Unconditionally
-    /// clearing the flag here would wipe out the drain state of another
-    /// cache whose worker is still running, causing spurious
-    /// "retire_obj() called before start_event_drain()" warnings.
+    /// The domain-global `drain_started` flag is deliberately NOT cleared
+    /// here. It gates a one-shot stderr warning that tells operators they
+    /// never started a reclaim worker, and the failure it warns about
+    /// (retired objects accumulating without bound) is a property of the
+    /// whole process, not of one cache. Clearing it on teardown re-armed
+    /// the warning so that the very next `retire_obj()` — including the
+    /// retires this destructor itself performs while releasing the
+    /// remaining items — printed a bogus "retired objects will accumulate
+    /// until pending_count > 4096" message on an otherwise clean shutdown.
+    /// Since the flag is process-global and the hazptr domain is shared, a
+    /// false positive is far more damaging than a false negative: it
+    /// teaches operators to ignore the one signal that matters.
+    ///
+    /// "Is a reclaim worker running *right now*" is a per-cache question
+    /// and is answered by `is_event_drain_running()` /
+    /// `is_reclaim_worker_running()` below, which read this cache's own
+    /// worker handles.
     void stop_event_drain() {
-        const bool had_drain_worker =
-            reclaim_drain_worker_ != nullptr || callback_drain_worker_ != nullptr;
         if (callback_drain_worker_) {
             callback_drain_worker_->stop();
             callback_drain_worker_.reset();
@@ -8502,14 +8980,6 @@ public:
         if (reclaim_drain_worker_) {
             reclaim_drain_worker_->stop();
             reclaim_drain_worker_.reset();
-        }
-        // P1-3: clear drain_started only if this cache started a worker;
-        // otherwise a fresh start_event_drain() call from another cache
-        // re-arms the state correctly. The drain_warn_emitted_ CAS flag
-        // in hazptr_domain is NOT reset, so the warning never fires twice
-        // per process.
-        if (had_drain_worker) {
-            detail::hazptr_domain::default_domain().set_drain_started(false);
         }
     }
 
@@ -8540,14 +9010,17 @@ public:
         return callback_drain_worker_ != nullptr;
     }
 
-    /// P1-3: Query whether the hazptr drain worker has been started.
-    /// Mirrors `hazptr_domain::is_drain_started()`. Returns true after
-    /// `start_event_drain()` and false after `stop_event_drain()`. When
-    /// false, the first `retire_obj()` call emits a one-shot stderr
-    /// warning so operators notice the missing worker before memory
-    /// grows unboundedly.
+    /// Whether THIS cache currently has a drain worker running and is able
+    /// to reclaim retired objects. Reported as `lru_drain_worker_started`
+    /// in `prometheus_text()`, which operators alert on — so it must answer
+    /// "is reclamation happening now for this cache", not "was a worker
+    /// ever started somewhere in the process".
+    ///
+    /// The hazptr domain's `drain_started` flag is process-global and, by
+    /// design, monotonic (see `stop_event_drain()`), so it cannot answer
+    /// the per-cache question. The cache's own worker handles can.
     bool is_drain_worker_started() const noexcept {
-        return detail::hazptr_domain::default_domain().is_drain_started();
+        return is_event_drain_running();
     }
 
     // --------------------------------------------------------------------
@@ -9071,156 +9544,23 @@ public:
     }
 
 private:
-    /// T-G1: Value-layer TTL scanner for caches whose value_type is
-    /// `ttl_entry<U>`. Walks the MM under a read lock to collect expired
-    /// keys, then deletes each key under its per-shard write lock (or
-    /// global write lock for non-sharded caches). This makes
-    /// `start_ttl_cleaner()` effective for `ttl_cache<U>` users without
-    /// requiring them to wire up an external periodic worker.
-    ///
-    /// Design notes:
-    ///   - Read-lock walk + per-key write-lock delete mirrors the pattern
-    ///     in `ttl_cache::clear_expired_locked()`, but lives in
-    ///     unified_cache so it works for direct
-    ///     `unified_cache<..., ttl_entry<U>>` usage too.
-    ///   - For sharded caches, the read lock is acquired per-shard via
-    ///     `try_acquire_shard_*_lock` to avoid blocking writers across
-    ///     the entire cache. A shard that is contended is skipped this
-    ///     cycle and retried next cycle.
-    ///   - Batch size is honored (config.ttl_evict_batch_size) to bound
-    ///     the per-cycle work; remaining expired items are picked up in
-    ///     subsequent cleaner cycles.
-    std::size_t evict_expired_via_ttl_entry_scan(bool round_robin = false) {
-        using entry_t = value_type;
-        using clock_t = typename entry_t::clock;
-        const auto now = clock_t::now();
-
-        // Determine batch size (0 = unlimited per cycle).
-        const std::size_t batch_size = [this]() -> std::size_t {
-            if constexpr (requires { mm_.config().ttl_evict_batch_size; }) {
-                auto bs = mm_.config().ttl_evict_batch_size;
-                if (bs > 0) return bs;
-                if constexpr (requires { mm_.config().lru_config.ttl_evict_batch_size; }) {
-                    return mm_.config().lru_config.ttl_evict_batch_size;
-                }
-            }
-            if constexpr (requires { mm_.config().lru_config.ttl_evict_batch_size; }) {
-                return mm_.config().lru_config.ttl_evict_batch_size;
-            }
-            return 0;
-        }();
-
-        std::size_t total = 0;
-
-        if constexpr (is_striped) {
-            // T-G17: True per-shard round-robin. When enabled (default for
-            // background cleaner), each cycle processes exactly ONE shard
-            // (the next in rotation). This cuts per-cycle work by
-            // ~1/num_shards for production_cache (64 shards). When disabled,
-            // falls back to legacy "scan all shards per cycle" behavior.
-            const bool use_round_robin = round_robin
-                && ttl_cleaner_round_robin_.load(std::memory_order_relaxed);
-            const std::size_t num_shards = mm_.num_shards();
-            const std::size_t start_shard = use_round_robin
-                ? (ttl_cleaner_next_shard_.fetch_add(1, std::memory_order_relaxed) % num_shards)
-                : 0;
-            const std::size_t shard_limit = use_round_robin
-                ? (start_shard + 1)  // process exactly one shard
-                : num_shards;        // process all shards
-
-            for (std::size_t shard_idx = start_shard; shard_idx < shard_limit; ++shard_idx) {
-                const std::size_t i = shard_idx % num_shards;
-                if (total > 0 && batch_size > 0 && total >= batch_size) break;
-
-                // Phase 1: collect expired keys under a read lock (try-lock
-                // to avoid blocking writers).
-                std::vector<key_type> expired_keys;
-                {
-                    if constexpr (has_per_shard_lock_v<mm_type>) {
-                        auto lock = mm_.try_acquire_shard_read_lock(i);
-                        if (!lock.owns_lock()) continue;
-                        for (auto it = mm_.shard(i).begin();
-                             it != mm_.shard(i).end(); ++it) {
-                            if (it->value.is_expired_at(now)) {
-                                expired_keys.push_back(it->key);
-                                if (batch_size > 0 && (total + expired_keys.size()) >= batch_size) break;
-                            }
-                        }
-                    } else {
-                        auto stripe = i % striped_mutex_.size();
-                        auto lock = striped_mutex_.try_make_shared_lock(stripe);
-                        if (!lock.owns_lock()) continue;
-                        for (auto it = mm_.shard(i).begin();
-                             it != mm_.shard(i).end(); ++it) {
-                            if (it->value.is_expired_at(now)) {
-                                expired_keys.push_back(it->key);
-                                if (batch_size > 0 && (total + expired_keys.size()) >= batch_size) break;
-                            }
-                        }
-                    }
-                }
-                // Phase 2: delete each expired key under a write lock.
-                for (const auto& k : expired_keys) {
-                    if constexpr (has_per_shard_lock_v<mm_type>) {
-                        auto wlock = mm_.try_acquire_shard_write_lock(i);
-                        if (!wlock.owns_lock()) continue;
-                        if (mm_.shard(i).del(k)) ++total;
-                    } else {
-                        auto stripe = i % striped_mutex_.size();
-                        auto wlock = striped_mutex_.try_make_unique_lock(stripe);
-                        if (!wlock.owns_lock()) continue;
-                        if (mm_.shard(i).del(k)) ++total;
-                    }
-                    if (batch_size > 0 && total >= batch_size) break;
-                }
-            }
-        } else {
-            // Non-sharded: single read-lock walk + single write-lock delete.
-            std::vector<key_type> expired_keys;
-            {
-                auto lock = acquire_read_lock();
-                for (auto it = mm_.begin(); it != mm_.end(); ++it) {
-                    const auto& entry = it->value;
-                    if (entry.is_expired_at(now)) {
-                        expired_keys.push_back(it->key);
-                        if (batch_size > 0 && expired_keys.size() >= batch_size) break;
-                    }
-                }
-            }
-            auto wlock = acquire_write_lock();
-            for (const auto& k : expired_keys) {
-                if (mm_.del(k)) ++total;
-                if (batch_size > 0 && total >= batch_size) break;
-            }
-        }
-        return total;
-    }
-
     /// SFINAE-aware evict_expired implementation. Dispatches to the MM's
     /// evict_expired() if it exists; otherwise returns 0 (no-op).
     ///
-    /// T-G1: When value_type is `ttl_entry<U>` (i.e. the cache was
-    /// constructed as `unified_cache<..., ttl_entry<U>>` or via
-    /// `ttl_cache<U>`), TTL information lives in the value layer
-    /// (`ttl_entry::expiry`), NOT in the MM's native TTL heap. The MM's
-    /// `evict_expired()` returns 0 because its ttl_heap_ is never
-    /// populated. To fix this, when `is_ttl_entry_v<value_type>` is true
-    /// we dispatch to `evict_expired_via_ttl_entry_scan()` which walks
-    /// the MM under a read lock, collects expired keys, and deletes them
-    /// per-shard under write locks — the same pattern as
-    /// `ttl_cache::clear_expired()`, but integrated into unified_cache so
-    /// `start_ttl_cleaner()` works out of the box for ttl_cache users.
+    /// P1-31 (fix.01): every eviction strategy now owns an item-level TTL
+    /// index (`detail::mm_ttl_index_mixin`), and `ttl_cache` publishes its
+    /// expiry to that index through `set_with_absolute_expiry()`. The previous
+    /// T-G1 fallback — `evict_expired_via_ttl_entry_scan()`, which walked the
+    /// ENTIRE cache under a read lock and deleted expired keys one by one —
+    /// has therefore been deleted rather than kept as a second, divergent
+    /// implementation. TTL cleanup is now O(log n) per expired item for every
+    /// strategy and every value type, and there is exactly one sweep path.
     ///
     /// When ttl_evict_batch_size > 0 (configured via mm config), the
     /// implementation uses try_lock to avoid blocking concurrent readers
     /// and limits eviction to `batch_size` items per shard/lock acquisition.
     /// Remaining expired items are processed in subsequent cleaner cycles.
     std::size_t evict_expired_impl(bool round_robin = false) {
-        // T-G1: value-layer TTL scan for ttl_entry-wrapped caches.
-        if constexpr (is_ttl_entry_v<value_type>) {
-            return evict_expired_via_ttl_entry_scan(round_robin);
-        }
-
         if constexpr (is_striped) {
             std::size_t total = 0;
             if constexpr (requires { mm_.shard(0).evict_expired(); }) {
@@ -9564,7 +9904,8 @@ public:
     /// Used for global write operations (flush, resize, etc.).
     struct striped_write_lock_all {
         striped_mutex_storage& sm;
-        explicit striped_write_lock_all(striped_mutex_storage& sm) : sm(sm) { sm.lock_all(); }
+        // Parameter named `m` (not `sm`) to avoid shadowing the member.
+        explicit striped_write_lock_all(striped_mutex_storage& m) : sm(m) { sm.lock_all(); }
         ~striped_write_lock_all() { sm.unlock_all(); }
         striped_write_lock_all(const striped_write_lock_all&) = delete;
         striped_write_lock_all& operator=(const striped_write_lock_all&) = delete;
@@ -9574,7 +9915,8 @@ public:
     /// Used for global read operations (size, stats, etc.).
     struct striped_read_lock_all {
         striped_mutex_storage& sm;
-        explicit striped_read_lock_all(striped_mutex_storage& sm) : sm(sm) { sm.lock_shared_all(); }
+        // Parameter named `m` (not `sm`) to avoid shadowing the member.
+        explicit striped_read_lock_all(striped_mutex_storage& m) : sm(m) { sm.lock_shared_all(); }
         ~striped_read_lock_all() { sm.unlock_shared_all(); }
         striped_read_lock_all(const striped_read_lock_all&) = delete;
         striped_read_lock_all& operator=(const striped_read_lock_all&) = delete;
@@ -9813,6 +10155,19 @@ public:
         }
     }
 
+    /// P1-30 (方案 B): the effective number of MM shards, i.e. the LRU /
+    /// hash-table granularity. Equal to `num_stripes()` for
+    /// `sharded_mm_lru`, and 1 for non-sharded strategies. Exposed so callers
+    /// (and tests) can verify that a small cache is not laid out over more
+    /// shards than it has slots.
+    std::size_t num_shards() const noexcept {
+        if constexpr (has_per_shard_lock_v<mm_type>) {
+            return mm_.num_shards();
+        } else {
+            return 1;
+        }
+    }
+
     /// Compile-time default stripe count (for backwards compatibility and
     /// static_assert checks). Use num_stripes() for the runtime value.
     static constexpr std::size_t default_num_stripes() {
@@ -9946,7 +10301,10 @@ private:
     }
 
     /// Optional value provider for get_or_fetch / operator[].
-    std::function<Value(const Key&)> value_provider_;
+    /// P1-45 (fix.01 方案 A): published through an RCU-style atomic shared_ptr
+    /// so the miss path can take a snapshot without holding a lock (and without
+    /// copying/allocating a std::function under the per-key lock).
+    detail::atomic_shared_ptr<std::function<Value(const Key&)>> value_provider_;
 
     /// O2: Slow query logger — invoked when get()/set() latency exceeds
     /// `slow_query_threshold_ns_`. Stored as detail::atomic_shared_ptr
@@ -10157,7 +10515,18 @@ private:
     /// calls notify_all() on this cv when the last handle is dropped
     /// during shutdown, so shutdown_and_wait() returns immediately
     /// instead of busy-polling. Wired in init_production_features().
-    handle_release_notifier active_handle_notifier_;
+    /// P1-33 (fix.01 方案 A): process-lifetime handle-release notifier.
+    ///
+    /// Deliberately a raw pointer that is allocated on first use and NEVER
+    /// deleted: outstanding read_handles keep a reference to it so they can
+    /// observe `cache_alive` after this cache has been destroyed. Freeing it with
+    /// the cache would reintroduce exactly the use-after-free this fixes.
+    handle_release_notifier* active_handle_notifier_ = nullptr;
+
+    /// P1-40 (fix.01 方案 A): set while a transactional snapshot holds the cache
+    /// quiesced (no writers, no outstanding handles). Unlike `closed_` it is
+    /// reversible via resume().
+    std::atomic<bool> quiesced_{false};
 
     // ----------------------------------------------------------------
     // P1-3: Memory watermark and OOM protection
@@ -10575,6 +10944,84 @@ private:
         if (memory_monitor_.active()) {
             memory_monitor_.report_memory(mm_.current_memory());
         }
+    }
+
+    // --------------------------------------------------------------------
+    // P1-19 (fix.01 方案 B) + P1-23 (方案 B): the SINGLE admission gate
+    // --------------------------------------------------------------------
+    //
+    // Capacity enforcement used to be decided independently by every MM
+    // strategy: `mm_lru` did "evict → verify progress → refuse", while
+    // `mm_fifo` / `mm_2q` / `mm_tiny_lfu` / `mm_wtiny_lfu` each tried exactly
+    // one `evict()` and then inserted REGARDLESS of whether any space had been
+    // freed (mm.hpp's old `insert_new()` bodies). Under pin pressure (slow
+    // readers holding `read_handle`s) those four strategies therefore grew
+    // without bound and no rejection signal was ever raised: operators saw
+    // memory climb while every metric looked normal.
+    //
+    // The rule is now decided in exactly ONE place, here, and the MM layer's
+    // internal attempts are a best-effort optimisation rather than the policy:
+    //
+    //   1. After the MM insert, if the cache is over `max_size`, try to make
+    //      room (this is also what covers `sharded_mm_lru`, whose eviction is
+    //      only ever best-effort).
+    //   2. If no progress can be made, the insert is ROLLED BACK and the
+    //      rejection is reported: `collect_reject` fires and the
+    //      `eviction_failed` metric is bumped. `size() <= max_size` holds
+    //      afterwards, so "memory is configurable" is actually true.
+    //
+    // `size_before` is passed in so the caller-provided key can be restored
+    // without a second lookup, and so an update to an existing key (which must
+    // never be rolled back) is distinguishable from a fresh insert.
+    void enforce_capacity_after_insert(const Key& key, std::size_t size_before) {
+        if (max_size() == unlimited) return;
+        const std::size_t cap = max_size();
+        if (mm_.size() <= cap) return;
+
+        // Try to reclaim. The MM strategies already attempt this internally,
+        // so this loop usually exits immediately; it exists for the paths that
+        // can only report failure (sharded_mm_lru's try_lock fast path) and to
+        // convert "no progress" into an observable rejection.
+        constexpr std::size_t kMaxReclaimTries = 8;
+        for (std::size_t tries = 0; tries < kMaxReclaimTries; ++tries) {
+            if (mm_.size() <= cap) return;
+            const auto before = mm_.size();
+            if constexpr (requires { mm_.evict_lru(); }) {
+                static_cast<void>(mm_.evict_lru());
+            } else if constexpr (requires { mm_.evict(); }) {
+                mm_.evict();
+            } else {
+                break;
+            }
+            if (mm_.size() >= before) break;  // no progress
+        }
+        if (mm_.size() <= cap) return;
+
+        // Rejection: the cache cannot honour this insert. Roll it back so the
+        // capacity invariant is preserved, then report it. `force_del` removes
+        // the key unconditionally (it is not subject to the pin check that
+        // makes `del()` return false), which is what a rollback needs.
+        if (mm_.size() > size_before) {
+            if constexpr (requires { mm_.force_del(key); }) {
+                static_cast<void>(mm_.force_del(key));
+            } else if constexpr (requires { mm_.del(key); }) {
+                static_cast<void>(mm_.del(key));
+            }
+        }
+        auto& st = [&]() -> stats_type& {
+            if constexpr (is_striped) {
+                return mm_.shard(mm_.shard_for(key)).stats();
+            } else {
+                return mm_.stats();
+            }
+        }();
+        // P1-23 方案 B: report the failure. `note_eviction_rejected` bumps the
+        // `eviction_failed` counter when cache_stats carries it and always fires
+        // the rejection callback, so a rejected insert is never silent.
+        // The value itself is gone (the insert was rolled back), so a
+        // default-constructed one is passed — the reject callback is a signal,
+        // not a value carrier.
+        detail::note_eviction_rejected(st, mm_.callbacks(), key, Value{});
     }
 
     // --------------------------------------------------------------------

@@ -417,7 +417,7 @@ struct serde {
         detail::serde_write(w, value);
     }
     static T deserialize(detail::binary_reader& r) {
-        return detail::serde_read(r, (const T*)nullptr);
+        return detail::serde_read(r, static_cast<const T*>(nullptr));
     }
 };
 
@@ -460,8 +460,8 @@ void serde_write(binary_writer& w, const std::pair<A, B>& p) {
 }
 template <typename A, typename B>
 std::pair<A, B> serde_read(binary_reader& r, const std::pair<A, B>*) {
-    auto a = serde_read(r, (const A*)nullptr);
-    auto b = serde_read(r, (const B*)nullptr);
+    auto a = serde_read(r, static_cast<const A*>(nullptr));
+    auto b = serde_read(r, static_cast<const B*>(nullptr));
     return std::pair<A, B>(std::move(a), std::move(b));
 }
 
@@ -477,7 +477,7 @@ std::vector<T> serde_read(binary_reader& r, const std::vector<T>*) {
         throw std::runtime_error("deserialization: vector size exceeds reasonable limit");
     }
     std::vector<T> res; res.reserve(n);
-    for (uint32_t i = 0; i < n; ++i) res.push_back(serde_read(r, (const T*)nullptr));
+    for (uint32_t i = 0; i < n; ++i) res.push_back(serde_read(r, static_cast<const T*>(nullptr)));
     return res;
 }
 
@@ -489,7 +489,7 @@ void serde_write(binary_writer& w, const std::optional<T>& opt) {
 template <typename T>
 std::optional<T> serde_read(binary_reader& r, const std::optional<T>*) {
     auto has = r.read<uint8_t>();
-    if (has) return std::optional<T>(serde_read(r, (const T*)nullptr));
+    if (has) return std::optional<T>(serde_read(r, static_cast<const T*>(nullptr)));
     return std::nullopt;
 }
 
@@ -514,8 +514,15 @@ struct serialized_mm_config {
     double warm_ratio = 0.4;
     bool rebalance_on_record_access = true;
 
-    // TinyLFU / W-TinyLFU CountMinSketch error rate (v3+)
-    double cms_error_rate = 0.01;
+    // P1-25 (fix.01 方案 A): TinyLFU / W-TinyLFU CountMinSketch sizing, in the
+    // CacheLib parameterisation (numCounters = next_pow2(e * capacity *
+    // window_multiplier / error_threshold), hash_count rows). Replaces the
+    // (error_rate, confidence) pair, which produced 42 counters independent of
+    // capacity — a format change, acceptable because the project requires no
+    // backward compatibility (the format version is bumped accordingly).
+    uint32_t cms_window_multiplier = 32;
+    double cms_error_threshold = 5.0;
+    uint32_t cms_hash_count = 4;
 
     void write(detail::binary_writer& w) const {
         w.write(lru_refresh_time);
@@ -528,7 +535,9 @@ struct serialized_mm_config {
         w.write(hot_ratio);
         w.write(warm_ratio);
         w.write(static_cast<uint8_t>(rebalance_on_record_access ? 1 : 0));
-        w.write(cms_error_rate);
+        w.write(cms_window_multiplier);
+        w.write(cms_error_threshold);
+        w.write(cms_hash_count);
     }
 
     void read(detail::binary_reader& r) {
@@ -542,7 +551,9 @@ struct serialized_mm_config {
         hot_ratio = r.read<double>();
         warm_ratio = r.read<double>();
         rebalance_on_record_access = r.read<uint8_t>() != 0;
-        cms_error_rate = r.read<double>();
+        cms_window_multiplier = r.read<uint32_t>();
+        cms_error_threshold = r.read<double>();
+        cms_hash_count = r.read<uint32_t>();
     }
 };
 
@@ -695,71 +706,6 @@ std::vector<uint8_t> serialize_impl(
     return w.release();
 }
 
-/// 通用反序列化实现：header -> config -> restore_fn(reader, item_count, cfg)
-/// restore_fn 负责读取 extra_state + items + 重建缓存。
-/// 版本 != current_version 时抛出异常。
-template <typename MM, typename RestoreFn>
-void deserialize_impl(
-    MM& cache,
-    mm_type_id expected_type_id,
-    std::span<const uint8_t> data,
-    RestoreFn&& restore)
-{
-    using Key = typename MM::key_type;
-    using Value = typename MM::mapped_type;
-
-    binary_reader r(data);
-
-    // Header
-    auto magic = r.read<uint32_t>();
-    if (magic != kSerializationMagic) {
-        throw std::runtime_error("deserialize: invalid magic number");
-    }
-    auto version = r.read<uint32_t>();
-    auto item_count = r.read<uint32_t>();
-    if (item_count > 10'000'000) {  // ~400MB upper bound for cache items
-        throw std::runtime_error("deserialize: item_count exceeds reasonable limit");
-    }
-    auto mm_type_raw = r.read<uint32_t>();
-    if (static_cast<mm_type_id>(mm_type_raw) != expected_type_id) {
-        throw std::runtime_error("deserialize: mm_type mismatch (expected " +
-            std::to_string(static_cast<uint32_t>(expected_type_id)) +
-            ", got " + std::to_string(mm_type_raw) + ")");
-    }
-
-    if (version != kSerializationVersion) {
-        throw std::runtime_error("deserialize: unsupported version " + std::to_string(version) +
-            " (only version " + std::to_string(kSerializationVersion) + " is supported)");
-    }
-
-    auto header_size = r.read<uint32_t>();
-    if (header_size < kV5HeaderSize || header_size > data.size()) {
-        throw std::runtime_error("deserialize: invalid header_size");
-    }
-    [[maybe_unused]] auto flags = r.read<uint32_t>();
-
-    // Read feature_flags (v5 header)
-    serialization_feature feature_flags = static_cast<serialization_feature>(r.read<uint64_t>());
-
-    auto stored_checksum = r.read<uint32_t>();
-    std::size_t payload_offset = header_size;
-    uint32_t computed_checksum = detail::crc32(
-        data.data() + payload_offset,
-        data.size() - payload_offset);
-    if (computed_checksum != stored_checksum) {
-        throw std::runtime_error("deserialize: header checksum mismatch (data corrupted)");
-    }
-
-    // Clear existing contents
-    cache.flush();
-
-    // MM Config
-    serialized_mm_config cfg;
-    cfg.read(r);
-
-    // MM-specific restore: reads extra_state + items + rebuilds
-    restore(r, item_count, cfg);
-}
 
 // ============================================================================
 // COW Snapshot Serialization
@@ -970,46 +916,131 @@ std::vector<uint8_t> serialize(const mm_lru<Key, Value, Hash, KeyEqual>& cache) 
             lst.write(w);
         });
 }
+namespace detail {
 
-/// Deserialize into an enhanced LRU cache (overwrites existing contents).
+/// Helper: determine the mm_type_id for a given MM type at compile time.
+template <typename MM> struct mm_type_id_for;
+template <typename K, typename V, typename H, typename E, typename P, bool S>
+struct mm_type_id_for<mm_lru<K, V, H, E, P, S>> {
+    static constexpr mm_type_id value = mm_type_id::lru;
+};
+template <typename K, typename V, typename H, typename E, typename P, bool S>
+struct mm_type_id_for<mm_2q<K, V, H, E, P, S>> {
+    static constexpr mm_type_id value = mm_type_id::two_q;
+};
+template <typename K, typename V, typename H, typename E, typename P, bool S>
+struct mm_type_id_for<mm_tiny_lfu<K, V, H, E, P, S>> {
+    static constexpr mm_type_id value = mm_type_id::tiny_lfu;
+};
+template <typename K, typename V, typename H, typename E, typename P, bool S>
+struct mm_type_id_for<mm_wtiny_lfu<K, V, H, E, P, S>> {
+    static constexpr mm_type_id value = mm_type_id::w_tiny_lfu;
+};
+template <typename K, typename V, typename H, typename E, typename P, bool S>
+struct mm_type_id_for<mm_fifo<K, V, H, E, P, S>> {
+    static constexpr mm_type_id value = mm_type_id::fifo;
+};
+template <typename K, typename V, typename H, typename E, typename P, bool S>
+struct mm_type_id_for<sharded_mm_lru<K, V, H, E, P, S>> {
+    static constexpr mm_type_id value = mm_type_id::sharded_lru;
+};
+
+template <typename MM>
+inline constexpr mm_type_id mm_type_id_v = mm_type_id_for<MM>::value;
+
+
+
+/// Rebuild an MM object from parsed_deserialization_data (to be called under
+/// write lock). The parsed data was obtained from parse_serialized_data()
+/// without any lock.
+template <typename MM>
+void rebuild_from_parsed(MM& mm, const parsed_deserialization_data<typename MM::key_type, typename MM::mapped_type>& parsed) {
+    constexpr auto type_id = mm_type_id_v<MM>;
+
+    mm.flush();
+
+    if constexpr (type_id == mm_type_id::lru) {
+        auto new_cfg = mm.config();
+        new_cfg.lru_insertion_point_spec = parsed.config.lru_insertion_point_spec;
+        new_cfg.update_on_read = parsed.config.update_on_read;
+        new_cfg.update_on_write = parsed.config.update_on_write;
+        new_cfg.try_lock_update = parsed.config.try_lock_update;
+        new_cfg.lru_refresh_ratio = parsed.config.lru_refresh_ratio;
+        new_cfg.mm_reconfigure_interval_secs = parsed.config.mm_reconfigure_interval_secs;
+        new_cfg.default_lru_refresh_time = parsed.config.lru_refresh_time;
+
+        uint32_t ins_pos = parsed.list_state.insertion_point_pos;
+        uint32_t tail_sz = parsed.list_state.tail_size;
+
+        mm.rebuild_from_serialized(parsed.items.begin(), parsed.items.end(), ins_pos, tail_sz);
+        mm.set_config(new_cfg);
+    } else if constexpr (type_id == mm_type_id::two_q) {
+        auto new_cfg = mm.config();
+        new_cfg.update_on_read = parsed.config.update_on_read;
+        new_cfg.update_on_write = parsed.config.update_on_write;
+        new_cfg.try_lock_update = parsed.config.try_lock_update;
+        new_cfg.lru_refresh_ratio = parsed.config.lru_refresh_ratio;
+        new_cfg.mm_reconfigure_interval_secs = parsed.config.mm_reconfigure_interval_secs;
+        new_cfg.hot_ratio = parsed.config.hot_ratio;
+        new_cfg.warm_ratio = parsed.config.warm_ratio;
+        new_cfg.rebalance_on_record_access = parsed.config.rebalance_on_record_access;
+        new_cfg.default_lru_refresh_time = parsed.config.lru_refresh_time;
+        mm.set_config(new_cfg);
+
+        mm.rebuild_from_serialized(parsed.items.begin(), parsed.items.end());
+    } else if constexpr (type_id == mm_type_id::fifo) {
+        for (const auto& item : parsed.items) {
+            mm.set(item.key, std::move(item.value));
+        }
+    } else if constexpr (type_id == mm_type_id::tiny_lfu) {
+        auto new_cfg = mm.config();
+        new_cfg.lru_refresh_ratio = parsed.config.lru_refresh_ratio;
+        new_cfg.cms_window_multiplier = parsed.config.cms_window_multiplier;
+        new_cfg.cms_error_threshold = parsed.config.cms_error_threshold;
+        new_cfg.cms_hash_count = parsed.config.cms_hash_count;
+        new_cfg.try_lock_update = parsed.config.try_lock_update;
+        new_cfg.default_lru_refresh_time = parsed.config.lru_refresh_time;
+        mm.set_config(new_cfg);
+
+        if (!parsed.cms_state.empty()) {
+            auto it = parsed.cms_state.begin();
+            mm.sketch_mut().load_state(it);
+        }
+
+        mm.rebuild_from_serialized(parsed.items.begin(), parsed.items.end());
+    } else if constexpr (type_id == mm_type_id::w_tiny_lfu) {
+        auto new_cfg = mm.config();
+        new_cfg.lru_refresh_ratio = parsed.config.lru_refresh_ratio;
+        new_cfg.cms_window_multiplier = parsed.config.cms_window_multiplier;
+        new_cfg.cms_error_threshold = parsed.config.cms_error_threshold;
+        new_cfg.cms_hash_count = parsed.config.cms_hash_count;
+        new_cfg.try_lock_update = parsed.config.try_lock_update;
+        new_cfg.default_lru_refresh_time = parsed.config.lru_refresh_time;
+        mm.set_config(new_cfg);
+
+        if (!parsed.cms_state.empty()) {
+            auto it = parsed.cms_state.begin();
+            mm.sketch_mut().load_state(it);
+        }
+
+        mm.rebuild_from_serialized(parsed.items.begin(), parsed.items.end());
+    }
+}
+} // namespace detail
+/// Deserialize into an mm_lru cache (overwrites existing contents).
+///
+/// Two-phase: parse_serialized_data() validates the magic, version, mm_type,
+/// header size and CRC and decodes every item BEFORE anything is mutated, so
+/// a truncated or mismatched payload throws with the cache untouched. The
+/// previous single-phase implementation called cache.flush() before it had
+/// even read the MM config, so a payload that failed part-way through the
+/// restore left the cache emptied and half-filled, with no rollback and no
+/// way for the caller to tell how far it had got.
 template <typename Key, typename Value, typename Hash, typename KeyEqual>
 void deserialize(mm_lru<Key, Value, Hash, KeyEqual>& cache,
                  std::span<const uint8_t> data) {
-    detail::deserialize_impl(cache, mm_type_id::lru, data,
-        [&](detail::binary_reader& r, uint32_t item_count,
-            serialized_mm_config& cfg) {
-            using ser_item = serialized_item<Key, Value>;
-
-            serialized_list_state lst;
-            lst.read(r);
-            uint32_t ins_pos = lst.insertion_point_pos;
-            uint32_t tail_sz = lst.tail_size;
-
-            // Config: apply from serialized data
-            auto new_cfg = cache.config();
-            new_cfg.lru_insertion_point_spec = cfg.lru_insertion_point_spec;
-            new_cfg.update_on_read = cfg.update_on_read;
-            new_cfg.update_on_write = cfg.update_on_write;
-            new_cfg.try_lock_update = cfg.try_lock_update;
-            new_cfg.lru_refresh_ratio = cfg.lru_refresh_ratio;
-            new_cfg.mm_reconfigure_interval_secs = cfg.mm_reconfigure_interval_secs;
-            new_cfg.default_lru_refresh_time = cfg.lru_refresh_time;
-
-            // Read all items
-            std::vector<ser_item> items;
-            items.reserve(item_count);
-            for (uint32_t i = 0; i < item_count; ++i) {
-                ser_item item;
-                item.read(r);
-                items.push_back(std::move(item));
-            }
-
-            // S0: Faithful rebuild
-            cache.rebuild_from_serialized(items.begin(), items.end(), ins_pos, tail_sz);
-
-            // Apply config AFTER rebuild to set lru_refresh_time
-            cache.set_config(new_cfg);
-        });
+    auto parsed = detail::parse_serialized_data<Key, Value>(mm_type_id::lru, data);
+    detail::rebuild_from_parsed(cache, parsed);
 }
 
 // ============================================================================
@@ -1035,35 +1066,20 @@ std::vector<uint8_t> serialize(const mm_2q<Key, Value, Hash, KeyEqual>& cache) {
         [&](detail::binary_writer&) {}); // 2Q has no extra state
 }
 
+/// Deserialize into an mm_2q cache (overwrites existing contents).
+///
+/// Two-phase: parse_serialized_data() validates the magic, version, mm_type,
+/// header size and CRC and decodes every item BEFORE anything is mutated, so
+/// a truncated or mismatched payload throws with the cache untouched. The
+/// previous single-phase implementation called cache.flush() before it had
+/// even read the MM config, so a payload that failed part-way through the
+/// restore left the cache emptied and half-filled, with no rollback and no
+/// way for the caller to tell how far it had got.
 template <typename Key, typename Value, typename Hash, typename KeyEqual>
 void deserialize(mm_2q<Key, Value, Hash, KeyEqual>& cache,
                  std::span<const uint8_t> data) {
-    detail::deserialize_impl(cache, mm_type_id::two_q, data,
-        [&](detail::binary_reader& r, uint32_t item_count,
-            serialized_mm_config& cfg) {
-            using ser_item = serialized_item<Key, Value>;
-
-            auto new_cfg = cache.config();
-            new_cfg.update_on_read = cfg.update_on_read;
-            new_cfg.update_on_write = cfg.update_on_write;
-            new_cfg.try_lock_update = cfg.try_lock_update;
-            new_cfg.lru_refresh_ratio = cfg.lru_refresh_ratio;
-            new_cfg.mm_reconfigure_interval_secs = cfg.mm_reconfigure_interval_secs;
-            new_cfg.hot_ratio = cfg.hot_ratio;
-            new_cfg.warm_ratio = cfg.warm_ratio;
-            new_cfg.rebalance_on_record_access = cfg.rebalance_on_record_access;
-            new_cfg.default_lru_refresh_time = cfg.lru_refresh_time;
-            cache.set_config(new_cfg);
-
-            std::vector<ser_item> items;
-            items.reserve(item_count);
-            for (uint32_t i = 0; i < item_count; ++i) {
-                ser_item item;
-                item.read(r);
-                items.push_back(std::move(item));
-            }
-            cache.rebuild_from_serialized(items.begin(), items.end());
-        });
+    auto parsed = detail::parse_serialized_data<Key, Value>(mm_type_id::two_q, data);
+    detail::rebuild_from_parsed(cache, parsed);
 }
 
 // ============================================================================
@@ -1078,19 +1094,20 @@ std::vector<uint8_t> serialize(const mm_fifo<Key, Value, Hash, KeyEqual>& cache)
         [&](detail::binary_writer&) {}); // FIFO has no extra state
 }
 
+/// Deserialize into an mm_fifo cache (overwrites existing contents).
+///
+/// Two-phase: parse_serialized_data() validates the magic, version, mm_type,
+/// header size and CRC and decodes every item BEFORE anything is mutated, so
+/// a truncated or mismatched payload throws with the cache untouched. The
+/// previous single-phase implementation called cache.flush() before it had
+/// even read the MM config, so a payload that failed part-way through the
+/// restore left the cache emptied and half-filled, with no rollback and no
+/// way for the caller to tell how far it had got.
 template <typename Key, typename Value, typename Hash, typename KeyEqual>
 void deserialize(mm_fifo<Key, Value, Hash, KeyEqual>& cache,
                  std::span<const uint8_t> data) {
-    detail::deserialize_impl(cache, mm_type_id::fifo, data,
-        [&](detail::binary_reader& r, uint32_t item_count,
-            serialized_mm_config& /*cfg*/) {
-            using ser_item = serialized_item<Key, Value>;
-            for (uint32_t i = 0; i < item_count; ++i) {
-                ser_item item;
-                item.read(r);
-                cache.set(item.key, std::move(item.value));
-            }
-        });
+    auto parsed = detail::parse_serialized_data<Key, Value>(mm_type_id::fifo, data);
+    detail::rebuild_from_parsed(cache, parsed);
 }
 
 // ============================================================================
@@ -1105,7 +1122,12 @@ std::vector<uint8_t> serialize(const mm_tiny_lfu<Key, Value, Hash, KeyEqual>& ca
             const auto& c = cache.config();
             cfg.lru_refresh_time = cache.refresh_time();
             cfg.lru_refresh_ratio = c.lru_refresh_ratio;
-            cfg.cms_error_rate = c.cms_error_rate;
+            // P1-25: the serialized config stores 32-bit values; the MM config
+            // uses size_t. Convert explicitly (the values are small parameters,
+            // never near 2^32).
+            cfg.cms_window_multiplier = static_cast<uint32_t>(c.cms_window_multiplier);
+            cfg.cms_error_threshold = c.cms_error_threshold;
+            cfg.cms_hash_count = static_cast<uint32_t>(c.cms_hash_count);
             cfg.try_lock_update = c.try_lock_update;
         },
         [&](detail::binary_writer& w) {
@@ -1118,45 +1140,20 @@ std::vector<uint8_t> serialize(const mm_tiny_lfu<Key, Value, Hash, KeyEqual>& ca
         });
 }
 
+/// Deserialize into an mm_tiny_lfu cache (overwrites existing contents).
+///
+/// Two-phase: parse_serialized_data() validates the magic, version, mm_type,
+/// header size and CRC and decodes every item BEFORE anything is mutated, so
+/// a truncated or mismatched payload throws with the cache untouched. The
+/// previous single-phase implementation called cache.flush() before it had
+/// even read the MM config, so a payload that failed part-way through the
+/// restore left the cache emptied and half-filled, with no rollback and no
+/// way for the caller to tell how far it had got.
 template <typename Key, typename Value, typename Hash, typename KeyEqual>
 void deserialize(mm_tiny_lfu<Key, Value, Hash, KeyEqual>& cache,
                  std::span<const uint8_t> data) {
-    detail::deserialize_impl(cache, mm_type_id::tiny_lfu, data,
-        [&](detail::binary_reader& r, uint32_t item_count,
-            serialized_mm_config& cfg) {
-            using ser_item = serialized_item<Key, Value>;
-
-            // Restore config including cms_error_rate
-            auto new_cfg = cache.config();
-            new_cfg.lru_refresh_ratio = cfg.lru_refresh_ratio;
-            new_cfg.cms_error_rate = cfg.cms_error_rate;
-            new_cfg.try_lock_update = cfg.try_lock_update;
-            new_cfg.default_lru_refresh_time = cfg.lru_refresh_time;
-            cache.set_config(new_cfg);
-
-            // S3: 恢复 CountMinSketch 状态
-            {
-                auto cms_words = r.read<uint32_t>();
-                if (cms_words > 1'000'000) {  // ~4MB upper bound for CMS data
-                    throw std::runtime_error("deserialization: cms_words exceeds reasonable limit");
-                }
-                std::vector<uint32_t> cms_buf(cms_words);
-                for (uint32_t i = 0; i < cms_words; ++i) {
-                    cms_buf[i] = r.read<uint32_t>();
-                }
-                auto it = cms_buf.begin();
-                cache.sketch_mut().load_state(it);
-            }
-
-            std::vector<ser_item> items;
-            items.reserve(item_count);
-            for (uint32_t i = 0; i < item_count; ++i) {
-                ser_item item;
-                item.read(r);
-                items.push_back(std::move(item));
-            }
-            cache.rebuild_from_serialized(items.begin(), items.end());
-        });
+    auto parsed = detail::parse_serialized_data<Key, Value>(mm_type_id::tiny_lfu, data);
+    detail::rebuild_from_parsed(cache, parsed);
 }
 
 // ============================================================================
@@ -1171,7 +1168,12 @@ std::vector<uint8_t> serialize(const mm_wtiny_lfu<Key, Value, Hash, KeyEqual>& c
             const auto& c = cache.config();
             cfg.lru_refresh_time = cache.refresh_time();
             cfg.lru_refresh_ratio = c.lru_refresh_ratio;
-            cfg.cms_error_rate = c.cms_error_rate;
+            // P1-25: the serialized config stores 32-bit values; the MM config
+            // uses size_t. Convert explicitly (the values are small parameters,
+            // never near 2^32).
+            cfg.cms_window_multiplier = static_cast<uint32_t>(c.cms_window_multiplier);
+            cfg.cms_error_threshold = c.cms_error_threshold;
+            cfg.cms_hash_count = static_cast<uint32_t>(c.cms_hash_count);
             cfg.try_lock_update = c.try_lock_update;
         },
         [&](detail::binary_writer& w) {
@@ -1184,45 +1186,20 @@ std::vector<uint8_t> serialize(const mm_wtiny_lfu<Key, Value, Hash, KeyEqual>& c
         });
 }
 
+/// Deserialize into an mm_wtiny_lfu cache (overwrites existing contents).
+///
+/// Two-phase: parse_serialized_data() validates the magic, version, mm_type,
+/// header size and CRC and decodes every item BEFORE anything is mutated, so
+/// a truncated or mismatched payload throws with the cache untouched. The
+/// previous single-phase implementation called cache.flush() before it had
+/// even read the MM config, so a payload that failed part-way through the
+/// restore left the cache emptied and half-filled, with no rollback and no
+/// way for the caller to tell how far it had got.
 template <typename Key, typename Value, typename Hash, typename KeyEqual>
 void deserialize(mm_wtiny_lfu<Key, Value, Hash, KeyEqual>& cache,
                  std::span<const uint8_t> data) {
-    detail::deserialize_impl(cache, mm_type_id::w_tiny_lfu, data,
-        [&](detail::binary_reader& r, uint32_t item_count,
-            serialized_mm_config& cfg) {
-            using ser_item = serialized_item<Key, Value>;
-
-            // Restore config including cms_error_rate
-            auto new_cfg = cache.config();
-            new_cfg.lru_refresh_ratio = cfg.lru_refresh_ratio;
-            new_cfg.cms_error_rate = cfg.cms_error_rate;
-            new_cfg.try_lock_update = cfg.try_lock_update;
-            new_cfg.default_lru_refresh_time = cfg.lru_refresh_time;
-            cache.set_config(new_cfg);
-
-            // S3: 恢复 CountMinSketch 状态
-            {
-                auto cms_words = r.read<uint32_t>();
-                if (cms_words > 1'000'000) {  // ~4MB upper bound for CMS data
-                    throw std::runtime_error("deserialization: cms_words exceeds reasonable limit");
-                }
-                std::vector<uint32_t> cms_buf(cms_words);
-                for (uint32_t i = 0; i < cms_words; ++i) {
-                    cms_buf[i] = r.read<uint32_t>();
-                }
-                auto it = cms_buf.begin();
-                cache.sketch_mut().load_state(it);
-            }
-
-            std::vector<ser_item> items;
-            items.reserve(item_count);
-            for (uint32_t i = 0; i < item_count; ++i) {
-                ser_item item;
-                item.read(r);
-                items.push_back(std::move(item));
-            }
-            cache.rebuild_from_serialized(items.begin(), items.end());
-        });
+    auto parsed = detail::parse_serialized_data<Key, Value>(mm_type_id::w_tiny_lfu, data);
+    detail::rebuild_from_parsed(cache, parsed);
 }
 
 // ============================================================================

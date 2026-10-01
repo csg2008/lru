@@ -1,4 +1,4 @@
-# LRU Cache Library v4.0.0
+# LRU Cache Library v1.0.0
 
 A high-performance, feature-rich LRU cache implementation for C++20, inspired by Facebook's CacheLib architecture.
 
@@ -502,9 +502,18 @@ bool ok2 = c.cas(key, [](const V& cur) { return cur == expected; }, desired);
 
 ### 可观测性
 
+> **延迟埋点默认关闭。** 每个 `get()`/`set()` 的 `scope_latency_timer` 要付两次
+> `steady_clock::now()` 加一次直方图更新；在命中为主的负载上实测占单次操作延迟的
+> **+68%**（约 90ns），所以默认不开。需要 P50/P95/P99 时先调用
+> `c.set_latency_tracking(true)`，否则分位数恒为 0。
+> `set_slow_query_callback()` / `set_trace_callback()` 会自动开启它——这两个回调
+> 依赖测量出的延迟，不会静默失效。
+> `set_latency_sample_rate(rate)` 能降低直方图本身的原子开销，但**两次读时钟是每次
+> 操作都要付的**，采样不能替代关闭。
+
 ```cpp
 auto stats = c.stats_snapshot();
-// 延迟分位（纳秒）
+// 延迟分位（纳秒）—— 需先 set_latency_tracking(true)
 stats.get_latency.percentile(0.99);  // P99 get 延迟
 stats.set_latency.percentile(0.99);  // P99 set 延迟
 // 活跃 handle 数、TLS ring 积压

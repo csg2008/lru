@@ -34,6 +34,10 @@ endif()
 lru_add_internal_executable(lru_cache_test
     test_cache.cpp
     test_cache_stats.cpp
+    # P0 regression: API-surface instantiation. Keeps P0-1 (striped-alias
+    # constructibility on GCC) and P0-2 (formerly uncompilable public API
+    # methods) from silently regressing.
+    test_api_surface.cpp
     test_compact_cache.cpp
     test_lfu_cache.cpp
     test_safe_cache.cpp
@@ -42,6 +46,10 @@ lru_add_internal_executable(lru_cache_test
     test_eviction.cpp
     test_stress.cpp
     test_slab_memory.cpp
+    # spec/fix.01.md §3.3 (P1-13 … P1-18): slab allocator + memory monitor
+    # regression tests (ABA tag, wrong-size deallocation, NUMA owner routing,
+    # gauge accounting, hard memory cap, per-class live/peak/failure counters).
+    test_memory_p1.cpp
     test_hazptr.cpp
     test_production_api.cpp
     test_production_metrics.cpp
@@ -84,6 +92,23 @@ lru_add_internal_executable(lru_cache_test
     test_ttl_lazy_delete.cpp
     test_async_callback_reject_policy.cpp
     test_pooled_cache.cpp
+    # fix.01 §3.4/§3.5 regression batch (P1-19 … P1-44): single admission gate,
+    # record_access guards, replace_node coherence, W-TinyLFU window/main swap,
+    # strict capacity, eviction-cursor LRU order, pop_lru accounting, TTL.
+    test_mm_p1.cpp
+    # fix.01 §3.1/§3.2 regression batch: reclamation, seqlock and background
+    # worker contracts (P1-1, P1-4, P1-7, P1-9 … P1-12, P1-35, P1-36, P1-39).
+    test_reclaim_p1.cpp
+    # fix.01 §3.4 regression batch: CountMinSketch sizing from capacity and
+    # whole-table decay with a geometrically shrinking window (P1-25, P1-26).
+    test_cms_p1.cpp
+    # fix.01 §3.5 regression batch: the strategy-agnostic TTL expiry index used
+    # by P1-31 (detail::ttl_heap) — sweep/budget/stale/pinned-deferral contracts.
+    test_ttl_heap_p1.cpp
+    # fix.01 §3.4/§3.6 completion batch: item-level TTL for EVERY eviction
+    # strategy with a single O(log n) sweep path (P1-31), and the 2Q A1out ghost
+    # queue (P1-28).
+    test_mm_2q_ghost_p1.cpp
 )
 target_link_libraries(lru_cache_test PRIVATE GTest::gtest_main)
 

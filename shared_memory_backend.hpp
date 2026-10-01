@@ -514,15 +514,27 @@ private:
 // T5.1: cross_process_mutex
 // ----------------------------------------------------------------------------
 //
-// A kernel-level named mutex that survives process crashes. Used to
-// serialize save()/attach() across processes that share the same
-// shared-memory segment.
+// A kernel-level named mutex used to serialize save()/attach() across
+// processes that share the same shared-memory segment.
 //
-//   - Windows: CreateMutexA / OpenMutexA (kernel object, auto-released
-//              on process exit by the OS).
-//   - POSIX:   named POSIX semaphore (sem_open with O_CREAT). Named
-//              semaphores are kernel-persistent on Linux and survive
-//              process crashes; the last `sem_unlink` removes them.
+//   - Windows: CreateMutexA / OpenMutexA. A kernel mutex object is
+//              released by the OS when its owner dies, and the next
+//              waiter gets WAIT_ABANDONED, so this is genuinely
+//              crash-safe.
+//   - POSIX:   named POSIX semaphore (sem_open with O_CREAT). This is
+//              NOT crash-safe. A name semaphore's count is kernel
+//              state, not owner state: if a process dies while holding
+//              it the count stays at 0 forever and every later
+//              sem_wait() blocks indefinitely, with no timeout and no
+//              way to recover short of deleting /dev/shm/sem.* by hand.
+//
+// The two platforms are therefore NOT equivalent, and callers must not
+// assume the POSIX path can absorb a crash. attach() uses a bounded wait
+// for exactly this reason — see kCrossProcessLockTimeout. The robust
+// fix on POSIX is a process-shared pthread mutex with
+// PTHREAD_MUTEX_ROBUST (EOWNERDEAD + pthread_mutex_consistent) in a
+// small mmap'd region; that is a larger change than this file's
+// structure currently supports and is not implemented.
 //
 // The mutex name is derived from the shared-memory segment name by
 // appending a "_lock" suffix, so callers don't need to invent a
@@ -836,9 +848,15 @@ public:
         if (!segment_) return;  // Segment creation/opening failed
 
         if (segment_.is_newly_created()) {
-            // Fresh segment — initialize the header
+            // Fresh segment — initialize the header.
+            // P0-3: `header` has default member initializers, so it is a
+            // non-trivial type and std::memset on it trips -Wclass-memaccess
+            // (and is only conditionally well-defined). The struct is exactly
+            // 128 bytes with no padding (see the static_assert below it), so
+            // value initialisation covers the whole header region and
+            // establishes the same defaults.
             auto* hdr = header_ptr();
-            std::memset(hdr, 0, sizeof(header));
+            *hdr = header{};
             hdr->magic = kMagic;
             hdr->version = kVersion;
             hdr->item_count = 0;
@@ -882,10 +900,22 @@ public:
     ///
     /// Example:
     ///   cache.attach([&](const K& k, const V& v) { primary_cache.set(k, v); });
+    /// Upper bound on the cross-process lock acquired by attach().
+    ///
+    /// attach() used to pass a negative timeout, i.e. block forever. On
+    /// Windows that is safe (an abandoned kernel mutex is granted
+    /// immediately). On POSIX it is not: a process that died while holding
+    /// the semaphore leaves it permanently at 0, so attach() hung the whole
+    /// process with no diagnostic and no recovery path. Failing after a
+    /// bounded wait turns an unrecoverable hang into a clear error the
+    /// operator can act on. 30s is far longer than any legitimate
+    /// save()/attach() critical section.
+    static constexpr std::chrono::seconds kCrossProcessLockTimeout{30};
+
     template <typename Inserter>
     std::size_t attach(Inserter&& inserter) {
         return attach_with_timeout(
-            std::chrono::seconds(-1),  // negative = block forever
+            kCrossProcessLockTimeout,
             std::forward<Inserter>(inserter));
     }
 
@@ -898,15 +928,31 @@ public:
         Inserter&& inserter) {
         if (!has_previous_data_) return 0;
 
-        // T5.2: try to acquire the cross-process mutex.
-        // Negative timeout = block forever (matches attach()).
+        // Acquire the cross-process mutex. A negative timeout blocks
+        // forever; attach() deliberately does not use that (see
+        // kCrossProcessLockTimeout) because on POSIX the underlying
+        // primitive is not crash-safe.
         bool acquired = false;
         if (timeout.count() < 0) {
             mutex_.lock();
             acquired = true;
         } else {
             acquired = mutex_.lock(timeout);
-            if (!acquired) return 0;  // timeout
+            if (!acquired) {
+                // Give the operator the one piece of information that makes
+                // this recoverable: on POSIX the lock is a named semaphore,
+                // so a crashed holder leaves it at 0 permanently and no
+                // amount of retrying will help.
+                std::fprintf(stderr,
+                    "[shared_memory_backend] attach() could not acquire the "
+                    "cross-process lock within the timeout — returning 0 "
+                    "without reading any items. On POSIX this lock is a "
+                    "named semaphore, which is NOT released if its holder "
+                    "crashed; if no writer process is alive, remove the "
+                    "stale '/dev/shm/sem.*_lock' object and retry.\n");
+                std::fflush(stderr);
+                return 0;  // timeout
+            }
         }
         // RAII release — std::lock_guard works because cross_process_mutex
         // exposes lock()/unlock().

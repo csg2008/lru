@@ -147,10 +147,14 @@ TEST(ConcurrentEdgeExtras, StripedLockHashDistribution) {
         if (max_size > 0) {
             // Imbalance < 50% — for 5000 keys across 16 shards, ~312 per shard.
             // 50% is generous; hash distribution should be much tighter.
-            double expected = static_cast<double>(kKeys) / info.num_shards;
+            // P0-3: both operands of the division must be double, otherwise the
+            // size_t operand is converted implicitly (-Wimplicit-int-float-conversion).
+            double expected =
+                static_cast<double>(kKeys) / static_cast<double>(info.num_shards);
             (void)expected;
             // Sanity: max_size should not be larger than 2x the average.
-            double avg = static_cast<double>(total) / info.per_shard_size.size();
+            double avg = static_cast<double>(total) /
+                         static_cast<double>(info.per_shard_size.size());
             EXPECT_LE(max_size, 2.0 * avg)
                 << "severe shard imbalance: max=" << max_size
                 << " avg=" << avg;
@@ -201,9 +205,9 @@ TEST(ConcurrentEdgeExtras, DeferPromotionToggleUnderLoad) {
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = rng() % 500;
+                int key = lru_test::rng_int(rng) % 500;
                 auto h = c.try_get(key);
                 if (h) reads.fetch_add(1, std::memory_order_relaxed);
             }

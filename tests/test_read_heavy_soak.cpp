@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -58,8 +59,17 @@ inline std::size_t sample_rss_bytes() {
     HMODULE psapi = ::LoadLibraryW(L"psapi.dll");
     if (!psapi) return 0;
     using GetProcessMemoryInfo_t = BOOL(WINAPI*)(HANDLE, void*, DWORD);
-    auto fn = reinterpret_cast<GetProcessMemoryInfo_t>(
-        ::GetProcAddress(psapi, "GetProcessMemoryInfo"));
+    // P0-3: GetProcAddress returns FARPROC (int(*)()), an incompatible
+    // function-pointer type; launder the address through memcpy rather than a
+    // function-pointer cast, which trips GCC's -Wcast-function-type (and, for
+    // the two-step void(*)() form, Clang's -Wcast-function-type-strict).
+    GetProcessMemoryInfo_t fn = nullptr;
+    {
+        FARPROC raw = ::GetProcAddress(psapi, "GetProcessMemoryInfo");
+        static_assert(sizeof(fn) == sizeof(raw),
+                      "resolved signature must fit GetProcAddress's result");
+        std::memcpy(&fn, &raw, sizeof(fn));
+    }
     if (!fn) {
         ::FreeLibrary(psapi);
         return 0;
@@ -166,9 +176,9 @@ RssSeries run_read_heavy_soak(CacheT& c, int key_space, int num_threads,
     // TLS rings, hazptr TLS slots, and the drain worker. This ensures the
     // baseline reflects steady-state, not cold-start.
     {
-        std::mt19937 rng(12345);
+        auto rng = lru_test::seed_rng(12345);
         for (int i = 0; i < 2000; ++i) {
-            int key = static_cast<int>(rng() % key_space);
+            int key = static_cast<int>(lru_test::rng_int(rng) % key_space);
             if (i % 20 == 0) {
                 c.set(key, key * 10);
             } else {
@@ -187,10 +197,10 @@ RssSeries run_read_heavy_soak(CacheT& c, int key_space, int num_threads,
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(static_cast<unsigned>(t * 7919 + 1));
+            auto rng = lru_test::seed_rng(static_cast<unsigned>(t * 7919 + 1));
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = static_cast<int>(rng() % key_space);
-                if (rng() % 100 < 5) {
+                int key = static_cast<int>(lru_test::rng_int(rng) % key_space);
+                if (lru_test::rng_int(rng) % 100 < 5) {
                     // 5% writes
                     c.set(key, key * 10);
                 } else {

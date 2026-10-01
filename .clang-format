@@ -1,0 +1,59 @@
+# clang-format configuration for the lru cache library.
+#
+# Style notes:
+#   - 4-space indent, 100-column limit, braces attached to the preceding line.
+#   - Construction of the style follows the code that is already here rather
+#     than the other way round. The tree is NOT yet fully formatted; run
+#     `clang-format -i` on files you touch rather than reformatting the whole
+#     library in one commit (an 80k-line whitespace diff is unreviewable).
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+Standard: c++20
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+ColumnLimit: 100
+
+# Access specifiers are outdented by one level (class { public: ... }).
+AccessModifierOffset: -4
+
+# Braces attach to the preceding line; functions are also attached.
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Constructor initializer lists are one-per-line with a LEADING comma, which
+# is the convention used throughout this codebase.
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+BreakConstructorInitializers: BeforeComma
+PackConstructorInitializers: Never
+
+# Template declarations: keep `template <...>` on its own line, as in the
+# existing headers.
+AlwaysBreakTemplateDeclarations: Yes
+
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+AlignAfterOpenBracket: Align
+AlignOperands: Align
+BinPackArguments: true
+BinPackParameters: true
+AllowAllParametersOfDeclarationOnNextLine: true
+
+# Include blocks are sorted, but each header keeps its own section so the
+# hand-written "core.hpp first, then subsystems" ordering survives.
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+
+# The codebase predates clang-format and mixes token sequences that the
+# newer style analyses would rewrite wholesale; keep those off so a format
+# run does not silently change code shape.
+FixNamespaceComments: true
+SpaceBeforeParens: ControlStatements
+SpacesBeforeTrailingComments: 2
+ReflowComments: false

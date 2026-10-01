@@ -29,16 +29,20 @@ int main() {
     std::cout << "初始大小: " << prod_cache.size() << "\n";
 
     // 多线程并发读 + 少量写
+    // P0-3 (fix.01 方案 B, type convergence): thread indices are std::size_t so
+    // that they can index the per-thread counter vectors without a
+    // -Wsign-conversion diagnostic; key arithmetic stays int.
+    using thread_index = std::size_t;
     std::vector<std::thread> threads;
-    constexpr int kReaders = 4;
-    constexpr int kWriters = 2;
+    constexpr thread_index kReaders = 4;
+    constexpr thread_index kWriters = 2;
     std::vector<int> read_hits(kReaders, 0);
     std::vector<int> write_count(kWriters, 0);
 
-    for (int t = 0; t < kReaders; ++t) {
+    for (thread_index t = 0; t < kReaders; ++t) {
         threads.emplace_back([&prod_cache, &read_hits, t]() {
             for (int i = 0; i < 2000; ++i) {
-                int key = (i * 7 + t * 13) % 100;
+                int key = (i * 7 + static_cast<int>(t) * 13) % 100;
                 // get() 返回 read_handle<V>，零堆分配，RAII 自动 unpin
                 auto handle = prod_cache.get(key);
                 if (handle) {
@@ -49,10 +53,10 @@ int main() {
         });
     }
 
-    for (int t = 0; t < kWriters; ++t) {
+    for (thread_index t = 0; t < kWriters; ++t) {
         threads.emplace_back([&prod_cache, &write_count, t]() {
             for (int i = 0; i < 100; ++i) {
-                int key = 100 + t * 100 + i;
+                int key = 100 + static_cast<int>(t) * 100 + i;
                 prod_cache.set(key, std::sqrt(static_cast<double>(key)));
                 ++write_count[t];
             }

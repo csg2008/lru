@@ -40,8 +40,12 @@ public:
     // member) must be movable for factory-style helpers and move
     // construction to compile.
     atomic_shared_ptr(atomic_shared_ptr&& other) noexcept
-        : lock_(ATOMIC_FLAG_INIT), ptr_(nullptr)
+        : ptr_(nullptr)
     {
+        // lock_ is default-initialized to the clear state (C++20
+        // std::atomic_flag has a default constructor that does this);
+        // ATOMIC_FLAG_INIT is redundant and warns when used as an
+        // initializer for a scalar member.
         while (other.lock_.test_and_set(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
@@ -103,7 +107,9 @@ public:
     }
 
 private:
-    mutable std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+    // C++20: std::atomic_flag's default constructor initializes it to the
+    // clear state, so no ATOMIC_FLAG_INIT is needed.
+    mutable std::atomic_flag lock_;
     std::shared_ptr<T> ptr_;
 };
 

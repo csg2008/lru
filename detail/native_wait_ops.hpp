@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 
 // ============================================================================
@@ -184,6 +185,27 @@ public:
     }
 
 private:
+    /// Resolve an exported symbol into a typed function pointer.
+    ///
+    /// P0-3: GetProcAddress returns FARPROC (`int(*)()`), whose type is
+    /// incompatible with every real target signature, so a function-pointer
+    /// cast trips GCC's -Wcast-function-type (and, via the two-step
+    /// void(*)() form, Clang's -Wcast-function-type-strict). Launder the address
+    /// through std::memcpy instead — the same technique used for
+    /// pVirtualAllocExNuma in memory.hpp. This replaces the
+    /// `#pragma GCC diagnostic ignored "-Wcast-function-type"` that previously
+    /// suppressed the diagnostic here, so the library no longer needs any
+    /// warning suppression in this file.
+    template <typename Fn>
+    static Fn resolve_export(HMODULE mod, const char* name) noexcept {
+        static_assert(sizeof(Fn) == sizeof(FARPROC),
+                      "resolved signature must fit GetProcAddress's result");
+        Fn fn = nullptr;
+        FARPROC raw = ::GetProcAddress(mod, name);
+        std::memcpy(&fn, &raw, sizeof(fn));
+        return fn;
+    }
+
     static bool probe() {
 #if LRU_NATIVE_HAS_WIN32
         // On Windows, dynamically resolve WaitOnAddress family.
@@ -202,15 +224,11 @@ private:
             if (!mod) mod = LoadLibraryW(name);
             if (!mod) continue;
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcast-function-type"
-            auto pWait = reinterpret_cast<WaitOnAddress_fn>(
-                GetProcAddress(mod, "WaitOnAddress"));
-            auto pWakeOne = reinterpret_cast<WakeByAddressSingle_fn>(
-                GetProcAddress(mod, "WakeByAddressSingle"));
-            auto pWakeAll = reinterpret_cast<WakeByAddressAll_fn>(
-                GetProcAddress(mod, "WakeByAddressAll"));
-#pragma GCC diagnostic pop
+            auto pWait = resolve_export<WaitOnAddress_fn>(mod, "WaitOnAddress");
+            auto pWakeOne =
+                resolve_export<WakeByAddressSingle_fn>(mod, "WakeByAddressSingle");
+            auto pWakeAll =
+                resolve_export<WakeByAddressAll_fn>(mod, "WakeByAddressAll");
 
             if (!pWait || !pWakeOne || !pWakeAll) continue;
 

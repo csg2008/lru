@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -60,6 +61,50 @@
 namespace lru {
 
 // ============================================================================
+// Internal numeric helpers (spec/fix.01.md P1-16 / P1-17)
+// ============================================================================
+//
+// Byte counts travel through two domains in this header: `std::size_t` for
+// gauges/charges and `std::int64_t` for rate-limiter samples and deltas.
+// Every conversion between them is saturating and range-checked here, because
+// the previous code used `static_cast<size_t>(std::abs(delta))`, which turned
+// any negative delta into ~2^64 and invoked undefined behaviour for
+// `std::abs(INT64_MIN)`.
+namespace detail_memory {
+
+/// @return `v` as an int64_t, saturating at INT64_MAX (never negative).
+inline std::int64_t size_to_i64(std::size_t v) noexcept {
+    constexpr auto kMax = static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
+    return v > kMax ? std::numeric_limits<std::int64_t>::max() : static_cast<std::int64_t>(v);
+}
+
+/// @return |delta| as an unsigned magnitude. The two's-complement negation is
+///         performed in the unsigned domain, so this is well defined for
+///         INT64_MIN (whose magnitude is not representable as int64_t) and is
+///         never negative.
+inline std::uint64_t magnitude_u64(std::int64_t delta) noexcept {
+    const auto u = static_cast<std::uint64_t>(delta);
+    return delta < 0 ? (std::uint64_t{0} - u) : u;
+}
+
+/// @return `mag` range-checked into a std::size_t. A magnitude the type cannot
+///         represent saturates at SIZE_MAX instead of wrapping (which is how
+///         the old `static_cast<size_t>(std::abs(delta))` produced ~2^64).
+inline std::size_t magnitude_u64_to_size(std::uint64_t mag) noexcept {
+    constexpr auto kMax = static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
+    return mag > kMax ? std::numeric_limits<std::size_t>::max() : static_cast<std::size_t>(mag);
+}
+
+/// Overflow-safe saturating addition for byte counts.
+inline std::size_t saturating_add(std::size_t a, std::size_t b) noexcept {
+    return b > std::numeric_limits<std::size_t>::max() - a
+             ? std::numeric_limits<std::size_t>::max()
+             : a + b;
+}
+
+} // namespace detail_memory
+
+// ============================================================================
 // Rate Limiter
 // ============================================================================
 
@@ -69,6 +114,13 @@ namespace lru {
 /// Lock-free implementation: add_value() and throttle() use only atomic
 /// operations on a power-of-2 ring buffer, eliminating mutex contention
 /// on the hot path (every insert/evict calls report_memory() → add_value()).
+///
+/// P1-16: the limiter answers the "is the rate too high?" question through
+/// `exceeded()` — an explicit boolean with the correct units (bytes per
+/// sample compared against a bytes-per-sample budget). It deliberately does
+/// *not* expose "compare my throttled delta against the budget", which was the
+/// unit mismatch that used to latch `memory_monitor::growth_rate_exceeded_` on
+/// any positive growth.
 class rate_limiter {
 public:
     /// @param detect_increase  If true, detect rate of increase (memory growth).
@@ -113,6 +165,10 @@ public:
     }
 
     /// Add a new sample to the window. Lock-free.
+    ///
+    /// The sample is an absolute observation (a gauge), not a delta — the rate
+    /// of change is derived from the difference between the newest and oldest
+    /// samples still in the window.
     void add_value(int64_t value) {
         auto pos = head_.fetch_add(1, std::memory_order_acq_rel);
         auto mask = mask_.load(std::memory_order_acquire);
@@ -120,52 +176,55 @@ public:
         count_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    /// P1-16 (2): explicit "is the rate of change above the budget?" verdict.
+    ///
+    /// @param budget_bytes_per_sample  Maximum acceptable growth per sample;
+    ///                                 <= 0 disables the check.
+    /// @return true when the normalized rate of change strictly exceeds
+    ///         `budget_bytes_per_sample`.
+    ///
+    /// This replaces comparing `throttle()`'s throttled delta against a byte
+    /// budget. Those are different quantities (a rate versus a budget), and the
+    /// comparison was always true for positive growth, which latched the
+    /// monitor's throttle flag permanently.
+    bool exceeded(std::int64_t budget_bytes_per_sample) const noexcept {
+        if (budget_bytes_per_sample <= 0) return false;
+        return normalized_rate() > static_cast<double>(budget_bytes_per_sample);
+    }
+
     /// Throttle a proposed change based on current rate of change. Lock-free.
     /// @param delta  The proposed amount to increase (positive) or decrease (negative).
-    /// @return       The throttled delta (may be 0 if fully throttled).
-    size_t throttle(int64_t delta) {
-        auto cnt = count_.load(std::memory_order_acquire);
-        if (cnt < 2) return static_cast<size_t>(std::abs(delta));
+    /// @return       The throttled delta magnitude (may be 0 if fully throttled).
+    ///
+    /// P1-16 (3): the magnitude is computed in the unsigned domain
+    /// (`throttled_magnitude()`) and range-checked by the single narrowing
+    /// conversion below. Nothing calls std::abs(), whose result for INT64_MIN
+    /// is undefined, and no path can turn a negative delta into ~2^64.
+    std::size_t throttle(int64_t delta) const noexcept {
+        return detail_memory::magnitude_u64_to_size(throttled_magnitude(delta));
+    }
 
-        auto h = head_.load(std::memory_order_acquire);
-        auto mask = mask_.load(std::memory_order_acquire);
+    /// P1-16 (3): the throttled delta as a signed-domain magnitude
+    /// (std::uint64_t, so INT64_MIN's 2^63 is representable). Callers that need
+    /// a std::size_t must range-check, as `throttle()` does.
+    std::uint64_t throttled_magnitude(int64_t delta) const noexcept {
+        // Full magnitude of the request; used whenever the rate is not the
+        // limiting factor.
+        const std::uint64_t full = detail_memory::magnitude_u64(delta);
 
-        // Read newest (head-1) and oldest (head-cnt) values from the ring buffer.
-        // These loads are not atomic with respect to head_, but the ring buffer
-        // semantics guarantee that the slots are valid (written to) — the only
-        // race is with concurrent add_value(), which may shift head_ forward.
-        // In the worst case we read slightly stale values, which is acceptable
-        // for a rate estimator.
-        int64_t newest = buffer_[(h - 1) & mask].load(std::memory_order_acquire);
-        int64_t oldest = buffer_[(h - cnt) & mask].load(std::memory_order_acquire);
+        // rate <= 1.0 (or no history) → not rate limited, allow the full delta.
+        const double rate = normalized_rate();
+        if (!(rate > 1.0)) return full;
 
-        int64_t total_change = newest - oldest;
-        double avg_rate = static_cast<double>(total_change) /
-                          static_cast<double>(cnt - 1);
+        // |delta| <= rate → still inside the observed rate, allow it in full.
+        // (NaN-safe: `full` is finite and non-negative.)
+        if (static_cast<double>(full) <= rate) return full;
 
-        // Normalize avg_rate: for detect_increase_, we care about rate in the
-        // "increasing" direction. If detect_increase_==true, positive rate = growth.
-        // If detect_increase_==false, negative rate = decline (the "increasing" direction).
-        double normalized_rate = detect_increase_ ? avg_rate : -avg_rate;
-
-        if (normalized_rate <= 0.0) {
-            // Rate is in the "decreasing" direction or zero — allow full delta
-            return static_cast<size_t>(std::abs(delta));
-        }
-
-        if (normalized_rate < 1.0) {
-            // Rate is very low — allow full delta
-            return static_cast<size_t>(std::abs(delta));
-        }
-
-        // Scale delta proportionally to how much it exceeds the average rate
-        double ratio = std::abs(static_cast<double>(delta) / normalized_rate);
-        if (ratio <= 1.0) {
-            return static_cast<size_t>(std::abs(delta));
-        }
-
-        // Throttle: reduce to the average rate
-        return static_cast<size_t>(normalized_rate);
+        // Throttle down to the observed rate. `rate` is in (1.0, |delta|) here
+        // and `full` fits a uint64_t, so the conversion cannot overflow.
+        const double capped = rate < static_cast<double>(full) ? rate
+                                                              : static_cast<double>(full);
+        return static_cast<std::uint64_t>(capped);
     }
 
     /// Reset all state. Not thread-safe with concurrent add_value().
@@ -180,6 +239,32 @@ public:
     }
 
 private:
+    /// Current normalized rate of change, in units per sample, or 0.0 when the
+    /// window holds fewer than two samples.
+    ///
+    /// The newest (`head - 1`) and oldest (`head - count`) slots are read
+    /// without being atomic with respect to `head_`, but the ring-buffer
+    /// semantics guarantee that both slots were written: the only race is with
+    /// a concurrent add_value() shifting `head_` forward, which yields slightly
+    /// stale values — acceptable for a rate estimator.
+    double normalized_rate() const noexcept {
+        const auto cnt = count_.load(std::memory_order_acquire);
+        if (cnt < 2) return 0.0;
+
+        const auto h = head_.load(std::memory_order_acquire);
+        const auto mask = mask_.load(std::memory_order_acquire);
+        const int64_t newest = buffer_[(h - 1) & mask].load(std::memory_order_acquire);
+        const int64_t oldest = buffer_[(h - cnt) & mask].load(std::memory_order_acquire);
+
+        const int64_t total_change = newest - oldest;
+        const double avg_rate = static_cast<double>(total_change) /
+                                static_cast<double>(cnt - 1);
+
+        // Normalize: for detect_increase_ we care about growth, otherwise about
+        // decline (the "increasing" direction is the negative one).
+        return detect_increase_ ? avg_rate : -avg_rate;
+    }
+
     /// Allocate and zero-initialize the ring buffer for the given capacity.
     /// Capacity must be a power of 2.
     void init_buffer(std::size_t capacity) {
@@ -646,6 +731,7 @@ public:
     memory_monitor(memory_monitor&& other) noexcept
         : config_(std::move(other.config_))
         , current_memory_(other.current_memory_.load(std::memory_order_relaxed))
+        , reserved_bytes_(other.reserved_bytes_.load(std::memory_order_relaxed))
         , growth_rate_exceeded_(other.growth_rate_exceeded_.load(std::memory_order_relaxed))
         , is_throttled_(other.is_throttled_.load(std::memory_order_relaxed))
         , bg_eviction_requested_(other.bg_eviction_requested_.load(std::memory_order_relaxed))
@@ -660,6 +746,7 @@ public:
         if (this != &other) {
             config_ = std::move(other.config_);
             current_memory_.store(other.current_memory_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            reserved_bytes_.store(other.reserved_bytes_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             growth_rate_exceeded_.store(other.growth_rate_exceeded_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             is_throttled_.store(other.is_throttled_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             bg_eviction_requested_.store(other.bg_eviction_requested_.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -773,6 +860,17 @@ public:
     ///   throttled — admit, set throttle flag, set background eviction flag
     ///   critical  — reject with probability proportional to how far above
     ///               critical threshold; set throttle + background eviction flags
+    ///
+    /// P1-17: every admitting path now also has to pass the hard byte cap
+    /// (`current_memory_ + reserved_bytes_ + delta_bytes <= max_memory_bytes`).
+    /// The cap used to be purely advisory: `should_admit()` read
+    /// `current_memory_` once and returned, so N threads could all pass and then
+    /// each commit, overshooting the configured ceiling by N-1 items.
+    ///
+    /// `should_admit()` itself does not *hold* a reservation (callers are not
+    /// obliged to return one), so for an atomic reservation use `memory_guard`,
+    /// whose constructor reserves via CAS and whose destructor returns the
+    /// reservation when the insertion does not happen.
     bool should_admit(std::size_t delta_bytes = 0) {
         // -----------------------------------------------------------------
         // Tier 1: Application-provided pressure callback takes precedence.
@@ -820,7 +918,8 @@ public:
                 bg_eviction_requested_.store(true, std::memory_order_release);
                 track_pressure(pressure_level::critical);
                 // 0.1% admit probability under OS-level critical pressure.
-                return accept_with_probability(0.001);
+                // P1-17: even the probabilistic path must respect the hard cap.
+                return accept_with_probability(0.001) && memory_budget_allows(delta_bytes);
             }
             if (snap && snap->level == os_pressure_level::warning) {
                 is_throttled_.store(true, std::memory_order_release);
@@ -846,7 +945,14 @@ public:
             return true; // unlimited internal budget
         }
 
-        double fraction = static_cast<double>(mem + delta_bytes) / static_cast<double>(max);
+        // P1-17: the pressure model sees in-flight reservations too, so a burst
+        // of concurrent writers that already reserved their bytes cannot each
+        // individually observe a "mostly empty" cache and all be admitted.
+        // Saturating add: the projected footprint must not wrap.
+        const auto reserved = reserved_bytes_.load(std::memory_order_acquire);
+        const auto projected = detail_memory::saturating_add(
+            mem, detail_memory::saturating_add(reserved, delta_bytes));
+        double fraction = static_cast<double>(projected) / static_cast<double>(max);
         auto crit_frac = config_.critical_fraction.load(std::memory_order_relaxed);
         auto throttle_frac = config_.throttle_fraction.load(std::memory_order_relaxed);
         auto crit_wm = config_.critical_watermark_fraction.load(std::memory_order_relaxed);
@@ -881,7 +987,7 @@ public:
             // For effective_crit=0.90: peak ≈ 0.0025 (0.25%), effectively
             // rejecting nearly all insertions.
             double accept_prob = 4.0 * overflow * (1.0 - overflow) * (1.0 - effective_crit) * (1.0 - effective_crit);
-            return accept_with_probability(accept_prob);
+            return accept_with_probability(accept_prob) && memory_budget_allows(delta_bytes);
         }
 
         // Throttled: admit but signal throttle + background eviction
@@ -889,7 +995,7 @@ public:
             is_throttled_.store(true, std::memory_order_release);
             bg_eviction_requested_.store(true, std::memory_order_release);
             track_pressure(pressure_level::throttled);
-            return true;
+            return memory_budget_allows(delta_bytes);
         }
 
         // Rate-based throttling: admit but signal throttle (accelerate eviction)
@@ -898,14 +1004,14 @@ public:
             is_throttled_.store(true, std::memory_order_release);
             bg_eviction_requested_.store(true, std::memory_order_release);
             track_pressure(pressure_level::throttled);
-            return true;
+            return memory_budget_allows(delta_bytes);
         }
 
         // Normal: clear throttle + background eviction flags
         is_throttled_.store(false, std::memory_order_release);
         bg_eviction_requested_.store(false, std::memory_order_release);
         track_pressure(pressure_level::normal);
-        return true;
+        return memory_budget_allows(delta_bytes);
     }
 
     /// Whether the monitor is in a throttled state, signalling that
@@ -973,25 +1079,35 @@ public:
     // Reporting
     // --------------------------------------------------------------------
 
-    /// Report the current memory usage (call periodically, e.g., after each insert/evict).
+    /// Report the current memory usage as an absolute gauge.
     /// @param current_memory_bytes  Total memory used by the cache right now.
+    ///
+    /// P1-16 (1): `report_memory()` is a *pure gauge* update. It stores the
+    /// authoritative absolute value and does not participate in delta
+    /// accounting — `report_insert()`/`report_evict()` own the increments — so
+    /// the mixed pattern used by the cache layer and by `memory_guard`
+    /// (`report_insert(x); report_memory(total); report_evict(y)`) can no
+    /// longer double-count: the gauge is always overwritten with the truth,
+    /// while the deltas move it between gauge reports.
+    ///
+    /// The sample is also fed to the growth-rate limiter, and the latched
+    /// `growth_rate_exceeded_` flag is refreshed from the limiter's explicit
+    /// `exceeded()` verdict (P1-16 (2)) — a rate is compared against a rate
+    /// budget, not against a throttled delta.
     void report_memory(std::size_t current_memory_bytes) {
         current_memory_.store(current_memory_bytes, std::memory_order_release);
 
-        // Feed into rate limiter
-        growth_limiter_.add_value(static_cast<int64_t>(current_memory_bytes));
+        // Feed the gauge into the rate limiter. The conversion saturates: a
+        // byte count that does not fit int64_t must not wrap negative.
+        growth_limiter_.add_value(detail_memory::size_to_i64(current_memory_bytes));
 
-        // Check if growth rate exceeds threshold
-        if (config_.max_growth_rate_bytes.load(std::memory_order_relaxed) > 0) {
-            auto throttled_delta = growth_limiter_.throttle(
-                static_cast<int64_t>(config_.max_growth_rate_bytes.load(std::memory_order_relaxed)));
-            growth_rate_exceeded_.store(
-                throttled_delta < config_.max_growth_rate_bytes.load(std::memory_order_relaxed),
-                std::memory_order_release);
-        }
+        refresh_growth_rate_flag();
     }
 
     /// Report a successful insertion of `delta_bytes`.
+    ///
+    /// P1-16 (1): deltas are the only thing this touches. `report_memory()`
+    /// remains the absolute gauge, so a caller may interleave both freely.
     void report_insert(std::size_t delta_bytes) {
         current_memory_.fetch_add(delta_bytes, std::memory_order_release);
     }
@@ -1002,12 +1118,75 @@ public:
     }
 
     // --------------------------------------------------------------------
+    // Hard memory cap (P1-17)
+    // --------------------------------------------------------------------
+
+    /// Atomically reserve `delta_bytes` against the hard cap.
+    ///
+    /// This is what turns `max_memory_bytes` from a threshold into a limit:
+    /// the CAS serializes concurrent writers on
+    /// `current_memory_ + reserved_bytes_ + delta <= max_memory_bytes`, so N
+    /// threads can no longer all pass admission and each commit. The caller
+    /// owns the reservation and must return it with `release_reservation()`
+    /// (the `memory_guard` destructor does this automatically).
+    ///
+    /// @return true if the reservation was taken; false if it does not fit.
+    bool try_reserve(std::size_t delta_bytes) {
+        const auto max = config_.max_memory_bytes.load(std::memory_order_relaxed);
+        if (max == 0) {
+            // Unlimited budget: nothing can be exceeded, but the reservation is
+            // still accounted so that release_reservation() stays symmetric and
+            // the `reserved_bytes()` gauge remains truthful if a budget is
+            // configured later.
+            reserved_bytes_.fetch_add(delta_bytes, std::memory_order_acq_rel);
+            return true;
+        }
+
+        // Bounded retry: `commit()` moves bytes from reserved to committed
+        // without changing their sum, but a concurrent raw
+        // report_insert()/report_memory() can invalidate the pre-check.
+        for (int attempt = 0; attempt < kReserveAttempts; ++attempt) {
+            const auto committed = current_memory_.load(std::memory_order_acquire);
+            std::size_t reserved = reserved_bytes_.load(std::memory_order_acquire);
+            // Overflow-safe: both operands of each subtraction are <= max.
+            if (committed >= max || delta_bytes > max - committed) return false;
+            if (reserved > max - committed - delta_bytes) return false;
+            if (reserved_bytes_.compare_exchange_weak(
+                    reserved, reserved + delta_bytes,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                // Re-validate against fresh values. The reservation itself is
+                // inclusive in `r2`, so this checks the true projected total.
+                const auto c2 = current_memory_.load(std::memory_order_acquire);
+                const auto r2 = reserved_bytes_.load(std::memory_order_acquire);
+                if (c2 <= max && r2 <= max - c2) return true;
+                // Lost the race against a raw report — give the bytes back.
+                reserved_bytes_.fetch_sub(delta_bytes, std::memory_order_acq_rel);
+            }
+        }
+        return false;
+    }
+
+    /// Return a reservation taken by `try_reserve()`.
+    void release_reservation(std::size_t delta_bytes) noexcept {
+        if (delta_bytes == 0) return;
+        reserved_bytes_.fetch_sub(delta_bytes, std::memory_order_acq_rel);
+    }
+
+    /// Bytes currently reserved by in-flight `memory_guard` instances.
+    std::size_t reserved_bytes() const noexcept {
+        return reserved_bytes_.load(std::memory_order_acquire);
+    }
+
+    // --------------------------------------------------------------------
     // Statistics
     // --------------------------------------------------------------------
 
     struct stats {
         std::size_t current_memory_bytes = 0;
         std::size_t max_memory_bytes = 0;
+        /// P1-17: bytes held by in-flight reservations (memory_guard instances
+        /// that have been admitted but have not committed or been destroyed).
+        std::size_t reserved_memory_bytes = 0;
         double occupancy_fraction = 0.0;
         double growth_rate_bytes_per_sample = 0.0;
         state current_state = state::normal;
@@ -1021,6 +1200,7 @@ public:
         stats s;
         s.current_memory_bytes = current_memory_.load(std::memory_order_acquire);
         s.max_memory_bytes = config_.max_memory_bytes.load(std::memory_order_relaxed);
+        s.reserved_memory_bytes = reserved_bytes_.load(std::memory_order_acquire);
         if (s.max_memory_bytes > 0) {
             s.occupancy_fraction = static_cast<double>(s.current_memory_bytes) /
                                    static_cast<double>(s.max_memory_bytes);
@@ -1051,6 +1231,10 @@ public:
 
     void reset() {
         current_memory_.store(0, std::memory_order_release);
+        // P1-17: drop any in-flight reservation. Callers holding a
+        // memory_guard across a reset must not expect their reservation to
+        // survive (documented: reset() invalidates outstanding guards).
+        reserved_bytes_.store(0, std::memory_order_release);
         growth_rate_exceeded_.store(false, std::memory_order_release);
         is_throttled_.store(false, std::memory_order_release);
         bg_eviction_requested_.store(false, std::memory_order_release);
@@ -1097,6 +1281,33 @@ public:
     }
 
 private:
+    /// P1-17: hard-cap gate.
+    ///
+    /// @return true when `delta_bytes` still fits after the committed gauge and
+    ///         every in-flight reservation. This is the check that makes
+    ///         `max_memory_bytes` a ceiling rather than a hint; it is a plain
+    ///         comparison (advisory across threads) — `try_reserve()` performs
+    ///         the atomic version.
+    bool memory_budget_allows(std::size_t delta_bytes) const noexcept {
+        const auto max = config_.max_memory_bytes.load(std::memory_order_relaxed);
+        if (max == 0) return true;
+        const auto committed = current_memory_.load(std::memory_order_acquire);
+        if (committed >= max) return false;
+        const auto reserved = reserved_bytes_.load(std::memory_order_acquire);
+        if (reserved > max - committed) return false;
+        return delta_bytes <= max - committed - reserved;
+    }
+
+    /// P1-16 (2): refresh the latched growth-rate flag from the limiter's
+    /// explicit verdict. Kept as a latch (rather than querying the limiter on
+    /// every admission) so that `current_state()` stays a single atomic read.
+    void refresh_growth_rate_flag() noexcept {
+        const auto budget = config_.max_growth_rate_bytes.load(std::memory_order_relaxed);
+        const bool over = budget > 0 &&
+            growth_limiter_.exceeded(detail_memory::size_to_i64(budget));
+        growth_rate_exceeded_.store(over, std::memory_order_release);
+    }
+
     /// Accept with a given probability (0.0 = never, 1.0 = always).
     /// Uses xoshiro128** PRNG — better statistical quality than LCG with
     /// comparable speed. Each thread gets its own state (no contention).
@@ -1157,6 +1368,9 @@ private:
 
     config config_;
     std::atomic<std::size_t> current_memory_{0};
+    /// P1-17: bytes reserved by in-flight `memory_guard` instances. Enforced
+    /// together with `current_memory_` in `try_reserve()`/`memory_budget_allows()`.
+    std::atomic<std::size_t> reserved_bytes_{0};
     std::atomic<bool> growth_rate_exceeded_{false};
     std::atomic<bool> is_throttled_{false};
     std::atomic<bool> bg_eviction_requested_{false};
@@ -1165,6 +1379,12 @@ private:
     std::atomic<std::size_t> pressure_critical_count_{0};
     // low_watermark_fraction reserved for future hysteresis implementation
     rate_limiter growth_limiter_;
+
+    /// P1-17: bounded retry budget for `try_reserve()`'s CAS. A reservation
+    /// only fails to converge when raw (non-reserved) reports keep changing
+    /// `current_memory_` concurrently; giving up and rejecting is the safe
+    /// outcome, so the loop is deliberately bounded.
+    static constexpr int kReserveAttempts = 8;
 
     // P0-4: Application-provided pressure callback + OS memory sampler.
     //
@@ -1185,23 +1405,46 @@ private:
 // ============================================================================
 
 /// RAII guard for a throttled insertion attempt.
-/// On construction, checks if insertion should be allowed.
-/// On successful commit(), the memory is accounted for.
-/// On destruction without commit(), the attempt is discarded.
+///
+/// On construction the guard asks the monitor for admission and then takes an
+/// atomic (CAS) reservation against the hard byte cap. On successful
+/// `commit()` the insertion is accounted for; on destruction without
+/// commit() the reservation is returned.
+///
+/// P1-17: the guard is what makes `max_memory_bytes` a *hard* limit. N
+/// concurrent writers can no longer all pass admission and then each commit,
+/// overshooting the ceiling by N-1 items: each writer holds its bytes from
+/// construction until it commits or is destroyed, and the reservation fails
+/// once the budget is gone.
+///
+/// Usage:
+///   lru::memory_guard guard(cache.monitor(), item_bytes);
+///   if (guard) { insert(); guard.commit(); }
 class memory_guard {
 public:
     memory_guard(memory_monitor& monitor, std::size_t delta_bytes)
         : monitor_(&monitor)
         , delta_bytes_(delta_bytes)
-        , admitted_(monitor.should_admit(delta_bytes)) {}
+        , admitted_(monitor.should_admit(delta_bytes)) {
+        if (admitted_) {
+            // P1-17: reserve the bytes. `should_admit()` is a snapshot check;
+            // the reservation is the atomic one, so losing this race rejects
+            // the insertion instead of silently oversubscribing the cap.
+            admitted_ = monitor_->try_reserve(delta_bytes_);
+        }
+    }
 
     memory_guard(memory_guard&& other) noexcept
         : monitor_(other.monitor_)
         , delta_bytes_(other.delta_bytes_)
         , admitted_(other.admitted_)
         , committed_(other.committed_) {
+        // The reservation moves with the guard: the moved-from object is
+        // neutered so it neither reports itself as admitting the insert nor
+        // returns bytes it no longer owns.
         other.monitor_ = nullptr;
-        other.committed_ = true; // prevent double-commit
+        other.admitted_ = false;
+        other.committed_ = true; // prevent double-commit / double-release
     }
 
     memory_guard& operator=(memory_guard&&) = delete;
@@ -1210,8 +1453,9 @@ public:
 
     ~memory_guard() {
         if (admitted_ && !committed_ && monitor_) {
-            // Rollback: the insert was allowed but didn't happen
-            // Nothing to do — we only account on commit
+            // Rollback: the insert was admitted but never happened. The
+            // reservation taken in the constructor is returned here.
+            monitor_->release_reservation(delta_bytes_);
         }
     }
 
@@ -1219,10 +1463,14 @@ public:
     explicit operator bool() const noexcept { return admitted_; }
     bool admitted() const noexcept { return admitted_; }
 
-    /// Commit the insertion — the memory is now accounted for.
+    /// Commit the insertion — the reservation becomes committed accounting.
     void commit() {
         if (admitted_ && !committed_ && monitor_) {
+            // Order matters: grow the committed gauge first, then drop the
+            // reservation. The intermediate state is conservative (the total
+            // is momentarily too high), never optimistic.
             monitor_->report_insert(delta_bytes_);
+            monitor_->release_reservation(delta_bytes_);
             committed_ = true;
         }
     }
@@ -1584,6 +1832,27 @@ private:
 // Allocation Class (lock-free free list per power-of-2 size class)
 // ============================================================================
 
+/// P1-18: why a slab allocation failed. Exposed (rather than logged) so an
+/// operator can attribute an OOM to a size class and a cause — the previous
+/// code returned a silent nullptr and left nothing to look at.
+enum class slab_alloc_failure : std::uint8_t {
+    none = 0,                 ///< No failure recorded yet
+    max_slabs_reached = 1,    ///< The per-class slab limit blocked a new slab
+    os_allocation_failed = 2, ///< The OS/heap refused a slab or a large block
+    slab_exhausted = 3,       ///< A slab was added but the class is still empty
+};
+
+/// P1-14: why a deallocation was refused. A refused deallocation is counted,
+/// reported once on stderr, and the block is deliberately leaked — leaking one
+/// block is strictly better than handing it to the wrong size class (or to
+/// `::operator delete`) and corrupting the heap.
+enum class slab_dealloc_reject : std::uint8_t {
+    none = 0,                 ///< No rejection recorded yet
+    unknown_block = 1,        ///< Block magic mismatch: not from this allocator
+    size_class_mismatch = 2,  ///< The claimed size does not fit the block
+    corrupt_header = 3,       ///< The header records an out-of-range class
+};
+
 /// A single size class within the slab allocator.
 /// Manages an ABA-safe lock-free free list (Treiber stack with tagged pointer)
 /// for blocks of a fixed size.
@@ -1598,17 +1867,66 @@ private:
 /// Requires cmpxchg16b support (x86-64 v2 baseline, available on all modern
 /// x86-64 CPUs since ~2006). Compile with -mcx16 on GCC/Clang. MSVC emits
 /// cmpxchg16b by default on x86-64.
+///
+/// P1-14 / P1-15: every block is preceded by a 16-byte `block_header` holding
+/// a magic, the size class that owns it, its payload capacity and the NUMA
+/// node of the owning allocator. The payload handed to the caller starts after
+/// the header, so:
+///   * `slab_allocator::deallocate(ptr, size)` can prove that `ptr` really is
+///     a slab block and reject a size that does not fit it (instead of pushing
+///     it onto the wrong free list or calling `::operator delete` on slab
+///     memory), and
+///   * `numa_aware_slab_allocator` can return the block to the node that
+///     allocated it rather than to the calling thread's node.
+/// The header costs 16 bytes per block and keeps the payload aligned to 16
+/// bytes (class blocks are at least 64-byte aligned).
 class allocation_class {
 public:
+    /// Sentinel class index recorded in the header of blocks that were not
+    /// carved from a slab (requests larger than `kMaxClassSize` fall back to
+    /// the global heap). Deliberately larger than every real class index.
+    static constexpr std::uint16_t kLargeClassIndex = 0xFFFF;
+
+    /// Bytes reserved in front of every payload for the block header.
+    static constexpr std::uint32_t kBlockHeaderSize = 16;
+
+    /// Magic stored in every block header; verifying it is how `deallocate()`
+    /// distinguishes a block of this allocator from a foreign pointer.
+    static constexpr std::uint64_t kBlockMagic = 0x4C5255534C414230ULL; // "LRUSLAB0"
+
+    /// Per-block header, stored immediately before the payload returned by
+    /// `allocate()`. Exactly 16 bytes, and 16-byte aligned, so it neither
+    /// grows the per-block overhead beyond one word nor reduces the payload
+    /// alignment below `max_align_t`.
+    struct alignas(16) block_header {
+        std::uint64_t magic = kBlockMagic;  ///< Provenance marker
+        std::uint32_t capacity = 0;         ///< Usable payload bytes
+        std::uint16_t class_index = 0;      ///< Size class, or kLargeClassIndex
+        std::int16_t owner_node = -1;       ///< Owning NUMA node (-1 = none)
+    };
+    static_assert(sizeof(block_header) == kBlockHeaderSize,
+                  "block_header layout changed — update kBlockHeaderSize");
+    static_assert(alignof(block_header) == kBlockHeaderSize,
+                  "block_header must keep the payload 16-byte aligned");
+
+    /// @param class_index  Index of this class within slab_allocator::classes_
+    ///                     (recorded in every block header).
     /// @param class_size   Power-of-2 block size (e.g., 64, 128, 256, …)
     /// @param slab_size    Size of a single slab in bytes (default 64 KiB)
+    /// @param owner_node   NUMA node recorded in every block header
+    ///                     (-1 = allocator is not NUMA-bound).
     ///
-    /// T-P2-10: slab_size is now stored per-class so that each size class
+    /// T-P2-10: slab_size is stored per class so that each size class
     /// can have a different slab granularity (e.g., larger slabs for the
-    /// 64-byte class to amortise the per-sab overhead, smaller slabs for
+    /// 64-byte class to amortise the per-slab overhead, smaller slabs for
     /// the 65536-byte class to reduce wasted memory).
-    explicit allocation_class(uint32_t class_size, uint32_t slab_size = 65536) noexcept
-        : class_size_(class_size)
+    explicit allocation_class(std::uint32_t class_index,
+                              std::uint32_t class_size,
+                              std::uint32_t slab_size = 65536,
+                              int owner_node = -1) noexcept
+        : class_index_(static_cast<std::uint16_t>(class_index))
+        , owner_node_(static_cast<std::int16_t>(owner_node))
+        , class_size_(class_size)
         , slab_size_(slab_size)
         , items_per_slab_(slab_size / class_size) {
         // 一次性提示：16 字节原子非编译期锁自由时（如 MSYS2 MinGW GCC），
@@ -1628,11 +1946,18 @@ public:
     }
 
     allocation_class(allocation_class&& other) noexcept
-        : class_size_(other.class_size_)
+        : class_index_(other.class_index_)
+        , owner_node_(other.owner_node_)
+        , class_size_(other.class_size_)
         , slab_size_(other.slab_size_)
         , items_per_slab_(other.items_per_slab_)
         , num_slabs_(other.num_slabs_)
         , free_count_(other.free_count_.load(std::memory_order_relaxed))
+        , alloc_ops_(other.alloc_ops_.load(std::memory_order_relaxed))
+        , free_ops_(other.free_ops_.load(std::memory_order_relaxed))
+        , peak_bytes_(other.peak_bytes_.load(std::memory_order_relaxed))
+        , alloc_failures_(other.alloc_failures_.load(std::memory_order_relaxed))
+        , last_failure_reason_(other.last_failure_reason_.load(std::memory_order_relaxed))
         , free_list_(other.free_list_.load(std::memory_order_relaxed)) {
         other.free_list_.store(tagged_ptr{}, std::memory_order_relaxed);
         other.num_slabs_ = 0;
@@ -1644,21 +1969,30 @@ public:
     allocation_class& operator=(allocation_class&&) = delete;
 
     /// Lock-free allocate with ABA-safe tagged pointer.
-    /// @return Pointer to a free block, or nullptr if the free list is exhausted.
+    /// @return Pointer to a free payload, or nullptr if the free list is empty.
     void* allocate() noexcept {
         tagged_ptr expected = free_list_.load(std::memory_order_acquire);
         while (expected.ptr != 0) {
-            node* head = reinterpret_cast<node*>(expected.ptr);
+            auto* head = reinterpret_cast<node*>(expected.ptr);
             node* next = head->next.load(std::memory_order_acquire);
             tagged_ptr desired;
-            if (next) {
-                desired.ptr = reinterpret_cast<uint64_t>(next);
-                desired.tag = expected.tag + 1;
-            }
-            // When next is nullptr (last element), desired remains {0, 0} (empty).
+            desired.ptr = (next != nullptr) ? reinterpret_cast<uint64_t>(next) : 0;
+            // P1-13: advance the ABA tag *even when this pop empties the list*.
+            //
+            // The previous code left `desired` at its default {ptr=0, tag=0} in
+            // the `next == nullptr` branch, discarding the tag it had just
+            // loaded from `expected`. The stack → empty transition is by far
+            // the most common one, and with the tag reset to 0 the empty state
+            // became indistinguishable from every earlier empty state: two
+            // threads could both CAS a stale {0, 0} snapshot successfully and
+            // each be handed the same last block. The tag exists precisely to
+            // make each state unique, so the empty state gets the next tag too
+            // — exactly like the non-empty branch and `push_free()` below.
+            desired.tag = expected.tag + 1;
             if (free_list_.compare_exchange_weak(expected, desired,
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
                 free_count_.fetch_sub(1, std::memory_order_relaxed);
+                note_allocation();
                 return head;
             }
             // CAS failed — expected is updated with current value, retry
@@ -1666,8 +2000,159 @@ public:
         return nullptr;
     }
 
-    /// Lock-free deallocate with ABA-safe tagged pointer.
+    /// Return a payload to the free list.
+    ///
+    /// Trusted path: the caller has already established that `ptr` belongs to
+    /// this class (either it came straight out of `allocate()`, or
+    /// `slab_allocator::deallocate()` validated the block header).
     void deallocate(void* ptr) noexcept {
+        // P1-18: account the free *before* publishing the block back onto the
+        // free list. Ordering it this way means a concurrent snapshot can only
+        // ever under-count live bytes (the block is already counted as free
+        // while it is being pushed), never claim more live memory than was
+        // actually handed out.
+        free_ops_.fetch_add(1, std::memory_order_relaxed);
+        push_free(ptr);
+    }
+
+    /// Populate the free list by carving a slab into class-sized blocks, and
+    /// write the block header of every block.
+    void add_slab(void* slab_memory) noexcept {
+        auto* base = static_cast<char*>(slab_memory);
+        const std::uint32_t capacity = payload_capacity();
+        for (std::uint32_t i = 0; i < items_per_slab_; ++i) {
+            char* block = base + static_cast<std::size_t>(i) * class_size_;
+            void* payload = block + kBlockHeaderSize;
+            write_header(payload, class_index_, owner_node_, capacity);
+            // Carving is not an allocation: the blocks were never handed out,
+            // so this must not move the live/peak counters.
+            push_free(payload);
+        }
+        ++num_slabs_;
+    }
+
+    /// Write the block header in front of `payload`.
+    static void write_header(void* payload, std::uint16_t cls, std::int16_t node,
+                             std::uint32_t capacity) noexcept {
+        auto* hdr = block_header_of(payload);
+        hdr->magic = kBlockMagic;
+        hdr->capacity = capacity;
+        hdr->class_index = cls;
+        hdr->owner_node = node;
+    }
+
+    /// The block header that precedes `payload`.
+    static block_header* block_header_of(void* payload) noexcept {
+        return static_cast<block_header*>(payload) - 1;
+    }
+    static const block_header* block_header_of(const void* payload) noexcept {
+        return static_cast<const block_header*>(payload) - 1;
+    }
+
+    // -- Accessors --
+
+    std::uint32_t class_size() const noexcept { return class_size_; }
+    /// T-P2-10: Return the per-class slab size in bytes.
+    std::uint32_t slab_size() const noexcept { return slab_size_; }
+    std::uint32_t items_per_slab() const noexcept { return items_per_slab_; }
+    /// Usable payload bytes per block (block size minus the block header).
+    std::uint32_t payload_capacity() const noexcept {
+        return class_size_ - kBlockHeaderSize;
+    }
+    /// Index of this class in the owning slab_allocator's class table.
+    std::uint16_t class_index() const noexcept { return class_index_; }
+    /// NUMA node recorded in the headers of blocks carved here (-1 = none).
+    std::int16_t owner_node() const noexcept { return owner_node_; }
+    /// Number of slabs ever carved for this class. Note this only ever grows:
+    /// slabs are never returned, so it is a high-water mark rather than a
+    /// live count. (The `release_slab()` decrement that used to exist here
+    /// had no callers and was removed rather than left as dead code that
+    /// implied a matching release path.)
+    std::uint32_t num_slabs() const noexcept { return num_slabs_; }
+    std::uint32_t free_count() const noexcept { return free_count_.load(std::memory_order_relaxed); }
+
+    /// P1-13: current ABA tag of the free list. Exposed so regression tests can
+    /// prove the tag advances, including on the stack → empty transition that
+    /// used to reset it to zero.
+    std::uint32_t free_list_tag() const noexcept {
+        return free_list_.load(std::memory_order_acquire).tag;
+    }
+
+    // -- P1-18: live/peak/failure accounting --
+
+    /// P1-18: one consistent read of this class's monotonic counters.
+    ///
+    /// Reading the counters once (instead of once per accessor) is what makes
+    /// the live block/byte figures in a snapshot agree with each other: two
+    /// separate reads can straddle a concurrent update and produce a pair that
+    /// no single instant ever observed.
+    struct allocation_counters {
+        std::uint64_t allocations = 0;   ///< Monotonic successful allocations
+        std::uint64_t frees = 0;         ///< Monotonic deallocations
+        std::uint64_t peak_bytes = 0;    ///< High-water mark of live bytes
+        std::uint64_t alloc_failures = 0;
+        slab_alloc_failure last_failure_reason = slab_alloc_failure::none;
+    };
+
+    /// Live blocks implied by a counter snapshot: (allocations − frees),
+    /// clamped at zero.
+    static std::uint64_t live_blocks_of(const allocation_counters& c) noexcept {
+        return c.allocations > c.frees ? c.allocations - c.frees : 0;
+    }
+
+    /// P1-18: take a counter snapshot for this class.
+    allocation_counters counters() const noexcept {
+        allocation_counters c;
+        c.allocations = alloc_ops_.load(std::memory_order_relaxed);
+        c.frees = free_ops_.load(std::memory_order_relaxed);
+        c.peak_bytes = peak_bytes_.load(std::memory_order_relaxed);
+        c.alloc_failures = alloc_failures_.load(std::memory_order_relaxed);
+        c.last_failure_reason =
+            static_cast<slab_alloc_failure>(last_failure_reason_.load(std::memory_order_relaxed));
+        return c;
+    }
+
+    /// Monotonic count of successful allocations (blocks handed to callers).
+    std::uint64_t total_allocations() const noexcept {
+        return alloc_ops_.load(std::memory_order_relaxed);
+    }
+    /// Monotonic count of blocks returned through `deallocate()`.
+    std::uint64_t total_frees() const noexcept {
+        return free_ops_.load(std::memory_order_relaxed);
+    }
+    /// Live blocks, derived as (allocations − frees). Derived rather than
+    /// stored so a concurrent snapshot can never go negative: the two counters
+    /// are read independently and the difference is clamped at zero.
+    std::uint64_t live_blocks() const noexcept {
+        return live_blocks_of(counters());
+    }
+    /// Live payload bytes: live blocks × class size (includes the per-block
+    /// header, since that memory is reserved by this class all the same).
+    std::uint64_t live_bytes() const noexcept {
+        return live_blocks() * static_cast<std::uint64_t>(class_size_);
+    }
+    /// High-water mark of `live_bytes()`.
+    std::uint64_t peak_bytes() const noexcept {
+        return peak_bytes_.load(std::memory_order_relaxed);
+    }
+    /// Number of failed allocations attributed to this class.
+    std::uint64_t alloc_failures() const noexcept {
+        return alloc_failures_.load(std::memory_order_relaxed);
+    }
+    /// Most recent failure reason recorded for this class.
+    slab_alloc_failure last_failure_reason() const noexcept {
+        return static_cast<slab_alloc_failure>(last_failure_reason_.load(std::memory_order_relaxed));
+    }
+    /// Record a failed allocation for this class (called by slab_allocator).
+    void note_alloc_failure(slab_alloc_failure reason) noexcept {
+        alloc_failures_.fetch_add(1, std::memory_order_relaxed);
+        last_failure_reason_.store(static_cast<std::uint8_t>(reason), std::memory_order_relaxed);
+    }
+
+private:
+    /// Push a payload onto the Treiber stack without touching the live/peak
+    /// counters (used for carving).
+    void push_free(void* ptr) noexcept {
         auto* node_ptr = static_cast<node*>(ptr);
         tagged_ptr expected = free_list_.load(std::memory_order_acquire);
         tagged_ptr desired;
@@ -1681,29 +2166,22 @@ public:
         free_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    /// Populate the free list by carving a slab into class-sized blocks.
-    void add_slab(void* slab_memory) noexcept {
-        auto* ptr = static_cast<char*>(slab_memory);
-        for (uint32_t i = 0; i < items_per_slab_; ++i) {
-            deallocate(ptr + i * class_size_);
+    /// P1-18: bump the monotonic allocation counter and the peak high-water
+    /// mark. Called on the successful-pop path only.
+    void note_allocation() noexcept {
+        const auto allocs = alloc_ops_.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto frees = free_ops_.load(std::memory_order_relaxed);
+        const std::uint64_t live = allocs > frees ? allocs - frees : 0;
+        const std::uint64_t live_bytes = live * static_cast<std::uint64_t>(class_size_);
+        std::uint64_t peak = peak_bytes_.load(std::memory_order_relaxed);
+        while (live_bytes > peak &&
+               !peak_bytes_.compare_exchange_weak(peak, live_bytes,
+                   std::memory_order_relaxed, std::memory_order_relaxed)) {
+            // `peak` is refreshed by the failing CAS; loop until the stored
+            // high-water mark is at least `live_bytes`.
         }
-        ++num_slabs_;
     }
 
-    // -- Accessors --
-
-    uint32_t class_size() const noexcept { return class_size_; }
-    /// T-P2-10: Return the per-class slab size in bytes.
-    uint32_t slab_size() const noexcept { return slab_size_; }
-    uint32_t items_per_slab() const noexcept { return items_per_slab_; }
-    uint32_t num_slabs() const noexcept { return num_slabs_; }
-    uint32_t free_count() const noexcept { return free_count_.load(std::memory_order_relaxed); }
-    bool empty() const noexcept { return free_list_.load(std::memory_order_acquire).ptr == 0; }
-
-    /// Decrement slab count after a slab has been transferred out.
-    void release_slab() noexcept { --num_slabs_; }
-
-private:
     /// Intrusive link stored at the head of each free block.
     /// Because every free block is at least class_size_ bytes (≥ 64),
     /// there is always room for a single pointer.
@@ -1721,12 +2199,22 @@ private:
     };
     static_assert(sizeof(tagged_ptr) == 16, "tagged_ptr must be 16 bytes");
 
-    uint32_t class_size_;
+    /// Class index (recorded in the block header).
+    std::uint16_t class_index_;
+    /// NUMA node recorded in the block header (-1 = not NUMA-bound).
+    std::int16_t owner_node_;
+    std::uint32_t class_size_;
     /// T-P2-10: Per-class slab size (bytes per slab for this class).
-    uint32_t slab_size_;
-    uint32_t items_per_slab_;
-    uint32_t num_slabs_{0};
+    std::uint32_t slab_size_;
+    std::uint32_t items_per_slab_;
+    std::uint32_t num_slabs_{0};
     std::atomic<uint32_t> free_count_{0};
+    // P1-18: monotonic allocation/free counters and the failure attribution.
+    std::atomic<std::uint64_t> alloc_ops_{0};
+    std::atomic<std::uint64_t> free_ops_{0};
+    std::atomic<std::uint64_t> peak_bytes_{0};
+    std::atomic<std::uint64_t> alloc_failures_{0};
+    std::atomic<std::uint8_t> last_failure_reason_{0};
     std::atomic<tagged_ptr> free_list_{};  ///< 128-bit tagged pointer + ABA counter
     // P2-H: 16-byte atomics should be lock-free (cmpxchg16b) for the free-list
     // Treiber stack to scale under contention. Compile with -mcx16 on GCC/Clang
@@ -1772,6 +2260,11 @@ static_assert(sizeof(shared_memory_header) == 88,
 // Slab Allocator (size-class based, lock-free fast path)
 // ============================================================================
 
+/// P1-14 方案 C: owning RAII handle for a slab block. Declared here so that
+/// `slab_allocator::allocate_owned()` can return it by value; defined after
+/// `slab_allocator` is complete.
+class slab_ptr;
+
 /// Multi-size-class slab allocator inspired by Facebook CacheLib.
 ///
 /// Allocation fast path (per-class Treiber stack) is lock-free.
@@ -1784,7 +2277,15 @@ static_assert(sizeof(shared_memory_header) == 88,
 ///
 /// Size classes: 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
 ///               32768, 65536  (11 classes)
-/// Requests larger than 65536 bytes fall back to ::operator new/delete.
+/// Requests that do not fit a class once the 16-byte block header is accounted
+/// for fall back to the global heap (`allocate_large()`).
+///
+/// P1-14: every block carries a 16-byte header (magic + class + capacity +
+/// owner NUMA node) in front of the payload, so `deallocate()` validates the
+/// caller's size instead of trusting it. The RAII handle `slab_ptr` is the
+/// preferred interface for new code because it has no size parameter at all.
+/// P1-18: per-class live/peak bytes and allocation-failure counters, plus a
+/// global failure/rejection tally, are exposed through `snapshot()`.
 class slab_allocator {
 public:
     /// Configuration for the slab allocator.
@@ -1878,6 +2379,7 @@ public:
 
     explicit slab_allocator(const config& cfg)
         : config_(cfg)
+        , owner_node_(static_cast<std::int16_t>(cfg.numa_node))
     {
         // T-P2-10: Initialize per-class slab sizes and max-slabs from config.
         // If per_class_slab_sizes[i] == 0, fall back to the default slab_size.
@@ -1894,9 +2396,11 @@ public:
 
         // Initialise allocation classes: 64, 128, 256, …, 65536
         // T-P2-10: each class gets its own slab_size.
+        // P1-14/P1-15: each class also records its index and the NUMA node of
+        // this allocator in every block header it carves.
         uint32_t cs = kMinClassSize;
         for (uint32_t i = 0; i < kNumClasses; ++i) {
-            classes_.emplace_back(cs, slab_sizes_[i]);
+            classes_.emplace_back(i, cs, slab_sizes_[i], cfg.numa_node);
             cs <<= 1;
         }
 
@@ -1952,13 +2456,19 @@ public:
     // ----------------------------------------------------------------
 
     /// Allocate a block of at least `size` bytes.
-    /// Uses the appropriate size class; falls back to ::operator new for
-    /// sizes larger than the maximum class.
+    /// Uses the appropriate size class; falls back to the global heap for
+    /// requests that cannot fit a class once the 16-byte block header is
+    /// accounted for.
+    ///
+    /// P1-14: the returned pointer is preceded by a block header, so
+    /// `deallocate()` never has to trust a caller-supplied size.
+    /// P1-18: failures are counted and attributed (per class + global) instead
+    /// of silently returning nullptr.
     void* allocate(std::size_t size) {
-        if (size > kMaxClassSize) {
-            return ::operator new(size);
+        const std::uint32_t idx = class_index_for_payload(size);
+        if (idx == allocation_class::kLargeClassIndex) {
+            return allocate_large(size);
         }
-        uint32_t idx = class_index_for(static_cast<uint32_t>(size));
         // Fast path: lock-free pop from the per-class free list
         if (void* ptr = classes_[idx].allocate()) {
             return ptr;
@@ -1972,21 +2482,125 @@ public:
             if (void* ptr = classes_[idx].allocate()) {
                 return ptr;
             }
-            add_slab_to_class(idx);
-            return classes_[idx].allocate();
+            if (classes_[idx].num_slabs() >=
+                max_slabs_per_class_[idx].load(std::memory_order_relaxed)) {
+                // P1-18: the per-class slab budget is exhausted. This is the
+                // OOM attribution point that did not exist before.
+                note_alloc_failure(idx, slab_alloc_failure::max_slabs_reached);
+                return nullptr;
+            }
+            try {
+                add_slab_to_class(idx);
+            } catch (...) {
+                // The OS refused a new slab (or an aligned allocation).
+                // Count it, then preserve the historical throwing behaviour.
+                note_alloc_failure(idx, slab_alloc_failure::os_allocation_failed);
+                throw;
+            }
+            void* ptr = classes_[idx].allocate();
+            if (!ptr) {
+                note_alloc_failure(idx, slab_alloc_failure::slab_exhausted);
+            }
+            return ptr;
         }
     }
 
     /// Deallocate a block previously returned by `allocate(size)`.
-    /// The `size` parameter must match the size passed to allocate.
+    ///
+    /// P1-14: the `size` parameter is **not trusted**. The block header in
+    /// front of the payload records the class and capacity that `allocate()`
+    /// actually used, and the caller's claim is cross-checked against it. A
+    /// claim that cannot fit the block — the corruption case, where slab memory
+    /// used to be handed to `::operator delete`, or pushed onto a smaller
+    /// class's free list — is rejected and counted instead of corrupting the
+    /// heap. A claim that fits (including the exact size) is routed by the
+    /// *recorded* class, never by the claimed one.
+    ///
+    /// Callers that cannot supply a trustworthy size must use the size-free
+    /// path `deallocate_block()` (or the `slab_ptr` RAII handle).
     void deallocate(void* ptr, std::size_t size) noexcept {
         if (!ptr) return;
-        if (size > kMaxClassSize) {
-            ::operator delete(ptr);
+        const auto* hdr = allocation_class::block_header_of(ptr);
+        if (hdr->magic != allocation_class::kBlockMagic) {
+            note_dealloc_reject(slab_dealloc_reject::unknown_block);
             return;
         }
-        uint32_t idx = class_index_for(static_cast<uint32_t>(size));
-        classes_[idx].deallocate(ptr);
+        // The claim must be consistent with the block that actually owns the
+        // pointer. Slab blocks accept any claim that fits them; large blocks
+        // (global heap) accept only another oversized claim, because a
+        // slab-sized claim on a large block means the caller mixed up two
+        // pointers.
+        const auto claimed = class_index_for_payload(size);
+        const auto recorded = static_cast<std::uint32_t>(hdr->class_index);
+        const bool claim_fits = recorded >= kNumClasses
+            ? claimed == static_cast<std::uint32_t>(allocation_class::kLargeClassIndex)
+            : claimed <= recorded;
+        if (!claim_fits) {
+            note_dealloc_reject(slab_dealloc_reject::size_class_mismatch);
+            return;
+        }
+        free_by_header(hdr, ptr);
+    }
+
+    /// P1-14 (方案 C): size-free deallocation.
+    ///
+    /// This is the safe path the RAII handle (`slab_ptr`) uses: the block
+    /// header is authoritative, so there is no size for a caller to get wrong.
+    /// A pointer whose header magic does not match is rejected and counted; the
+    /// block is deliberately leaked rather than handed to the wrong
+    /// deallocator.
+    void deallocate_block(void* ptr) noexcept {
+        if (!ptr) return;
+        const auto* hdr = allocation_class::block_header_of(ptr);
+        if (hdr->magic != allocation_class::kBlockMagic) {
+            note_dealloc_reject(slab_dealloc_reject::unknown_block);
+            return;
+        }
+        free_by_header(hdr, ptr);
+    }
+
+    /// P1-14 方案 C: allocate and return an owning RAII handle. The handle
+    /// remembers the allocator and the block, so release cannot be given a
+    /// wrong size — there is no size parameter at all.
+    slab_ptr allocate_owned(std::size_t size);
+
+    // ----------------------------------------------------------------
+    // Block header introspection (P1-14 / P1-15)
+    // ----------------------------------------------------------------
+
+    /// P1-15: the NUMA node recorded for `ptr`'s block, or -1 when the block
+    /// was not produced by a slab allocator (magic mismatch).
+    ///
+    /// Precondition: `ptr` is nullptr, was returned by `allocate()` /
+    /// `allocate_owned()`, or points into memory that the caller owns (so that
+    /// reading the 16 bytes in front of it is itself safe).
+    static int owner_node_of(const void* ptr) noexcept {
+        if (!ptr) return -1;
+        const auto* hdr = allocation_class::block_header_of(ptr);
+        if (hdr->magic != allocation_class::kBlockMagic) return -1;
+        return static_cast<int>(hdr->owner_node);
+    }
+
+    /// P1-14: usable payload capacity of the block that owns `ptr`
+    /// (0 when the block magic does not match).
+    static std::size_t block_capacity(const void* ptr) noexcept {
+        if (!ptr) return 0;
+        const auto* hdr = allocation_class::block_header_of(ptr);
+        if (hdr->magic != allocation_class::kBlockMagic) return 0;
+        return hdr->capacity;
+    }
+
+    /// P1-14: the size class that would serve a request for `size` payload
+    /// bytes, or `allocation_class::kLargeClassIndex` when the request (plus
+    /// the block header) does not fit the largest class.
+    ///
+    /// Both `allocate()` and `deallocate()` use this, which is what makes the
+    /// size cross-check meaningful.
+    static std::uint32_t class_index_for_payload(std::size_t size) noexcept {
+        const auto needed = detail_memory::saturating_add(
+            size, static_cast<std::size_t>(allocation_class::kBlockHeaderSize));
+        if (needed > kMaxClassSize) return allocation_class::kLargeClassIndex;
+        return class_index_for(static_cast<std::uint32_t>(needed));
     }
 
     // ----------------------------------------------------------------
@@ -2047,10 +2661,37 @@ public:
 
     /// Per-class utilization statistics used by the slab rebalancer.
     struct allocation_class_stats {
-        uint32_t class_size;
-        uint32_t num_slabs;
-        uint32_t items_per_slab;
-        double utilization;  // allocated / total capacity
+        std::uint32_t class_size;
+        std::uint32_t num_slabs;
+        std::uint32_t items_per_slab;
+        /// Live blocks / total capacity, clamped to [0, 1]. P1-18: derived
+        /// from monotonic counters and clamped, because the previous
+        /// `1 - free_count/capacity` mixed two independently-read values and
+        /// could therefore report a negative utilization or one above 1.
+        double utilization;
+        // ---- P1-18 additions ----
+        std::uint64_t live_blocks = 0;
+        std::uint64_t live_bytes = 0;
+        std::uint64_t peak_bytes = 0;
+        std::uint64_t total_allocations = 0;
+        std::uint64_t total_frees = 0;
+        std::uint64_t alloc_failures = 0;
+        slab_alloc_failure last_failure_reason = slab_alloc_failure::none;
+    };
+
+    /// P1-18: one stable view of the allocator (per-class counters plus the
+    /// global failure/rejection tally).
+    struct stats_snapshot {
+        std::uint64_t alloc_failures_total = 0;
+        slab_alloc_failure last_failure_reason = slab_alloc_failure::none;
+        /// Index of the class of the most recent failure; kNumClasses when the
+        /// failure belonged to the large (> kMaxClassSize) path.
+        std::uint32_t last_failure_class = 0;
+        std::uint64_t dealloc_rejects_total = 0;
+        slab_dealloc_reject last_reject_reason = slab_dealloc_reject::none;
+        std::uint64_t live_bytes_total = 0;
+        std::uint64_t peak_bytes_total = 0;
+        std::vector<allocation_class_stats> classes;
     };
 
     /// Get per-class utilization statistics.
@@ -2059,21 +2700,143 @@ public:
         result.reserve(kNumClasses);
         for (uint32_t i = 0; i < kNumClasses; ++i) {
             const auto& cls = classes_[i];
+            // P1-18: derive every live/peak figure from ONE counter read so the
+            // snapshot is internally consistent (a live-byte count that does not
+            // equal live_blocks * class_size is worse than no metric at all).
+            const auto ctr = cls.counters();
             allocation_class_stats cs{};
             cs.class_size = cls.class_size();
             cs.num_slabs = cls.num_slabs();
             cs.items_per_slab = cls.items_per_slab();
-            uint32_t total_capacity = cs.num_slabs * cs.items_per_slab;
-            uint32_t free_cnt = cls.free_count();
-            cs.utilization = (total_capacity > 0)
-                ? 1.0 - static_cast<double>(free_cnt) / static_cast<double>(total_capacity)
+            cs.total_allocations = ctr.allocations;
+            cs.total_frees = ctr.frees;
+            cs.live_blocks = allocation_class::live_blocks_of(ctr);
+            cs.live_bytes = cs.live_blocks * static_cast<std::uint64_t>(cs.class_size);
+            cs.peak_bytes = ctr.peak_bytes;
+            cs.alloc_failures = ctr.alloc_failures;
+            cs.last_failure_reason = ctr.last_failure_reason;
+            const auto total_capacity =
+                static_cast<std::uint64_t>(cs.num_slabs) * cs.items_per_slab;
+            // P1-18: clamp. `num_slabs` and `live_blocks` are read at different
+            // instants, so the raw ratio can transiently leave [0, 1] while
+            // another thread grows the class. A utilization outside [0, 1] is
+            // worse than useless as an operator signal.
+            const double raw = total_capacity > 0
+                ? static_cast<double>(cs.live_blocks) / static_cast<double>(total_capacity)
                 : 0.0;
+            cs.utilization = std::clamp(raw, 0.0, 1.0);
             result.push_back(cs);
         }
         return result;
     }
 
+    /// P1-18: take a stable snapshot of the allocator's counters.
+    ///
+    /// This is the single call an operator/diagnostic should use: per-class
+    /// live/peak/failure data plus the global failure and rejection tallies,
+    /// without racing a per-class loop against concurrent slab growth.
+    stats_snapshot snapshot() const {
+        stats_snapshot s;
+        s.alloc_failures_total = alloc_failures_total_.load(std::memory_order_relaxed);
+        s.last_failure_reason =
+            static_cast<slab_alloc_failure>(last_failure_reason_.load(std::memory_order_relaxed));
+        s.last_failure_class = last_failure_class_.load(std::memory_order_relaxed);
+        s.dealloc_rejects_total = dealloc_rejects_total_.load(std::memory_order_relaxed);
+        s.last_reject_reason =
+            static_cast<slab_dealloc_reject>(last_reject_reason_.load(std::memory_order_relaxed));
+        s.classes = get_stats();
+        for (const auto& cs : s.classes) {
+            s.live_bytes_total += cs.live_bytes;
+            s.peak_bytes_total += cs.peak_bytes;
+        }
+        return s;
+    }
+
+    /// P1-18: total number of failed allocations (all classes + large path).
+    std::uint64_t alloc_failures_total() const noexcept {
+        return alloc_failures_total_.load(std::memory_order_relaxed);
+    }
+
+    /// P1-14: total number of rejected deallocations (wrong size or foreign
+    /// pointer). A non-zero value means a caller is misusing the allocator —
+    /// memory was leaked rather than corrupted, and a message was printed once.
+    std::uint64_t dealloc_rejects_total() const noexcept {
+        return dealloc_rejects_total_.load(std::memory_order_relaxed);
+    }
+
 private:
+    /// P1-14: allocate an oversized block from the global heap, with the same
+    /// block header as a slab block so that `deallocate()` can prove
+    /// provenance and validate the claimed size before calling
+    /// `::operator delete`.
+    ///
+    /// The payload starts `kBlockHeaderSize` bytes in, which preserves the
+    /// 16-byte alignment that `::operator new` provides (the previous code
+    /// returned the raw global-heap pointer, i.e. the same alignment).
+    void* allocate_large(std::size_t size) {
+        const auto bytes = detail_memory::saturating_add(
+            size, static_cast<std::size_t>(allocation_class::kBlockHeaderSize));
+        void* base = nullptr;
+        try {
+            base = ::operator new(bytes);
+        } catch (...) {
+            // kNumClasses is the "not a size class" marker for the tally.
+            note_alloc_failure(kNumClasses, slab_alloc_failure::os_allocation_failed);
+            throw;
+        }
+        auto* hdr = static_cast<allocation_class::block_header*>(base);
+        hdr->magic = allocation_class::kBlockMagic;
+        hdr->capacity = (size > std::numeric_limits<std::uint32_t>::max())
+            ? std::numeric_limits<std::uint32_t>::max()
+            : static_cast<std::uint32_t>(size);
+        hdr->class_index = allocation_class::kLargeClassIndex;
+        // P1-15: record this allocator's node even for global-heap blocks, so
+        // owner-based routing in numa_aware_slab_allocator stays uniform.
+        hdr->owner_node = owner_node_;
+        return static_cast<char*>(base) + allocation_class::kBlockHeaderSize;
+    }
+
+    /// Release a block that has already been validated (correct magic) using
+    /// the class recorded in its header — never the caller's claim.
+    void free_by_header(const allocation_class::block_header* hdr, void* ptr) noexcept {
+        if (static_cast<std::uint32_t>(hdr->class_index) >= kNumClasses) {
+            // kLargeClassIndex: came from allocate_large().
+            ::operator delete(const_cast<allocation_class::block_header*>(hdr));
+            return;
+        }
+        classes_[hdr->class_index].deallocate(ptr);
+    }
+
+    /// P1-18: record a failed allocation, per class and globally.
+    /// @param class_idx  Failing size class, or kNumClasses for the large path.
+    void note_alloc_failure(std::uint32_t class_idx, slab_alloc_failure reason) noexcept {
+        if (class_idx < kNumClasses) {
+            classes_[class_idx].note_alloc_failure(reason);
+        }
+        last_failure_class_.store(class_idx, std::memory_order_relaxed);
+        last_failure_reason_.store(static_cast<std::uint8_t>(reason), std::memory_order_relaxed);
+        alloc_failures_total_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// P1-14: record a refused deallocation.
+    ///
+    /// Diagnosability was the core complaint about the old behaviour: a wrong
+    /// size silently corrupted the heap with no signal at all. A rejection is
+    /// now counted, attributed, and reported once per allocator on stderr.
+    void note_dealloc_reject(slab_dealloc_reject reason) noexcept {
+        dealloc_rejects_total_.fetch_add(1, std::memory_order_relaxed);
+        last_reject_reason_.store(static_cast<std::uint8_t>(reason), std::memory_order_relaxed);
+        if (!reject_warned_.exchange(true, std::memory_order_acq_rel)) {
+            std::fprintf(stderr,
+                "[slab_allocator] rejected deallocation (reason=%u): the caller-supplied "
+                "size does not match the block header. The block was leaked instead of "
+                "being handed to the wrong size class (or to ::operator delete). Use "
+                "slab_ptr or deallocate_block() for a size-free, header-verified free.\n",
+                static_cast<unsigned>(reason));
+            std::fflush(stderr);
+        }
+    }
+
     /// Allocate a raw slab from the OS and add it to class `idx`.
     /// Must be called while holding slab_mutexes_[idx].
     ///
@@ -2114,10 +2877,23 @@ private:
             // VirtualAllocExNuma allocates pages on the preferred NUMA node at
             // allocation time, so no separate binding step is needed.
             using alloc_numa_fn_t = LPVOID(WINAPI*)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD, DWORD);
-            static const alloc_numa_fn_t pVirtualAllocExNuma =
-                reinterpret_cast<alloc_numa_fn_t>(
-                    GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
-                                   "VirtualAllocExNuma"));
+            // P0-3: GetProcAddress() returns FARPROC (int(*)()), an incompatible
+            // function-pointer type. Launder the address through memcpy rather
+            // than a function-pointer cast: reinterpret_cast between
+            // incompatible function types trips GCC's -Wcast-function-type, and
+            // the two-step `void(*)()` form additionally trips Clang's
+            // -Wcast-function-type-strict (part of -Wall). memcpy is
+            // warning-free on both and is the portable way to round-trip a
+            // resolved symbol address.
+            static const alloc_numa_fn_t pVirtualAllocExNuma = []() noexcept {
+                FARPROC raw = GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                             "VirtualAllocExNuma");
+                alloc_numa_fn_t fn = nullptr;
+                static_assert(sizeof(fn) == sizeof(raw),
+                              "resolved signature must fit GetProcAddress's result");
+                std::memcpy(&fn, &raw, sizeof(fn));
+                return fn;
+            }();
             if (pVirtualAllocExNuma) {
                 slab = pVirtualAllocExNuma(
                     GetCurrentProcess(), nullptr, slab_size,
@@ -2176,7 +2952,7 @@ private:
             auto addr = reinterpret_cast<std::uintptr_t>(slab);
             if (from_shared_mem) {
                 // Shared memory slabs are not necessarily aligned to slab_size,
-                // so they won't use the fast path in find_slab_base().
+                // so they are not recorded in aligned_slabs_.
                 shared_mem_slabs_.insert(addr);
             } else {
                 // Record whether this slab was aligned (addr is a multiple of slab_size)
@@ -2196,60 +2972,22 @@ private:
         }
     }
 
-    /// Find the slab base address that contains `ptr`.
-    /// Returns nullptr if the pointer doesn't belong to any known slab.
-    ///
-    /// Fast path (O(1)): for aligned slabs, compute the candidate base via
-    /// bit-mask and verify with aligned_slabs_ hash set lookup.
-    /// Slow path (O(n)): linear scan for non-aligned slabs (rare fallback)
-    /// and shared memory slabs.
-    ///
-    /// T-P2-10: An optional `slab_size_hint` overrides the default config
-    /// slab_size, allowing callers that know the class index to use the
-    /// correct per-class slab size. If 0, falls back to config_.slab_size.
-    void* find_slab_base(void* ptr, uint32_t slab_size_hint = 0) const {
-        auto addr = reinterpret_cast<std::uintptr_t>(ptr);
-        auto slab_size = (slab_size_hint != 0) ? slab_size_hint : config_.slab_size;
-
-        // T-P2-10 fix: Lock bookkeeping_mutex_ to prevent concurrent writes
-        // from add_slab_to_class() in another thread. This is only called
-        // from the rare try_move_slab() path, so the lock doesn't affect
-        // hot-path performance.
-        std::lock_guard<std::mutex> lock(bookkeeping_mutex_);
-
-        // Fast path: if the slab was aligned, compute base via alignment mask
-        auto candidate = addr & ~(static_cast<std::uintptr_t>(slab_size) - 1);
-
-        // Verify candidate is actually a known aligned slab
-        if (aligned_slabs_.count(candidate)) {
-            return reinterpret_cast<void*>(candidate);
-        }
-
-        // Check if the pointer falls within the shared memory region
-        if (shared_mem_base_) {
-            auto sm_start = reinterpret_cast<std::uintptr_t>(shared_mem_base_) + kSharedMemHeaderSize;
-            auto sm_end = sm_start + (shared_mem_size_ - kSharedMemHeaderSize);
-            if (addr >= sm_start && addr < sm_end) {
-                // Compute slab base within shared memory
-                auto offset = addr - sm_start;
-                auto slab_offset = (offset / slab_size) * slab_size;
-                return reinterpret_cast<void*>(sm_start + slab_offset);
-            }
-        }
-
-        // Slow path: linear scan for non-aligned slabs
-        for (auto* slab : all_slabs_) {
-            auto slab_addr = reinterpret_cast<std::uintptr_t>(slab);
-            if (addr >= slab_addr && addr < slab_addr + slab_size) {
-                return slab;
-            }
-        }
-        return nullptr;
-    }
 
     config config_;
     std::vector<allocation_class> classes_;
     std::vector<void*> all_slabs_;
+    /// P1-15: NUMA node recorded in every block header this allocator writes
+    /// (-1 when not NUMA-bound). Set from config.numa_node.
+    std::int16_t owner_node_ = -1;
+    /// P1-18: global failure tally + most recent attribution.
+    std::atomic<std::uint64_t> alloc_failures_total_{0};
+    std::atomic<std::uint32_t> last_failure_class_{0};
+    std::atomic<std::uint8_t> last_failure_reason_{0};
+    /// P1-14: rejected-deallocation tally + most recent reason.
+    std::atomic<std::uint64_t> dealloc_rejects_total_{0};
+    std::atomic<std::uint8_t> last_reject_reason_{0};
+    /// One-shot stderr latch so a misusing caller is told once, not per call.
+    std::atomic<bool> reject_warned_{false};
     std::unordered_set<std::uintptr_t> aligned_slabs_;
     /// Slabs allocated via Windows NUMA API (VirtualAllocExNuma).
     /// Tracked separately because they require VirtualFree for deallocation.
@@ -2268,7 +3006,7 @@ private:
     /// Windows).
     ///
     /// This mutex is only held on the slow path (new slab creation) and in
-    /// `find_slab_base()` (rare slab-move path), so it does not affect the
+    /// slab-destruction path, so it does not affect the
     /// lock-free fast path of `allocate()` / `deallocate()`.
     mutable std::mutex bookkeeping_mutex_;
 
@@ -2339,10 +3077,8 @@ private:
         // per-class max-slabs limits. Each class i contributes
         // max_slabs_per_class_[i] * slab_sizes_[i] bytes.
         std::size_t data_size = 0;
-        std::size_t max_total_slabs = 0;
         for (uint32_t i = 0; i < kNumClasses; ++i) {
             std::size_t mc = max_slabs_per_class_[i].load(std::memory_order_relaxed);
-            max_total_slabs += mc;
             data_size += mc * slab_sizes_[i];
         }
         std::size_t total_file_size = kSharedMemHeaderSize + data_size;
@@ -2534,9 +3270,15 @@ private:
             shared_mem_next_slab_offset_ = slab_offset;
         } else {
             // ---- Fresh start: write header and allocate initial slabs ----
-            // Zero the header area, then populate fields
+            // Zero the header area, then populate fields.
+            // P0-3: shared_memory_header has NSDMIs, so it is a non-trivial type
+            // and std::memset on it trips -Wclass-memaccess (and is only
+            // conditionally well-defined). The struct is exactly 88 bytes with
+            // no padding (see the static_assert below it), so value
+            // initialisation covers the whole header region and additionally
+            // establishes the correct defaults for magic/version.
             auto* header = static_cast<shared_memory_header*>(shared_mem_base_);
-            std::memset(header, 0, kSharedMemHeaderSize);
+            *header = shared_memory_header{};
             std::memcpy(header->magic, "LRUS", 4);
             header->version = 1;
             // T-P2-10: store the default slab_size in the header for
@@ -2596,6 +3338,99 @@ private:
         shared_mem_size_ = 0;
     }
 };
+
+// ============================================================================
+// Slab Pointer — RAII allocation handle (spec/fix.01.md P1-14 方案 C)
+// ============================================================================
+
+/// Owning RAII handle for a block allocated from a `slab_allocator`.
+///
+/// The handle holds the allocator that produced the block plus the block
+/// pointer, so deallocation cannot be given a wrong size: there is no size
+/// parameter at all — the allocator reads the 16-byte block header written by
+/// `allocate()`. New code should prefer this over the raw
+/// `deallocate(ptr, size)` API, which only remains because existing callers
+/// (and the C++ sized-delete forms) still use it.
+///
+/// Usage:
+///   lru::slab_allocator alloc;
+///   lru::slab_ptr p = alloc.allocate_owned(128);
+///   if (p) std::memset(p.get(), 0, p.size());
+///   // released by ~slab_ptr, back into the correct size class
+class slab_ptr {
+public:
+    slab_ptr() noexcept = default;
+
+    /// Take ownership of `block`.
+    /// Precondition: `block` came from `owner->allocate(size)` (or is null).
+    slab_ptr(slab_allocator* owner, void* block, std::size_t size) noexcept
+        : owner_(owner), block_(block), size_(size) {}
+
+    ~slab_ptr() { reset(); }
+
+    slab_ptr(slab_ptr&& other) noexcept
+        : owner_(other.owner_), block_(other.block_), size_(other.size_) {
+        other.owner_ = nullptr;
+        other.block_ = nullptr;
+        other.size_ = 0;
+    }
+
+    slab_ptr& operator=(slab_ptr&& other) noexcept {
+        if (this != &other) {
+            reset();
+            owner_ = other.owner_;
+            block_ = other.block_;
+            size_ = other.size_;
+            other.owner_ = nullptr;
+            other.block_ = nullptr;
+            other.size_ = 0;
+        }
+        return *this;
+    }
+
+    slab_ptr(const slab_ptr&) = delete;
+    slab_ptr& operator=(const slab_ptr&) = delete;
+
+    /// Free the block through the header-verified, size-free path
+    /// (no-op when empty).
+    void reset() noexcept {
+        if (block_) {
+            if (owner_) owner_->deallocate_block(block_);
+            owner_ = nullptr;
+            block_ = nullptr;
+            size_ = 0;
+        }
+    }
+
+    /// Relinquish ownership without freeing. The caller takes over the raw
+    /// block and must free it with the same allocator.
+    void* release() noexcept {
+        void* p = block_;
+        owner_ = nullptr;
+        block_ = nullptr;
+        size_ = 0;
+        return p;
+    }
+
+    void* get() const noexcept { return block_; }
+    /// Requested size passed to `allocate()`, for diagnostics only — the
+    /// allocator always uses the block header, never this value.
+    std::size_t size() const noexcept { return size_; }
+    /// Allocator that owns the block (nullptr when empty).
+    slab_allocator* owner() const noexcept { return owner_; }
+    explicit operator bool() const noexcept { return block_ != nullptr; }
+
+private:
+    slab_allocator* owner_ = nullptr;
+    void* block_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+inline slab_ptr slab_allocator::allocate_owned(std::size_t size) {
+    void* block = allocate(size);
+    if (!block) return slab_ptr{};
+    return slab_ptr(this, block, size);
+}
 
 // ============================================================================
 // NUMA-Aware Slab Allocator
@@ -2668,13 +3503,33 @@ public:
         return current_allocator().allocate(size);
     }
 
+    /// P1-14 方案 C: allocate an owning RAII handle bound to the node that
+    /// served the request. The handle routes the later free by owner.
+    slab_ptr allocate_owned(std::size_t size) {
+        slab_allocator& node = current_allocator();
+        void* block = node.allocate(size);
+        if (!block) return slab_ptr{};
+        return slab_ptr(&node, block, size);
+    }
+
     /// Deallocate a block previously returned by `allocate(size)`.
+    ///
+    /// P1-15: the block is returned to the NUMA node recorded in its block
+    /// header, **not** to the calling thread's node. The old code used
+    /// `current_allocator()`, which is exactly what the comment above it said
+    /// not to do: a block allocated on node 0 and freed on node 1 was pushed
+    /// onto node 1's free list, so node 1 handed out node 0's memory forever
+    /// after — the NUMA-locality design was silently inverted and the mistake
+    /// was permanent.
     void deallocate(void* ptr, std::size_t size) noexcept {
-        // Deallocate through the allocator that owns the slab containing ptr.
-        // We try the current thread's allocator first (most common case),
-        // then fall back to checking all nodes.
-        auto& alloc = current_allocator();
-        alloc.deallocate(ptr, size);
+        if (!ptr) return;
+        allocator_for_block(ptr).deallocate(ptr, size);
+    }
+
+    /// P1-14/P1-15: size-free, owner-routed deallocation for `slab_ptr`.
+    void deallocate_block(void* ptr) noexcept {
+        if (!ptr) return;
+        allocator_for_block(ptr).deallocate_block(ptr);
     }
 
     // ----------------------------------------------------------------
@@ -2736,7 +3591,12 @@ public:
     // Statistics
     // ----------------------------------------------------------------
 
-    /// Per-class utilization statistics (aggregated across all NUMA nodes).
+    /// Per-class statistics aggregated across all NUMA nodes.
+    ///
+    /// P1-18: the new live/peak/failure counters are summed per node and the
+    /// utilization is recomputed from the aggregate (rather than averaging
+    /// per-node ratios), then clamped to [0, 1] so a concurrent slab addition
+    /// on any node cannot push it out of range.
     std::vector<slab_allocator::allocation_class_stats> get_stats() const {
         // Aggregate stats from all nodes
         std::vector<slab_allocator::allocation_class_stats> result;
@@ -2748,6 +3608,7 @@ public:
             agg.num_slabs = 0;
             agg.items_per_slab = 0;
             agg.utilization = 0.0;
+            std::uint64_t total_capacity = 0;
 
             for (int node = 0; node < num_nodes_; ++node) {
                 auto node_stats = node_allocators_[static_cast<std::size_t>(node)]->get_stats();
@@ -2757,16 +3618,48 @@ public:
                     agg.items_per_slab = cs.items_per_slab;
                 }
                 agg.num_slabs += cs.num_slabs;
-                // Weight utilization by number of slabs
-                double weight = static_cast<double>(cs.num_slabs);
-                agg.utilization += cs.utilization * weight;
+                agg.live_blocks += cs.live_blocks;
+                agg.live_bytes += cs.live_bytes;
+                agg.peak_bytes += cs.peak_bytes;
+                agg.total_allocations += cs.total_allocations;
+                agg.total_frees += cs.total_frees;
+                agg.alloc_failures += cs.alloc_failures;
+                if (cs.last_failure_reason != slab_alloc_failure::none) {
+                    agg.last_failure_reason = cs.last_failure_reason;
+                }
+                total_capacity +=
+                    static_cast<std::uint64_t>(cs.num_slabs) * cs.items_per_slab;
             }
-            if (agg.num_slabs > 0) {
-                agg.utilization /= static_cast<double>(agg.num_slabs);
-            }
+            const double raw = total_capacity > 0
+                ? static_cast<double>(agg.live_blocks) / static_cast<double>(total_capacity)
+                : 0.0;
+            agg.utilization = std::clamp(raw, 0.0, 1.0);
             result.push_back(agg);
         }
         return result;
+    }
+
+    /// P1-18: aggregated stable snapshot across all NUMA nodes.
+    slab_allocator::stats_snapshot snapshot() const {
+        slab_allocator::stats_snapshot s;
+        for (int node = 0; node < num_nodes_; ++node) {
+            const auto ns = node_allocators_[static_cast<std::size_t>(node)]->snapshot();
+            s.alloc_failures_total += ns.alloc_failures_total;
+            s.dealloc_rejects_total += ns.dealloc_rejects_total;
+            if (ns.last_failure_reason != slab_alloc_failure::none) {
+                s.last_failure_reason = ns.last_failure_reason;
+                s.last_failure_class = ns.last_failure_class;
+            }
+            if (ns.last_reject_reason != slab_dealloc_reject::none) {
+                s.last_reject_reason = ns.last_reject_reason;
+            }
+        }
+        s.classes = get_stats();
+        for (const auto& cs : s.classes) {
+            s.live_bytes_total += cs.live_bytes;
+            s.peak_bytes_total += cs.peak_bytes;
+        }
+        return s;
     }
 
     /// Returns true if any per-node allocator was initialized from an
@@ -2782,6 +3675,22 @@ private:
     config config_;
     int num_nodes_;
     std::vector<std::unique_ptr<slab_allocator>> node_allocators_;
+
+    /// P1-15: the per-node allocator that owns `ptr`'s block.
+    ///
+    /// Routing is driven by the owner node recorded in the block header, so a
+    /// cross-node free returns the block to its allocating node. Only a
+    /// pointer with no recorded owner (a foreign pointer, or a block from an
+    /// allocator that is not NUMA-bound) falls back to the calling thread's
+    /// node, where the header check in `slab_allocator::deallocate()` still
+    /// refuses to corrupt anything.
+    slab_allocator& allocator_for_block(void* ptr) noexcept {
+        const int node = slab_allocator::owner_node_of(ptr);
+        if (node >= 0 && node < num_nodes_) {
+            return *node_allocators_[static_cast<std::size_t>(node)];
+        }
+        return current_allocator();
+    }
 
     /// Get the slab allocator for the current thread's NUMA node.
     slab_allocator& current_allocator() {
@@ -2873,11 +3782,16 @@ void* cache_item<Key, Value, Hook>::operator new(std::size_t sz, slab_allocator*
 }
 
 template <typename Key, typename Value, typename Hook>
-void cache_item<Key, Value, Hook>::operator delete(void* p, std::size_t sz) {
+void cache_item<Key, Value, Hook>::operator delete(void* p, std::size_t) {
     if (!p) return;
     auto* self = static_cast<cache_item*>(p);
     if (self->allocator_) {
-        self->allocator_->deallocate(p, sz);
+        // P1-14: the compiler-supplied size is deliberately ignored. The slab
+        // block header is authoritative, so the two delete paths can no longer
+        // disagree — this one used to pass `sz` while
+        // operator delete(void*) passed `sizeof(cache_item)`, so whichever of
+        // the two ran could hand a wrong size to the allocator.
+        self->allocator_->deallocate_block(p);
     } else {
         // Matching aligned deallocation for the C++17 aligned operator new
         // used above. Without std::align_val_t, MSVC/UCRT may route the
@@ -2891,20 +3805,24 @@ void cache_item<Key, Value, Hook>::operator delete(void* p) {
     if (!p) return;
     auto* self = static_cast<cache_item*>(p);
     if (self->allocator_) {
-        self->allocator_->deallocate(p, sizeof(cache_item));
+        // P1-14: size-free, header-verified release (see operator delete
+        // above). `sizeof(cache_item)` is no longer passed to the allocator.
+        self->allocator_->deallocate_block(p);
     } else {
         ::operator delete(p, std::align_val_t(alignof(cache_item)));
     }
 }
 
 template <typename Key, typename Value, typename Hook>
-void cache_item<Key, Value, Hook>::operator delete(void* p, std::size_t sz, slab_allocator* alloc) {
-    if (p) alloc->deallocate(p, sz);
+void cache_item<Key, Value, Hook>::operator delete(void* p, std::size_t, slab_allocator* alloc) {
+    // P1-14: placement-delete counterpart of operator new(size_t, slab_allocator*).
+    // The size is ignored — the block header is authoritative.
+    if (p) alloc->deallocate_block(p);
 }
 
 template <typename Key, typename Value, typename Hook>
 void cache_item<Key, Value, Hook>::operator delete(void* p, slab_allocator* alloc) {
-    if (p) alloc->deallocate(p, sizeof(cache_item));
+    if (p) alloc->deallocate_block(p);
 }
 
 } // namespace lru::detail

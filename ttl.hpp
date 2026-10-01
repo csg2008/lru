@@ -222,7 +222,10 @@ public:
     void set(const Key& key, V&& value) {
         auto lock = acquire_ttl_write_lock(key);
         if (stopped_.load(std::memory_order_acquire)) return;
-        set_locked(key, std::forward<V>(value), default_ttl_);
+        insert_locked(key, std::forward<V>(value),
+                      default_ttl_ != duration_type::zero()
+                          ? std::optional<time_point>(clock::now() + default_ttl_)
+                          : std::nullopt);
     }
 
     /// Insert a key-value pair with a specific TTL.
@@ -231,11 +234,10 @@ public:
     void set(const Key& key, V&& value, std::chrono::duration<Rep, Period> ttl) {
         auto lock = acquire_ttl_write_lock(key);
         if (stopped_.load(std::memory_order_acquire)) return;
-        entry_type entry(std::forward<V>(value));
-        if (ttl > std::chrono::duration<Rep, Period>::zero()) {
-            entry.expiry = clock::now() + ttl;
-        }
-        cache_.set(key, std::move(entry));
+        insert_locked(key, std::forward<V>(value),
+                      ttl > std::chrono::duration<Rep, Period>::zero()
+                          ? std::optional<time_point>(clock::now() + ttl)
+                          : std::nullopt);
     }
 
     /// Set with custom TTL (alias for set with explicit ttl).
@@ -243,7 +245,10 @@ public:
     void set_with_ttl(const Key& key, V&& value, std::chrono::duration<Rep, Period> ttl) {
         auto lock = acquire_ttl_write_lock(key);
         if (stopped_.load(std::memory_order_acquire)) return;
-        set_locked(key, std::forward<V>(value), ttl);
+        insert_locked(key, std::forward<V>(value),
+                      ttl > std::chrono::duration<Rep, Period>::zero()
+                          ? std::optional<time_point>(clock::now() + ttl)
+                          : std::nullopt);
     }
 
     /// Set without TTL (never expires).
@@ -251,7 +256,7 @@ public:
     void set_no_ttl(const Key& key, V&& value) {
         auto lock = acquire_ttl_write_lock(key);
         if (stopped_.load(std::memory_order_acquire)) return;
-        set_locked(key, std::forward<V>(value), duration_type::zero());
+        insert_locked(key, std::forward<V>(value), std::nullopt);
     }
 
     /// Set with absolute expiry time.
@@ -259,9 +264,7 @@ public:
     void set_until(const Key& key, V&& value, time_point expiry) {
         auto lock = acquire_ttl_write_lock(key);
         if (stopped_.load(std::memory_order_acquire)) return;
-        entry_type entry(std::forward<V>(value));
-        entry.expiry = expiry;
-        cache_.set(key, std::move(entry));
+        insert_locked(key, std::forward<V>(value), std::optional<time_point>(expiry));
     }
 
     /// Get a value by key. Returns std::nullopt if the key is not found
@@ -441,7 +444,17 @@ public:
         default_ttl_ = ttl;
     }
 
+    /// Read the default TTL.
+    ///
+    /// Takes the global read lock because `default_ttl_` is a plain
+    /// (non-atomic) member that `set_default_ttl()` writes under the
+    /// global write lock. Reading it without a lock — as this accessor
+    /// used to — is a data race against any concurrent
+    /// `set_default_ttl()`. The lock is the same one the writer and
+    /// `operator<<` already use, so the accessor stays consistent with
+    /// them without introducing atomic semantics into the class.
     duration_type default_ttl() const {
+        auto lock = acquire_ttl_global_read_lock();
         return default_ttl_;
     }
 
@@ -462,7 +475,10 @@ public:
     friend std::ostream& operator<<(std::ostream& os, const ttl_cache& c) {
         auto lock = c.acquire_ttl_global_read_lock();
         auto mm_lock = c.cache_.acquire_read_lock();
-        const auto& uc = c.cache_;
+        // cache_ is `mutable`, so a const ttl_cache still yields a
+        // non-const lvalue here and for_each_entry() can take a shared
+        // lock on each shard while it walks it.
+        auto& uc = c.cache_;
 
         os << "ttl_cache @" << &c;
         if (c.default_ttl_ != duration_type::zero()) {
@@ -474,13 +490,13 @@ public:
         os << "  " << uc.stats_snapshot() << "\n";
 
         std::size_t idx = 0;
-        for (auto it = uc.mm().begin(); it != uc.mm().end(); ++it, ++idx) {
-            auto& entry = it->value;
-            os << "  " << idx << ": key=";
+        for_each_entry(uc, [&](const auto& item) {
+            const auto& entry = item.value;
+            os << "  " << idx++ << ": key=";
             if constexpr (detail::is_formattable_v<Key>) {
-                os << std::format("{}", it->key);
+                os << std::format("{}", item.key);
             } else {
-                os << std::format("<key at {:#x}>", reinterpret_cast<std::uintptr_t>(&it->key));
+                os << std::format("<key at {:#x}>", reinterpret_cast<std::uintptr_t>(&item.key));
             }
             os << " value='";
             if constexpr (detail::is_formattable_v<Value>) {
@@ -496,21 +512,90 @@ public:
                 os << " ttl=none";
             }
             os << "\n";
-        }
+        });
         return os;
     }
 
 private:
-    /// Internal set helper (caller must hold mutex_).
-    /// Templated on duration to preserve sub-second precision even when
-    /// the cache's default Duration is std::chrono::seconds.
-    template <typename V, typename Rep, typename Period>
-    void set_locked(const Key& key, V&& value, std::chrono::duration<Rep, Period> ttl) {
-        entry_type entry(std::forward<V>(value));
-        if (ttl > std::chrono::duration<Rep, Period>::zero()) {
-            entry.expiry = clock::now() + ttl;
+    /// Internal insert helper (caller must hold mutex_ and must have checked
+    /// `stopped_`).
+    ///
+    /// P1-31 (fix.01): the expiry is now published to BOTH layers.
+    ///
+    /// Before this change the TTL was written only into the value-layer
+    /// `ttl_entry`, while the item's own `expiry_ns` stayed 0. The cache layer
+    /// therefore could not use any MM strategy's O(log n) TTL index and had to
+    /// fall back to walking the entire cache under a read lock
+    /// (`evict_expired_via_ttl_entry_scan`) — the one remaining O(n) TTL path
+    /// in the library. Handing the SAME absolute deadline to
+    /// `set_with_absolute_expiry()` (which forwards it to
+    /// `mm_::set_with_expiry()`) makes the item-level index authoritative and
+    /// lets that fallback be deleted.
+    ///
+    /// The two layers must never disagree: a divergence would mean either an
+    /// entry that the item index still considers live after the value layer
+    /// expired it, or the reverse. Both are avoided here because exactly one
+    /// `time_point` is computed and converted, and `set_with_absolute_expiry`
+    /// applies no jitter of its own (unlike `set_with_ttl`, which would have
+    /// randomized only the item-level copy).
+    template <typename V>
+    void insert_locked(const Key& key, V&& value,
+                       std::optional<time_point> expiry) {
+        if (!expiry) {
+            cache_.set(key, entry_type(std::forward<V>(value), std::nullopt));
+            return;
         }
-        cache_.set(key, std::move(entry));
+        // Same storage convention as unified_cache::set_with_ttl():
+        // nanoseconds since the steady_clock epoch, 0 = no TTL. Every
+        // steady_clock deadline is >= the epoch, so a valid deadline can never
+        // collide with the sentinel.
+        const auto expiry_ns = static_cast<std::uint64_t>(expiry->time_since_epoch().count());
+        if constexpr (requires { cache_.set_with_absolute_expiry(key, value, expiry_ns); }) {
+            cache_.set_with_absolute_expiry(
+                key, entry_type(std::forward<V>(value), *expiry), expiry_ns);
+        } else {
+            // Compact / custom Caches without native TTL: the value layer is
+            // still authoritative for reads, so behaviour is unchanged.
+            cache_.set(key, entry_type(std::forward<V>(value), *expiry));
+        }
+    }
+
+    /// Visit every live entry of the backing cache, in whatever container
+    /// the MM uses to store them.
+    ///
+    /// `sharded_mm_lru::begin()/end()` expose only shard 0, so iterating
+    /// with them silently visits 1/N of the cache. That is how
+    /// `clear_expired()` came to leave 63 of 64 shards' worth of expired
+    /// entries resident forever — they kept consuming their shard's
+    /// `max_size` quota and pushed live entries out through LRU, while
+    /// `ttl_expired_total` still reported zero cleanups. Every full-scan
+    /// path must go through this helper rather than calling
+    /// `mm().begin()` directly.
+    ///
+    /// Each shard is visited under its own read lock, released before the
+    /// next shard is acquired, so shards do not serialize against each
+    /// other. The MM's own lock is taken here rather than relying on the
+    /// caller's stripe lock, which does not protect a shard.
+    template <typename Fn>
+    static void for_each_entry(entry_cache_type& c, Fn&& fn) {
+        auto& mm = c.mm();
+        if constexpr (requires(std::size_t i) {
+                          mm.num_shards();
+                          mm.acquire_shard_read_lock(i);
+                          mm.shard(i);
+                      }) {
+            for (std::size_t i = 0; i < mm.num_shards(); ++i) {
+                auto shard_lock = mm.acquire_shard_read_lock(i);
+                auto& shard = mm.shard(i);
+                for (auto it = shard.begin(); it != shard.end(); ++it) {
+                    fn(*it);
+                }
+            }
+        } else {
+            for (auto it = mm.begin(); it != mm.end(); ++it) {
+                fn(*it);
+            }
+        }
     }
 
     /// Internal clear_expired helper (no global TTL lock held by caller).
@@ -522,13 +607,12 @@ private:
         std::vector<key_type> expired_keys;
         {
             auto mm_lock = cache_.acquire_read_lock();
-            auto now = clock::now();
-            for (auto it = cache_.mm().begin(); it != cache_.mm().end(); ++it) {
-                const auto& entry = it->value;
-                if (entry.is_expired_at(now)) {
-                    expired_keys.push_back(it->key);
+            const auto now = clock::now();
+            for_each_entry(cache_, [&](const auto& item) {
+                if (item.value.is_expired_at(now)) {
+                    expired_keys.push_back(item.key);
                 }
-            }
+            });
         }
         size_type count = 0;
         for (const auto& key : expired_keys) {

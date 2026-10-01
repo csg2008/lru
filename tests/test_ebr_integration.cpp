@@ -136,9 +136,11 @@ TEST(EbrIntegration, ConcurrentReadAndEvictNoUaf) {
             int key = std::rand() % 100;
             auto h = c.try_get(key);
             if (h && h->has_value()) {
-                // Dereference the value — would crash on UAF
-                volatile auto& v = **h;
-                (void)v;
+                // Dereference the value — would crash on UAF.
+                // P0-3: a `(void)` cast on a volatile reference does not
+                // constitute an access in GCC, so read the value into a local.
+                const auto observed = **h;
+                (void)observed;
             }
         }
     });
@@ -174,8 +176,10 @@ TEST(EbrIntegration, StripedConcurrentReadAndEvictNoUaf) {
                 int key = std::rand() % 500;
                 auto h = c.try_get(key);
                 if (h && h->has_value()) {
-                    volatile auto& v = **h;
-                    (void)v;
+                    // P0-3: see above — read the value rather than casting a
+                    // volatile reference to void.
+                    const auto observed = **h;
+                    (void)observed;
                 }
             }
         });

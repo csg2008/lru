@@ -18,8 +18,11 @@ using namespace lru::detail;
 
 TEST(RefcountTest, BasicIncDecRef) {
     refcount_with_flags rc;
+    // P1-22: incRef() requires kLinked (see RefcountTest.IncRefRequiresLinked),
+    // so an item must be in the MM container before it can be pinned.
+    rc.markInMMContainer();
     EXPECT_EQ(rc.getAccessRef(), 0u);
-    EXPECT_TRUE(rc.isDrained());
+    EXPECT_FALSE(rc.isDrained());
 
     auto r1 = rc.incRef();
     EXPECT_EQ(r1, IncResult::kIncOk);
@@ -30,15 +33,27 @@ TEST(RefcountTest, BasicIncDecRef) {
     EXPECT_EQ(r2, IncResult::kIncOk);
     EXPECT_EQ(rc.getAccessRef(), 2u);
 
+    // P0-3: decRef() returns the new raw refcount word. Assert on its
+    // access-ref bits as well as via getAccessRef() so the return value is
+    // genuinely exercised (-Wunused-but-set-variable) and the two views of the
+    // same state are cross-checked.
     auto v = rc.decRef();
+    EXPECT_EQ(v & lru::detail::kAccessRefMask, std::uint64_t{1});
     EXPECT_EQ(rc.getAccessRef(), 1u);
     v = rc.decRef();
+    EXPECT_EQ(v & lru::detail::kAccessRefMask, std::uint64_t{0});
     EXPECT_EQ(rc.getAccessRef(), 0u);
+    // kLinked is still set (the item is still in the MM container), so the
+    // word is not drained until the container drops it.
+    EXPECT_FALSE(rc.isDrained());
+    rc.unmarkInMMContainer();
     EXPECT_TRUE(rc.isDrained());
 }
 
 TEST(RefcountTest, IncRefMultipleTimes) {
     refcount_with_flags rc;
+    // P1-22: incRef() requires kLinked — see RefcountTest.IncRefRequiresLinked.
+    rc.markInMMContainer();
     for (int i = 0; i < 100; ++i) {
         auto r = rc.incRef();
         EXPECT_EQ(r, IncResult::kIncOk);
@@ -49,6 +64,9 @@ TEST(RefcountTest, IncRefMultipleTimes) {
         rc.decRef();
     }
     EXPECT_EQ(rc.getAccessRef(), 0u);
+    // kLinked remains set until the container drops the item.
+    EXPECT_FALSE(rc.isDrained());
+    rc.unmarkInMMContainer();
     EXPECT_TRUE(rc.isDrained());
 }
 
@@ -223,9 +241,12 @@ TEST(RefcountTest, IsDrained) {
     rc.unmarkInMMContainer();
     EXPECT_TRUE(rc.isDrained());
 
-    rc.incRef();
+    // P1-22: incRef() requires kLinked.
+    rc.markInMMContainer();
+    EXPECT_EQ(rc.incRef(), IncResult::kIncOk);
     EXPECT_FALSE(rc.isDrained());
     rc.decRef();
+    rc.unmarkInMMContainer();
     EXPECT_TRUE(rc.isDrained());
 }
 
@@ -310,15 +331,42 @@ TEST(RefcountTest, RawValueLayout) {
     refcount_with_flags rc;
     EXPECT_EQ(rc.getRaw(), 0u);
 
-    rc.incRef();
+    // P1-22: incRef() requires kLinked, so mark the container first.
+    rc.markInMMContainer();
+    EXPECT_EQ(rc.incRef(), IncResult::kIncOk);
     // access_ref should be 1 → bit 0 is set
     EXPECT_EQ(rc.getRaw() & kAccessRefMask, 1u);
 
-    rc.markInMMContainer();
     // kLinked bit (bit 32) should be set  [R3: shifted from 24 to 32]
     EXPECT_TRUE(rc.getRaw() & (1ULL << kLinkedBit));
 
     rc.setFlag<Flags::kMMFlag0>();
     // kMMFlag0 bit (bit 35) should be set  [R3: shifted from 27 to 35]
     EXPECT_TRUE(rc.getRaw() & (1ULL << Flags::kMMFlag0));
+}
+
+// ============================================================================
+// P1-22: kLinked is the pin barrier — incRef() fails on an unlinked item
+// ============================================================================
+
+TEST(RefcountTest, IncRefRequiresLinked) {
+    refcount_with_flags rc;
+    // Freshly constructed (not in any MM container) → the pin must fail.
+    EXPECT_EQ(rc.incRef(), IncResult::kIncFailedUnlinked);
+    EXPECT_EQ(rc.getAccessRef(), 0u);
+
+    rc.markInMMContainer();
+    EXPECT_EQ(rc.incRef(), IncResult::kIncOk);
+    EXPECT_EQ(rc.getAccessRef(), 1u);
+
+    // Unlinking is the barrier: after the container drops the item, no new
+    // pin may succeed even though the access_ref has not yet drained.
+    rc.unmarkInMMContainer();
+    EXPECT_EQ(rc.incRef(), IncResult::kIncFailedUnlinked);
+    EXPECT_EQ(rc.getAccessRef(), 1u);  // unchanged
+
+    // The outstanding reference can still be released.
+    rc.decRef();
+    EXPECT_EQ(rc.getAccessRef(), 0u);
+    EXPECT_TRUE(rc.isDrained());
 }

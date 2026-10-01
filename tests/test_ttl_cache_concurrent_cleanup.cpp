@@ -28,13 +28,13 @@ TEST(TtlCacheConcurrentCleanup, BackgroundCleanerWithConcurrentTraffic) {
     std::atomic<std::uint64_t> errors{0};
 
     auto worker = [&](unsigned int seed) {
-        std::mt19937 rng(seed);
+        auto rng = lru_test::seed_rng(seed);
         std::uniform_int_distribution<int> key_dist(0, 999);
 
         while (!stop.load(std::memory_order_relaxed)) {
             int key = key_dist(rng);
             // Mix of set-with-TTL, set-no-TTL, and get.
-            int op = rng() % 3;
+            int op = lru_test::rng_int(rng) % 3;
             if (op == 0) {
                 cache.set_with_ttl(key, std::to_string(key), 30ms);
             } else if (op == 1) {

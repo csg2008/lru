@@ -479,7 +479,10 @@ public:
         std::size_t slot_used{0};         // allocator used slots
         std::size_t bucket_count{0};      // hash table bucket count
         float load_factor{0.0f};
-        bool latency_tracking_enabled{true};
+        // Mirrors cache_stats::latency_tracking_enabled, which is off by
+        // default (see the note there). This default is only a placeholder
+        // for the fill-in path below, but it should not claim "on" either.
+        bool latency_tracking_enabled{false};
         bool async_callbacks_enabled{false};
         bool is_thread_safe{false};
         bool is_striped{false};
@@ -540,7 +543,8 @@ public:
         append_kv("bucket_count", info.bucket_count);
 
         char lf_buf[32];
-        std::snprintf(lf_buf, sizeof(lf_buf), "load_factor: %.4f\n", info.load_factor);
+        std::snprintf(lf_buf, sizeof(lf_buf), "load_factor: %.4f\n",
+                      static_cast<double>(info.load_factor));
         out.append(lf_buf);
 
         append_kv("hits", info.hits);

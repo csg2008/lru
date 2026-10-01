@@ -139,6 +139,10 @@ enum class IncResult {
     kIncFailedMoving,    // item is being moved (kExclusive + access_ref > 0)
     kIncFailedEviction,  // item is being evicted (kExclusive + access_ref == 0)
     kIncFailedOverflow,  // access_ref would overflow (saturated at max)
+    // P1-22 (fix.01 方案 A): the item is not in the MM container (kLinked
+    // clear). Appended at the END so the numeric values of the existing
+    // enumerators are unchanged. See incRef() for why this is a pin barrier.
+    kIncFailedUnlinked,
 };
 
 // ============================================================================
@@ -234,11 +238,36 @@ public:
     // access_ref operations
     // ----------------------------------------------------------------
 
-    /// Increment access_ref. Fails if kExclusive is set or access_ref would overflow.
-    /// - If kExclusive is not set and access_ref < max: increments access_ref, returns kIncOk.
+    /// Increment access_ref. Fails if kExclusive is set, if kLinked is
+    /// clear, or if access_ref would overflow.
+    /// - If kLinked is clear (item is not in the MM container): returns
+    ///   kIncFailedUnlinked. See the barrier note below.
     /// - If kExclusive + access_ref == 0: returns kIncFailedEviction (should not happen normally).
     /// - If kExclusive + access_ref > 0: returns kIncFailedMoving.
     /// - If access_ref >= kAccessRefMax: returns kIncFailedOverflow (saturated, no increment).
+    ///
+    /// P1-22 (fix.01 方案 A): kLinked is the pin barrier.
+    ///
+    /// Every eviction path is `markForEviction() → map_.erase() →
+    /// remove_from_list() → unmarkForEviction() → retire()`. Before this
+    /// check existed, a lock-free reader that had already loaded the raw
+    /// item pointer (e.g. from the hash-table chain) could call incRef()
+    /// *after* `unmarkForEviction()` cleared kExclusive but *before* the
+    /// item was reclaimed, obtaining a read_handle to an item that had
+    /// already been handed to the reclaimer → use-after-free.
+    ///
+    /// Making "unlinking" itself the barrier closes that window for every
+    /// eviction path at once (the unlink always precedes the point at which
+    /// the item may be reclaimed), instead of relying on each path getting
+    /// its ordering right. It also makes the comment at mm.hpp's flush()
+    /// ("no concurrent incRef can succeed") actually true.
+    ///
+    /// Callers that pin must therefore only see items that are still linked
+    /// into the MM container. Verified: every `pin_fn` in the library is
+    /// invoked from inside `concurrent_hash_table::find_and_pin*()` on a
+    /// node reached by walking the live hash chain; MM inserts publish the
+    /// item into the map only AFTER `markInMMContainer()` + list link, so a
+    /// reachable node always has kLinked set.
     IncResult incRef() {
         // G23: relaxed initial load — the CAS failure case below already
         // uses memory_order_acquire, which provides the required acquire
@@ -257,6 +286,11 @@ public:
                 // T-G11: record result for caller inspection.
                 tls_last_incRef_result() = r;
                 return r;
+            }
+            // P1-22: kLinked must be set — see the barrier note above.
+            if (((old >> kLinkedBit) & 1ULL) == 0ULL) {
+                tls_last_incRef_result() = IncResult::kIncFailedUnlinked;
+                return IncResult::kIncFailedUnlinked;
             }
             Value access = old & kAccessRefMask;
             if (access >= kAccessRefMax) {
@@ -531,7 +565,19 @@ public:
     }
 
 private:
-    alignas(64) std::atomic<Value> value_;
+    // Deliberately NOT cache-line aligned.
+    //
+    // False sharing is a problem for a counter that many threads update
+    // concurrently. A cache item's refcount is only touched while the caller
+    // already holds that item's bucket or shard lock, so there is no
+    // cross-core ping-pong to avoid — while `alignas(64)` here forces the
+    // alignment on the *containing* cache_item, inflating sizeof(cache_item)
+    // for an <int,int> entry from ~192 to 256 bytes (32x the 8 bytes of
+    // payload). It also pushes the intrusive hook and the refcount onto
+    // different cache lines, so every step of an eviction scan touches an
+    // extra line. Removing the alignment is what makes the "one 8-byte word"
+    // budget in the header comment actually true.
+    std::atomic<Value> value_;
 
     // G19: class-wide overflow counter. Bumped on every kIncFailedOverflow
     // return from incRef(), exposed via overflow_count() / reset_overflow_count().

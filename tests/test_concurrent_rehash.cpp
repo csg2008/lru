@@ -70,9 +70,9 @@ TEST(ConcurrentRehash, F14DualArrayConcurrentRehashCorrectness) {
     // Readers: continuously read back previously-written keys.
     for (int t = 0; t < kReaders; ++t) {
         threads.emplace_back([&, t] {
-            std::mt19937 rng(t + 12345);
+            auto rng = lru_test::seed_rng(t + 12345);
             while (!stop.load(std::memory_order_acquire)) {
-                int key = rng() % (kThreads * kOpsPerThread);
+                int key = lru_test::rng_int(rng) % (kThreads * kOpsPerThread);
                 auto h = c.try_get(key);
                 // The key may not have been written yet; that's fine.
                 // But if it returns a value, the value must be correct.
@@ -86,9 +86,12 @@ TEST(ConcurrentRehash, F14DualArrayConcurrentRehashCorrectness) {
     }
 
     // Wait for writers to complete, then signal readers to stop.
-    for (int i = 0; i < kThreads; ++i) threads[i].join();
+    // P0-3: join via iterators instead of an int index into the vector, so no
+    // signed/unsigned conversion is needed for threads[i].
+    const auto batch_readers_begin = threads.begin() + kThreads;
+    for (auto it = threads.begin(); it != batch_readers_begin; ++it) it->join();
     stop.store(true, std::memory_order_release);
-    for (int i = kThreads; i < kThreads + kReaders; ++i) threads[i].join();
+    for (auto it = batch_readers_begin; it != threads.end(); ++it) it->join();
 
     EXPECT_EQ(read_failures.load(), 0)
         << "readers observed stale or incorrect values during rehash";
@@ -178,10 +181,10 @@ TEST(ConcurrentRehash, RehashDuringMixedReadWrite) {
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             for (int i = 0; i < kOpsPerThread; ++i) {
-                int key = rng() % 4000;
-                if (rng() % 2 == 0) {
+                int key = lru_test::rng_int(rng) % 4000;
+                if (lru_test::rng_int(rng) % 2 == 0) {
                     c.set(key, "v" + std::to_string(key));
                     write_count.fetch_add(1, std::memory_order_relaxed);
                 } else {
@@ -249,17 +252,18 @@ TEST(ConcurrentRehash, LockFreeRehashFallbackAccounting) {
         // captured `t`. The writer lambda above already captures `t` by value
         // for the same reason; this fix makes the reader consistent.
         threads.emplace_back([&, t] {
-            std::mt19937 rng(t + 4242);
+            auto rng = lru_test::seed_rng(t + 4242);
             while (!stop.load(std::memory_order_acquire)) {
-                int key = rng() % kTotalKeys;
+                int key = lru_test::rng_int(rng) % kTotalKeys;
                 (void)c.try_get(key);
             }
         });
     }
 
-    for (int i = 0; i < kThreads; ++i) threads[i].join();
+    const auto readers_begin = threads.begin() + kThreads;
+    for (auto it = threads.begin(); it != readers_begin; ++it) it->join();
     stop.store(true, std::memory_order_release);
-    for (int i = kThreads; i < kThreads + kReaders; ++i) threads[i].join();
+    for (auto it = readers_begin; it != threads.end(); ++it) it->join();
 
     // 1. API exposure: rehash_lockfree_fallback_count() is callable and
     //    returns a finite, non-negative count.

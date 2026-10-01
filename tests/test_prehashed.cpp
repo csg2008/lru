@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "../lru.hpp"
+#include "test_helpers.hpp"
 
 using namespace lru;
 
@@ -230,9 +231,9 @@ TEST(PrehashedApiTest, ConcurrentPrehashedOverlappingKeys) {
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 7919 + 1);
+            auto rng = lru_test::seed_rng(t * 7919 + 1);
             for (int i = 0; i < kOpsPerThread; ++i) {
-                int key = rng() % kKeySpace;
+                int key = lru_test::rng_int(rng) % kKeySpace;
                 std::size_t h = cache_hash(c, key);
                 if (i % 5 == 0) {
                     // 20% writes: update with canonical value.
@@ -276,11 +277,11 @@ TEST(PrehashedApiTest, ConcurrentPrehashedReadHeavy) {
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 7919 + 1);
+            auto rng = lru_test::seed_rng(t * 7919 + 1);
             for (int i = 0; i < kOpsPerThread; ++i) {
-                int key = rng() % kKeySpace;
+                int key = lru_test::rng_int(rng) % kKeySpace;
                 std::size_t h = cache_hash(c, key);
-                if (rng() % 100 < 5) {
+                if (lru_test::rng_int(rng) % 100 < 5) {
                     c.set_prehashed(key, h, key * 10);
                 } else {
                     auto v = c.try_get_prehashed(key, h);
@@ -321,14 +322,14 @@ TEST(PrehashedApiTest, ConcurrentMixedPrehashedAndNonPrehashed) {
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 31337 + 7);
+            auto rng = lru_test::seed_rng(t * 31337 + 7);
             for (int i = 0; i < kOpsPerThread; ++i) {
-                int key = rng() % kKeySpace;
-                bool use_prehashed = (rng() % 2 == 0);
+                int key = lru_test::rng_int(rng) % kKeySpace;
+                bool use_prehashed = (lru_test::rng_int(rng) % 2 == 0);
                 std::size_t h = cache_hash(c, key);
 
                 if (use_prehashed) {
-                    if (rng() % 10 < 2) {
+                    if (lru_test::rng_int(rng) % 10 < 2) {
                         c.set_prehashed(key, h, key * 10);
                     } else {
                         auto v = c.try_get_prehashed(key, h);
@@ -337,7 +338,7 @@ TEST(PrehashedApiTest, ConcurrentMixedPrehashedAndNonPrehashed) {
                         }
                     }
                 } else {
-                    if (rng() % 10 < 2) {
+                    if (lru_test::rng_int(rng) % 10 < 2) {
                         c.set(key, key * 10);
                     } else {
                         auto v = c.try_get(key);

@@ -49,6 +49,7 @@
 
 #include "ankerl/unordered_dense.h"
 #include "core.hpp"
+#include "detail/atomic_shared_ptr.hpp"
 #include "detail/foundation.hpp"
 #include "serialization.hpp"
 
@@ -117,15 +118,8 @@ public:
 
     ~warm_cache_manager() {
         stop_incremental_snapshot();
-        // G9: Explicitly join the load thread before cancel_load() does
-        // further cleanup. If swap_when_ready() was never called and the
-        // load thread is still running, this guarantees the thread is
-        // reaped before the object is destroyed, preventing UAF.
-        // cancel_load() will find the thread non-joinable and skip its
-        // own join, but still perform state/error/pending_cache cleanup.
-        if (load_thread_.joinable()) {
-            load_thread_.join();
-        }
+        // Joins the load thread if one is running (cancel_load_locked does
+        // that), so the thread is reaped before this object is destroyed.
         cancel_load();
     }
 
@@ -142,9 +136,8 @@ public:
     /// @param path      Path to the serialized snapshot file
     /// @param capacity  Capacity for the new cache (0 = auto from snapshot)
     void async_load(const std::string& path, size_type capacity = 0) {
-        cancel_load();  // Cancel any previous load
-
         std::unique_lock lock(load_mutex_);
+        cancel_load_locked();  // Cancel any previous load
         pending_cache_ = (capacity > 0)
             ? std::make_shared<cache_type>(capacity)
             : std::make_shared<cache_type>();
@@ -156,7 +149,7 @@ public:
                 std::ifstream file(path, std::ios::binary | std::ios::ate);
                 if (!file.is_open()) {
                     state_.store(load_state::failed, std::memory_order_release);
-                    load_error_ = "cannot open file: " + path;
+                    set_load_error("cannot open file: " + path);
                     load_cv_.notify_all();
                     return;
                 }
@@ -167,7 +160,7 @@ public:
 
                 if (!file) {
                     state_.store(load_state::failed, std::memory_order_release);
-                    load_error_ = "failed to read file: " + path;
+                    set_load_error("failed to read file: " + path);
                     load_cv_.notify_all();
                     return;
                 }
@@ -178,7 +171,7 @@ public:
                 state_.store(load_state::ready, std::memory_order_release);
                 load_cv_.notify_all();
             } catch (const std::exception& e) {
-                load_error_ = e.what();
+                set_load_error(e.what());
                 state_.store(load_state::failed, std::memory_order_release);
                 load_cv_.notify_all();
             }
@@ -187,9 +180,8 @@ public:
 
     /// Start loading from a binary data buffer in the background.
     void async_load_from_data(std::vector<uint8_t> data, size_type capacity = 0) {
-        cancel_load();
-
         std::unique_lock lock(load_mutex_);
+        cancel_load_locked();  // Cancel any previous load
         pending_cache_ = (capacity > 0)
             ? std::make_shared<cache_type>(capacity)
             : std::make_shared<cache_type>();
@@ -201,7 +193,7 @@ public:
                 state_.store(load_state::ready, std::memory_order_release);
                 load_cv_.notify_all();
             } catch (const std::exception& e) {
-                load_error_ = e.what();
+                set_load_error(e.what());
                 state_.store(load_state::failed, std::memory_order_release);
                 load_cv_.notify_all();
             }
@@ -236,7 +228,7 @@ public:
         }
 
         // Atomic swap
-        live_cache_ = std::move(pending_cache_);
+        live_cache_.store(std::move(pending_cache_));
         pending_cache_.reset();
         state_.store(load_state::idle, std::memory_order_release);
         // G9: Auto-reattach delta callbacks on the new live cache so
@@ -254,12 +246,26 @@ public:
 
     /// Get the load error message (empty if no error).
     std::string load_error() const {
-        std::lock_guard lock(load_mutex_);
-        return load_error_;
+        auto msg = load_error_.load();
+        return msg ? *msg : std::string{};
     }
 
     /// Cancel any in-progress load.
+    ///
+    /// Takes load_mutex_ itself. The callers (async_load /
+    /// async_load_from_data) used to invoke it BEFORE acquiring that mutex,
+    /// so two threads calling async_load() concurrently both reached
+    /// load_thread_.join() on the same std::thread object — undefined
+    /// behaviour, and the assignment of load_thread_ below raced as well.
+    /// Holding the mutex across cancel, teardown and re-arm makes the whole
+    /// sequence atomic with respect to other async_load() calls.
     void cancel_load() {
+        std::lock_guard lock(load_mutex_);
+        cancel_load_locked();
+    }
+
+    /// Body of cancel_load(); the caller must hold load_mutex_.
+    void cancel_load_locked() {
         if (load_thread_.joinable()) {
             // We can't safely interrupt the thread, but we can set the state
             // and wait for it to finish. The thread checks state_ on completion.
@@ -269,7 +275,19 @@ public:
         }
         pending_cache_.reset();
         state_.store(load_state::idle, std::memory_order_release);
-        load_error_.clear();
+        load_error_.store(nullptr);
+    }
+
+    /// Publish a load error for load_error() to read.
+    ///
+    /// Uses an atomic shared_ptr instead of load_mutex_ because the loader
+    /// thread would otherwise have to acquire a mutex that cancel_load()
+    /// holds while it joins that very thread — an immediate deadlock. The
+    /// previous code wrote this std::string with no lock at all while
+    /// load_error() read it under load_mutex_, so a reader could observe a
+    /// half-constructed string.
+    void set_load_error(std::string msg) {
+        load_error_.store(std::make_shared<const std::string>(std::move(msg)));
     }
 
     // --------------------------------------------------------------------
@@ -649,28 +667,42 @@ public:
     // Cache access
     // --------------------------------------------------------------------
 
-    /// Get the current live cache (shared_ptr for safe concurrent access).
+    /// Get the current live cache. The returned shared_ptr keeps that
+    /// snapshot alive even if a swap happens immediately afterwards.
     std::shared_ptr<cache_type> get_cache() const {
-        std::lock_guard lock(cache_mutex_);
-        return live_cache_;
+        return live_cache_.load();
     }
 
-    /// Direct access to the live cache (for convenience).
-    cache_type& operator*() { return *live_cache_; }
-    const cache_type& operator*() const { return *live_cache_; }
-    cache_type* operator->() { return live_cache_.get(); }
-    const cache_type* operator->() const { return live_cache_.get(); }
+    /// Direct access to the live cache.
+    ///
+    /// The pointer read is atomic, but the returned reference/pointer is
+    /// only valid until the next swap_when_ready(). Callers that must survive
+    /// a concurrent warm reload should hold the shared_ptr from get_cache()
+    /// instead.
+    cache_type& operator*() { return *live_cache_.load(); }
+    const cache_type& operator*() const { return *live_cache_.load(); }
+    cache_type* operator->() { return live_cache_.load().get(); }
+    const cache_type* operator->() const { return live_cache_.load().get(); }
 
 private:
-    // Live cache (atomically swappable via shared_ptr)
-    mutable std::mutex cache_mutex_;
-    std::shared_ptr<cache_type> live_cache_;
+    // Live cache. Must be atomic: swap_when_ready() replaces it from the
+    // loader thread while worker threads read it. It previously sat behind
+    // two DIFFERENT mutexes for its two accessors (swap took load_mutex_,
+    // get_cache() took cache_mutex_) and was read with no lock at all by
+    // operator*/operator-> — a concurrent read and write of a std::shared_ptr
+    // is undefined behaviour and can corrupt the control block refcount. The
+    // library already ships detail::atomic_shared_ptr for exactly this
+    // (event_tracker.hpp uses it); reuse it instead of inventing a lock.
+    mutable detail::atomic_shared_ptr<cache_type> live_cache_;
 
     // Async load state
     mutable std::mutex load_mutex_;
     std::shared_ptr<cache_type> pending_cache_;
     std::atomic<load_state> state_{load_state::idle};
-    std::string load_error_;
+    // Published atomically (see set_load_error) — never guarded by
+    // load_mutex_, which cancel_load_locked() holds while joining the very
+    // thread that writes this.
+    mutable detail::atomic_shared_ptr<const std::string> load_error_;
     std::condition_variable load_cv_;
     std::thread load_thread_;
 

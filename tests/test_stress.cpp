@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "../lru.hpp"
+#include "test_helpers.hpp"
 
 using namespace lru;
 using namespace std::chrono_literals;
@@ -61,7 +62,7 @@ static void launch_concurrent(std::chrono::steady_clock::time_point deadline,
         auto& [n, fn] = group;
         for (int t = 0; t < n; ++t) {
             all_threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 7919 + 31);
+                auto rng = lru_test::seed_rng(t * 7919 + 31);
                 fn(t, deadline, rng);
             });
         }
@@ -81,10 +82,10 @@ TEST(StressTest, SafeCache8Threads100KOps) {
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; t++) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 12345);
+            auto rng = lru_test::seed_rng(t * 12345);
             for (int i = 0; i < kOpsPerThread; i++) {
-                int key = rng() % 500;  // keys 0-499
-                int op = rng() % 10;
+                int key = lru_test::rng_int(rng) % 500;  // keys 0-499
+                int op = lru_test::rng_int(rng) % 10;
                 if (op < 7) {
                     (void)c.get(key);       // 70% get
                 } else if (op < 9) {
@@ -109,10 +110,10 @@ TEST(StressTest, StripedCache8Threads100KOps) {
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; t++) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 54321);
+            auto rng = lru_test::seed_rng(t * 54321);
             for (int i = 0; i < kOpsPerThread; i++) {
-                int key = rng() % 500;
-                int op = rng() % 10;
+                int key = lru_test::rng_int(rng) % 500;
+                int op = lru_test::rng_int(rng) % 10;
                 if (op < 7) {
                     (void)c.get(key);
                 } else if (op < 9) {
@@ -317,10 +318,10 @@ TEST(StressTTLCache, ConcurrentOps) {
         std::vector<std::thread> threads;
         for (int t = 0; t < 4; t++) {
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 99999);
+                auto rng = lru_test::seed_rng(t * 99999);
                 for (int i = 0; i < 10000; i++) {
-                    int key = rng() % 200;
-                    int op = rng() % 10;
+                    int key = lru_test::rng_int(rng) % 200;
+                    int op = lru_test::rng_int(rng) % 10;
                     if (op < 6) {
                         (void)c.get(key);               // 60% get
                     } else if (op < 9) {
@@ -411,11 +412,11 @@ TEST(StressTLSAdapter, ConcurrentOps) {
         std::vector<std::thread> threads;
         for (int t = 0; t < 4; t++) {
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 77777);
+                auto rng = lru_test::seed_rng(t * 77777);
                 // Each thread gets its own TLS ring automatically
                 for (int i = 0; i < 10000; i++) {
-                    int key = rng() % 200;
-                    int op = rng() % 10;
+                    int key = lru_test::rng_int(rng) % 200;
+                    int op = lru_test::rng_int(rng) % 10;
                     if (op < 6) {
                         (void)adapter.get(key);     // 60% get (promotes via TLS ring)
                     } else if (op < 9) {
@@ -452,9 +453,9 @@ TEST(StressPooledCache, ConcurrentOpsAcrossPools) {
         // Each thread targets a different pool pattern
         for (int t = 0; t < 6; t++) {
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 33333);
+                auto rng = lru_test::seed_rng(t * 33333);
                 for (int i = 0; i < 5000; i++) {
-                    int key = rng() % 200;
+                    int key = lru_test::rng_int(rng) % 200;
                     // Round-robin pool selection
                     const char* pool_name;
                     switch (t % 3) {
@@ -462,7 +463,7 @@ TEST(StressPooledCache, ConcurrentOpsAcrossPools) {
                         case 1: pool_name = "warm"; break;
                         default: pool_name = "cold"; break;
                     }
-                    int op = rng() % 10;
+                    int op = lru_test::rng_int(rng) % 10;
                     if (op < 6) {
                         (void)pc.get(pool_name, key);       // 60% get
                     } else if (op < 9) {
@@ -491,10 +492,10 @@ TEST(StressPooledCache, ConcurrentGetAnyAndSet) {
         std::vector<std::thread> threads;
         for (int t = 0; t < 4; t++) {
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 44444);
+                auto rng = lru_test::seed_rng(t * 44444);
                 for (int i = 0; i < 5000; i++) {
-                    int key = rng() % 200;
-                    int op = rng() % 10;
+                    int key = lru_test::rng_int(rng) % 200;
+                    int op = lru_test::rng_int(rng) % 10;
                     if (op < 5) {
                         (void)pc.get_any(key);              // 50% cross-pool get
                     } else if (op < 9) {
@@ -535,10 +536,10 @@ TEST(StressPooledCache, ConcurrentGetAnyAndSetThreadSafeUnderlying) {
         std::vector<std::thread> threads;
         for (int t = 0; t < 8; t++) {
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 44444);
+                auto rng = lru_test::seed_rng(t * 44444);
                 for (int i = 0; i < 2000; i++) {
-                    int key = rng() % 5000;
-                    int op = rng() % 10;
+                    int key = lru_test::rng_int(rng) % 5000;
+                    int op = lru_test::rng_int(rng) % 10;
                     if (op < 5) {
                         (void)pc.get_any(key);              // 50% cross-pool get
                     } else if (op < 9) {
@@ -581,10 +582,10 @@ TEST(StressIntegration, AllCacheTypesSimultaneously) {
         for (int t = 0; t < 2; t++) {
             // safe_cache threads
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 11111);
+                auto rng = lru_test::seed_rng(t * 11111);
                 for (int i = 0; i < 20000; i++) {
-                    int key = rng() % 100;
-                    int op = rng() % 10;
+                    int key = lru_test::rng_int(rng) % 100;
+                    int op = lru_test::rng_int(rng) % 10;
                     if (op < 7) (void)safe_c.get(key);
                     else if (op < 9) safe_c.set(key, i);
                     else (void)safe_c.del(key);
@@ -592,10 +593,10 @@ TEST(StressIntegration, AllCacheTypesSimultaneously) {
             });
             // striped_cache threads
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 22222);
+                auto rng = lru_test::seed_rng(t * 22222);
                 for (int i = 0; i < 20000; i++) {
-                    int key = rng() % 100;
-                    int op = rng() % 10;
+                    int key = lru_test::rng_int(rng) % 100;
+                    int op = lru_test::rng_int(rng) % 10;
                     if (op < 7) (void)striped_c.get(key);
                     else if (op < 9) striped_c.set(key, i);
                     else (void)striped_c.del(key);
@@ -603,10 +604,10 @@ TEST(StressIntegration, AllCacheTypesSimultaneously) {
             });
             // ttl_cache threads
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 33333);
+                auto rng = lru_test::seed_rng(t * 33333);
                 for (int i = 0; i < 20000; i++) {
-                    int key = rng() % 100;
-                    int op = rng() % 10;
+                    int key = lru_test::rng_int(rng) % 100;
+                    int op = lru_test::rng_int(rng) % 10;
                     if (op < 7) (void)ttl_c.get(key);
                     else if (op < 9) ttl_c.set(key, i);
                     else (void)ttl_c.del(key);
@@ -614,11 +615,11 @@ TEST(StressIntegration, AllCacheTypesSimultaneously) {
             });
             // tls_cache_adapter thread
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t * 44444);
+                auto rng = lru_test::seed_rng(t * 44444);
                 tls_cache_adapter<safe_cache<int, int>> adapter(safe_c);
                 for (int i = 0; i < 20000; i++) {
-                    int key = rng() % 100;
-                    int op = rng() % 10;
+                    int key = lru_test::rng_int(rng) % 100;
+                    int op = lru_test::rng_int(rng) % 10;
                     if (op < 7) (void)adapter.get(key);
                     else if (op < 9) adapter.set(key, i);
                     else (void)adapter.del(key);
@@ -654,7 +655,7 @@ TEST(StressTest, LongDurationStability) {
     std::vector<std::thread> writers;
     for (int t = 0; t < 4; ++t) {
         writers.emplace_back([&, t]() {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             int key = 0;
             while (!stop.load(std::memory_order_relaxed)) {
                 cache.set(key++, "value_" + std::to_string(rng()));
@@ -667,9 +668,9 @@ TEST(StressTest, LongDurationStability) {
     std::vector<std::thread> readers;
     for (int t = 0; t < num_threads - 4; ++t) {
         readers.emplace_back([&, t]() {
-            std::mt19937 rng(t + 100);
+            auto rng = lru_test::seed_rng(t + 100);
             while (!stop.load(std::memory_order_relaxed)) {
-                auto h = cache.get(rng() % 50000);
+                auto h = cache.get(lru_test::rng_int(rng) % 50000);
                 // Use handle to ensure it's valid
                 if (h) { auto& v = *h; (void)v; }
             }
@@ -698,10 +699,14 @@ TEST(StressTest, MemoryPressureWithEviction) {
     std::vector<std::thread> threads;
     for (int t = 0; t < 8; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             int key = 0;
             while (!stop.load(std::memory_order_relaxed)) {
-                cache.set(key++, std::string(100 + rng() % 200, 'x'));
+                // P0-3: std::string's count parameter is size_type, so the
+                // int-valued draw must be widened explicitly here.
+                cache.set(key++, std::string(
+                    static_cast<std::size_t>(100 + lru_test::rng_int(rng) % 200),
+                    'x'));
                 if (key > 10000) key = 0;
             }
         });
@@ -723,10 +728,10 @@ TEST(StressTest, RandomThreadTermination) {
 
         for (int t = 0; t < 8; ++t) {
             threads.emplace_back([&, t]() {
-                std::mt19937 rng(t + round * 100);
+                auto rng = lru_test::seed_rng(t + round * 100);
                 while (!stop.load(std::memory_order_relaxed)) {
-                    int key = rng() % 10000;
-                    if (rng() % 10 == 0) cache.set(key, "v");
+                    int key = lru_test::rng_int(rng) % 10000;
+                    if (lru_test::rng_int(rng) % 10 == 0) cache.set(key, "v");
                     else { auto h = cache.get(key); (void)h; }
                 }
             });
@@ -755,10 +760,10 @@ TEST(StressTest, MixedReadPeekGet) {
 
     for (int t = 0; t < 8; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = rng() % 1000;
-                int op = rng() % 10;
+                int key = lru_test::rng_int(rng) % 1000;
+                int op = lru_test::rng_int(rng) % 10;
                 if (op == 0) cache.set(key, key);
                 else if (op < 5) { auto h = cache.get(key); (void)h; }
                 else if (op < 8) { auto p = cache.peek(key); (void)p; }
@@ -804,10 +809,10 @@ TEST(StressTest, SegmentedCacheStress) {
     std::vector<std::thread> threads;
     for (int t = 0; t < 8; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             for (int i = 0; i < ops_per_thread; ++i) {
-                int key = rng() % key_space;
-                if (rng() % 10 == 0) {
+                int key = lru_test::rng_int(rng) % key_space;
+                if (lru_test::rng_int(rng) % 10 == 0) {
                     cache.set(key, "v" + std::to_string(rng()));
                 } else {
                     auto h = cache.get(key);
@@ -845,9 +850,9 @@ TEST(ExtendedStress, ConcurrentReadWriteStress) {
 
     // Launch 8 readers + 2 writers concurrently
     launch_concurrent(deadline,
-        std::pair{8, [&](int tid, auto dl, auto& rng) {
+        std::pair{8, [&](int /*tid*/, auto dl, auto& rng) {
             while (std::chrono::steady_clock::now() < dl) {
-                int key = static_cast<int>(rng() % 5000);
+                int key = static_cast<int>(lru_test::rng_int(rng) % 5000);
                 auto result = c.get(key);
                 // read_handle must return valid data or nullopt — never crash
                 if (result.has_value()) {
@@ -856,9 +861,9 @@ TEST(ExtendedStress, ConcurrentReadWriteStress) {
                 read_ops.fetch_add(1, std::memory_order_relaxed);
             }
         }},
-        std::pair{2, [&](int tid, auto dl, auto& rng) {
+        std::pair{2, [&](int /*tid*/, auto dl, auto& rng) {
             while (std::chrono::steady_clock::now() < dl) {
-                int key = static_cast<int>(rng() % 8000);
+                int key = static_cast<int>(lru_test::rng_int(rng) % 8000);
                 c.set(key, "v" + std::to_string(key));
                 write_ops.fetch_add(1, std::memory_order_relaxed);
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -883,9 +888,9 @@ TEST(ExtendedStress, ConcurrentReadWriteWithEviction) {
 
     // Launch 8 readers + 2 writers concurrently
     launch_concurrent(deadline,
-        std::pair{8, [&](int tid, auto dl, auto& rng) {
+        std::pair{8, [&](int /*tid*/, auto dl, auto& rng) {
             while (std::chrono::steady_clock::now() < dl) {
-                int key = static_cast<int>(rng() % 5000);
+                int key = static_cast<int>(lru_test::rng_int(rng) % 5000);
                 auto result = c.get(key);
                 if (result.has_value()) {
                     // read_handle must always return valid data
@@ -897,9 +902,9 @@ TEST(ExtendedStress, ConcurrentReadWriteWithEviction) {
                 read_ops.fetch_add(1, std::memory_order_relaxed);
             }
         }},
-        std::pair{2, [&](int tid, auto dl, auto& rng) {
+        std::pair{2, [&](int /*tid*/, auto dl, auto& rng) {
             while (std::chrono::steady_clock::now() < dl) {
-                int key = static_cast<int>(rng() % 5000);
+                int key = static_cast<int>(lru_test::rng_int(rng) % 5000);
                 c.set(key, "data_" + std::to_string(key));
                 write_ops.fetch_add(1, std::memory_order_relaxed);
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -930,7 +935,7 @@ TEST(ExtendedStress, ConcurrentIteratorWithEviction) {
         // 4 iterator threads: iterate with rbegin()
         // rbegin() returns a locked_range<begin, end, lock> that keeps the
         // read lock alive. hazptr protects iterators from use-after-free.
-        std::pair{4, [&](int tid, auto dl, auto& /*rng*/) {
+        std::pair{4, [&](int /*tid*/, auto dl, auto& /*rng*/) {
             while (std::chrono::steady_clock::now() < dl) {
                 try {
                     auto range = c.rbegin();
@@ -952,10 +957,10 @@ TEST(ExtendedStress, ConcurrentIteratorWithEviction) {
             }
         }},
         // 4 writer threads: continuous set()/del()
-        std::pair{4, [&](int tid, auto dl, auto& rng) {
+        std::pair{4, [&](int /*tid*/, auto dl, auto& rng) {
             while (std::chrono::steady_clock::now() < dl) {
-                int key = static_cast<int>(rng() % 6000);
-                if (rng() % 5 == 0) {
+                int key = static_cast<int>(lru_test::rng_int(rng) % 6000);
+                if (lru_test::rng_int(rng) % 5 == 0) {
                     (void)c.del(key);
                 } else {
                     c.set(key, "new_" + std::to_string(key));
@@ -991,10 +996,10 @@ TEST(ExtendedStress, ConcurrentTTLWithEviction) {
     std::vector<std::thread> threads;
     for (int t = 0; t < 8; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 7919 + 31);
+            auto rng = lru_test::seed_rng(t * 7919 + 31);
             while (std::chrono::steady_clock::now() < deadline) {
-                int key = static_cast<int>(rng() % 3000);
-                int op = static_cast<int>(rng() % 10);
+                int key = static_cast<int>(lru_test::rng_int(rng) % 3000);
+                int op = static_cast<int>(lru_test::rng_int(rng) % 10);
                 if (op < 6) {
                     // 60% get
                     auto result = c.get(key);
@@ -1052,10 +1057,10 @@ TEST(ExtendedStress, MemoryPressureStress) {
     std::vector<std::thread> threads;
     for (int t = 0; t < 8; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 7919 + 31);
+            auto rng = lru_test::seed_rng(t * 7919 + 31);
             while (std::chrono::steady_clock::now() < deadline) {
-                int key = static_cast<int>(rng() % 15000);
-                int op = static_cast<int>(rng() % 10);
+                int key = static_cast<int>(lru_test::rng_int(rng) % 15000);
+                int op = static_cast<int>(lru_test::rng_int(rng) % 10);
 
                 if (op < 7) {
                     // 70% insert — check admission control

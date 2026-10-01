@@ -475,7 +475,9 @@ TEST(ProductionIntegration, AllFeaturesTogether) {
     }
     EXPECT_EQ(c.size(), 100u);
 
-    // Read and record latency. Note: get() records latency, try_get() does not.
+    // Read and record latency. Note: get() records latency, try_get() does
+    // not — and only while latency tracking is enabled (off by default).
+    c.set_latency_tracking(true);
     for (int i = 0; i < 100; ++i) {
         auto h = c.get(i);
         ASSERT_TRUE(h.has_value());

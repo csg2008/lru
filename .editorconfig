@@ -1,0 +1,34 @@
+# Editor defaults for the lru cache library.
+# Keeps whitespace consistent across editors that do not read .clang-format.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{cpp,hpp,h}]
+indent_size = 4
+max_line_length = 100
+
+[*.{yml,yaml,json}]
+indent_size = 2
+
+[*.md]
+# Markdown uses trailing double-spaces for hard line breaks.
+trim_trailing_whitespace = false
+
+[CMakeLists.txt]
+indent_size = 4
+
+[*.cmake]
+indent_size = 4
+
+[*.sh]
+indent_size = 4
+
+[Makefile]
+indent_style = tab

@@ -56,7 +56,9 @@ TEST(TlsEventBackupTest, ThreadExitPushesEventsToBackup) {
     constexpr int kEvents = 10;
 
     {
-        std::thread t([&tracker, kEvents]() {
+        // P0-3: kEvents is a constant expression, so capturing it is
+        // unnecessary (-Wunused-lambda-capture).
+        std::thread t([&tracker]() {
             for (int i = 0; i < kEvents; ++i) {
                 tracker.record_insert(i);
             }
@@ -83,7 +85,9 @@ TEST(TlsEventBackupTest, DrainAllThreadsRetrievesExitedThreadEvents) {
     constexpr int kEvents = 20;
 
     {
-        std::thread t([&tracker, kEvents]() {
+        // P0-3: kEvents is a constant expression, so capturing it is
+        // unnecessary (-Wunused-lambda-capture).
+        std::thread t([&tracker]() {
             for (int i = 0; i < kEvents; ++i) {
                 tracker.record_insert(i);
             }
@@ -111,7 +115,9 @@ TEST(TlsEventBackupTest, FlushAllRegisteredRetrievesBackupEvents) {
     constexpr int kEvents = 5;
 
     {
-        std::thread t([&tracker, kEvents]() {
+        // P0-3: kEvents is a constant expression, so capturing it is
+        // unnecessary (-Wunused-lambda-capture).
+        std::thread t([&tracker]() {
             for (int i = 0; i < kEvents; ++i) {
                 tracker.record_insert(i);
             }

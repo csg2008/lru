@@ -15,6 +15,7 @@
 // TSan + signal-based thread parking (covered by the stress suite).
 
 #include "../lru.hpp"
+#include "test_helpers.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -95,7 +96,7 @@ TEST(EbrForceAdvanceUaf, ConcurrentAccessUnderFailAdvance) {
     std::atomic<std::uint64_t> errors{0};
 
     auto reader = [&](unsigned int seed) {
-        std::mt19937 rng(seed);
+        auto rng = lru_test::seed_rng(seed);
         std::uniform_int_distribution<int> dist(0, 1'999);
         while (!stop.load(std::memory_order_relaxed)) {
             int key = dist(rng);
@@ -112,7 +113,7 @@ TEST(EbrForceAdvanceUaf, ConcurrentAccessUnderFailAdvance) {
     };
 
     auto writer = [&](unsigned int seed) {
-        std::mt19937 rng(seed);
+        auto rng = lru_test::seed_rng(seed);
         std::uniform_int_distribution<int> dist(1'000, 2'999);
         while (!stop.load(std::memory_order_relaxed)) {
             int key = dist(rng);

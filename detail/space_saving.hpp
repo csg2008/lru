@@ -162,7 +162,8 @@ public:
     std::vector<std::pair<Key, std::size_t>> top_k(std::size_t k) const {
         std::vector<std::pair<Key, std::size_t>> result(map_.begin(), map_.end());
         std::size_t limit = std::min(k, result.size());
-        std::partial_sort(result.begin(), result.begin() + limit,
+        std::partial_sort(result.begin(),
+                          result.begin() + static_cast<std::ptrdiff_t>(limit),
                           result.end(),
                           [](const auto& a, const auto& b) {
                               return a.second > b.second;

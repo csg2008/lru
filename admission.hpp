@@ -54,8 +54,8 @@ public:
         : num_splits_(num_splits)
         , max_per_split_(std::max(std::size_t(1), max_entries / num_splits)) {
         splits_.resize(num_splits_);
-        for (auto& split : splits_) {
-            split.entries.reserve(max_per_split_);
+        for (auto& sp : splits_) {
+            sp.entries.reserve(max_per_split_);
         }
     }
 
@@ -64,21 +64,21 @@ public:
     /// @return false if this is the first time seeing the key.
     bool insert_and_check(uint64_t key_hash) {
         auto split_idx = key_hash % num_splits_;
-        auto& split = splits_[split_idx];
+        auto& sp = splits_[split_idx];
 
         // O(1) lookup via hash set
-        auto [it, inserted] = split.entries.insert(key_hash);
+        auto [it, inserted] = sp.entries.insert(key_hash);
         if (!inserted) {
             return true; // seen before
         }
 
         // New insertion — maintain capacity
-        if (split.entries.size() > max_per_split_) {
+        if (sp.entries.size() > max_per_split_) {
             // Arbitrary eviction: begin() on unordered_dense::set has no defined
             // ordering, so the evicted key is non-deterministic. This is
             // intentional — we only need to bound the window, not pick a
             // specific victim.
-            split.entries.erase(split.entries.begin());
+            sp.entries.erase(sp.entries.begin());
         }
         ++total_inserts_;
         return false; // first time seeing this key
@@ -92,22 +92,22 @@ public:
     /// Check if present without inserting.
     bool contains(uint64_t key_hash) const {
         auto split_idx = key_hash % num_splits_;
-        const auto& split = splits_[split_idx];
-        return split.entries.find(key_hash) != split.entries.end();
+        const auto& sp = splits_[split_idx];
+        return sp.entries.find(key_hash) != sp.entries.end();
     }
 
     /// Remove a key hash from the set.
     void remove(uint64_t key_hash) {
         auto split_idx = key_hash % num_splits_;
-        auto& split = splits_[split_idx];
-        split.entries.erase(key_hash);
+        auto& sp = splits_[split_idx];
+        sp.entries.erase(key_hash);
     }
 
     /// Total number of keys currently tracked.
     std::size_t size() const noexcept {
         std::size_t total = 0;
-        for (const auto& split : splits_) {
-            total += split.entries.size();
+        for (const auto& sp : splits_) {
+            total += sp.entries.size();
         }
         return total;
     }
@@ -119,8 +119,8 @@ public:
 
     /// Clear all tracked keys.
     void clear() {
-        for (auto& split : splits_) {
-            split.entries.clear();
+        for (auto& sp : splits_) {
+            sp.entries.clear();
         }
         total_inserts_ = 0;
     }

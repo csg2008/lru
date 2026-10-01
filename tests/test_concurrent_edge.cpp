@@ -85,7 +85,7 @@ TEST(ConcurrentEdge, CasAtomicityUnderConcurrency) {
     safe_cache<int, int> c(64);
     c.set(42, 0);
 
-    constexpr int kThreads = 4;
+    constexpr std::size_t kThreads = 4;
     constexpr int kAttemptsPerThread = 200;
     std::atomic<int> success_count{0};
     std::atomic<int> fail_count{0};
@@ -96,7 +96,7 @@ TEST(ConcurrentEdge, CasAtomicityUnderConcurrency) {
     // CAS workers: each thread tries to increment the shared counter a
     // bounded number of times. After each failed CAS, the thread yields
     // and retries with the freshly-read expected value.
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&] {
             int successes = 0;
             for (int i = 0; i < kAttemptsPerThread; ++i) {
@@ -158,9 +158,8 @@ TEST(ConcurrentEdge, TryGetOrFetchThunderingHerd) {
     safe_cache<int, std::string> c(64);
     c.set_per_cache_handle_tracking(false);
 
-    constexpr int kThreads = 32;
+    constexpr std::size_t kThreads = 32;
     std::atomic<int> provider_invocations{0};
-    std::atomic<std::string*> first_value{nullptr};
     std::atomic<bool> go{false};
     std::vector<std::thread> threads;
     std::vector<std::string> results(kThreads);
@@ -172,7 +171,7 @@ TEST(ConcurrentEdge, TryGetOrFetchThunderingHerd) {
         return std::string("val_") + std::to_string(key);
     };
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             // Spin until all threads are ready.
             while (!go.load(std::memory_order_acquire)) {
@@ -187,7 +186,7 @@ TEST(ConcurrentEdge, TryGetOrFetchThunderingHerd) {
     for (auto& th : threads) th.join();
 
     // All threads must observe the same value.
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         EXPECT_EQ(results[t], std::string("val_99"))
             << "thread " << t << " got unexpected value";
     }
@@ -196,8 +195,10 @@ TEST(ConcurrentEdge, TryGetOrFetchThunderingHerd) {
     // in the current try_get_or_fetch implementation), but the number should
     // be bounded. A reasonable upper bound is the number of threads; an
     // unbounded count would indicate a true thundering herd.
+    // P0-3: invocations is signed (atomic<int>), kThreads is std::size_t — the
+    // comparison converts explicitly at this one boundary.
     int invocations = provider_invocations.load();
-    EXPECT_LE(invocations, kThreads)
+    EXPECT_LE(invocations, static_cast<int>(kThreads))
         << "provider invoked " << invocations << " times (thundering herd)";
     EXPECT_GE(invocations, 1);
 }
@@ -228,7 +229,7 @@ TEST(ConcurrentEdge, GetOrFetchSingleflightCoalescesMisses) {
     c.set_singleflight_enabled(true);
     ASSERT_TRUE(c.is_singleflight_enabled());
 
-    constexpr int kThreads = 32;
+    constexpr std::size_t kThreads = 32;
     std::atomic<int> provider_invocations{0};
     std::atomic<bool> go{false};
     std::vector<std::thread> threads;
@@ -243,7 +244,7 @@ TEST(ConcurrentEdge, GetOrFetchSingleflightCoalescesMisses) {
         return std::string("val_") + std::to_string(key);
     };
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             while (!go.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -255,7 +256,7 @@ TEST(ConcurrentEdge, GetOrFetchSingleflightCoalescesMisses) {
     for (auto& th : threads) th.join();
 
     // All threads observe the same value.
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         EXPECT_EQ(results[t], std::string("val_99"))
             << "thread " << t << " got unexpected value";
     }
@@ -282,7 +283,7 @@ TEST(ConcurrentEdge, TryGetOrFetchSingleflightCoalescesMisses) {
     c.set_per_cache_handle_tracking(false);
     c.set_singleflight_enabled(true);
 
-    constexpr int kThreads = 32;
+    constexpr std::size_t kThreads = 32;
     std::atomic<int> provider_invocations{0};
     std::atomic<bool> go{false};
     std::vector<std::thread> threads;
@@ -294,7 +295,7 @@ TEST(ConcurrentEdge, TryGetOrFetchSingleflightCoalescesMisses) {
         return std::string("val_") + std::to_string(key);
     };
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             while (!go.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -305,7 +306,7 @@ TEST(ConcurrentEdge, TryGetOrFetchSingleflightCoalescesMisses) {
     go.store(true, std::memory_order_release);
     for (auto& th : threads) th.join();
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         EXPECT_EQ(results[t], std::string("val_99"))
             << "thread " << t << " got unexpected value";
     }
@@ -327,7 +328,7 @@ TEST(ConcurrentEdge, SingleflightDisabledDoesNotCoalesce) {
     c.set_per_cache_handle_tracking(false);
     ASSERT_FALSE(c.is_singleflight_enabled());
 
-    constexpr int kThreads = 16;
+    constexpr std::size_t kThreads = 16;
     std::atomic<int> provider_invocations{0};
     std::atomic<bool> go{false};
     std::vector<std::thread> threads;
@@ -339,7 +340,7 @@ TEST(ConcurrentEdge, SingleflightDisabledDoesNotCoalesce) {
         return std::string("val_") + std::to_string(key);
     };
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             while (!go.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -368,7 +369,7 @@ TEST(ConcurrentEdge, SingleflightPropagatesProviderException) {
     c.set_per_cache_handle_tracking(false);
     c.set_singleflight_enabled(true);
 
-    constexpr int kThreads = 8;
+    constexpr std::size_t kThreads = 8;
     std::atomic<int> provider_invocations{0};
     std::atomic<bool> go{false};
     std::vector<std::thread> threads;
@@ -381,7 +382,7 @@ TEST(ConcurrentEdge, SingleflightPropagatesProviderException) {
         throw std::runtime_error("provider_failed_" + std::to_string(key));
     };
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             while (!go.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -398,7 +399,7 @@ TEST(ConcurrentEdge, SingleflightPropagatesProviderException) {
     for (auto& th : threads) th.join();
 
     // All threads must observe the leader's exception.
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         EXPECT_TRUE(threw[t]) << "thread " << t << " did not receive exception";
         EXPECT_EQ(errors[t], "provider_failed_42")
             << "thread " << t << " received wrong exception message";
@@ -420,8 +421,8 @@ TEST(ConcurrentEdge, SingleflightDistinctKeysAreNotCoalesced) {
     c.set_per_cache_handle_tracking(false);
     c.set_singleflight_enabled(true);
 
-    constexpr int kKeys = 8;
-    constexpr int kThreadsPerKey = 4;
+    constexpr std::size_t kKeys = 8;
+    constexpr std::size_t kThreadsPerKey = 4;
     std::atomic<int> provider_invocations{0};
     std::atomic<bool> go{false};
     std::vector<std::thread> threads;
@@ -432,13 +433,15 @@ TEST(ConcurrentEdge, SingleflightDistinctKeysAreNotCoalesced) {
         return std::string("val_") + std::to_string(key);
     };
 
-    for (int k = 0; k < kKeys; ++k) {
-        for (int t = 0; t < kThreadsPerKey; ++t) {
+    for (std::size_t k = 0; k < kKeys; ++k) {
+        for (std::size_t t = 0; t < kThreadsPerKey; ++t) {
             threads.emplace_back([&, k] {
                 while (!go.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
-                (void)c.get_or_fetch(k, provider);
+                // P0-3: k is std::size_t (vector/count index type) while the
+                // cache key type is int, so convert at this boundary.
+                (void)c.get_or_fetch(static_cast<int>(k), provider);
             });
         }
     }
@@ -446,7 +449,8 @@ TEST(ConcurrentEdge, SingleflightDistinctKeysAreNotCoalesced) {
     for (auto& th : threads) th.join();
 
     // Each distinct key must invoke the provider exactly once.
-    EXPECT_EQ(provider_invocations.load(), kKeys)
+    // P0-3: provider_invocations is atomic<int> while kKeys is std::size_t.
+    EXPECT_EQ(provider_invocations.load(), static_cast<int>(kKeys))
         << "singleflight over-coalesced distinct keys";
     // Followers across all keys: kKeys * (kThreadsPerKey - 1).
     EXPECT_EQ(c.stampede_coalesced_count(), kKeys * (kThreadsPerKey - 1));
@@ -570,7 +574,7 @@ TEST(ConcurrentEdge, SingleflightCoalescesTtlExpiryStampede) {
     // Confirm the key has expired (try_get returns nullopt).
     EXPECT_FALSE(c.try_get(7).has_value());
 
-    constexpr int kThreads = 32;
+    constexpr std::size_t kThreads = 32;
     std::atomic<int> provider_invocations{0};
     std::atomic<bool> go{false};
     std::vector<std::thread> threads;
@@ -582,7 +586,7 @@ TEST(ConcurrentEdge, SingleflightCoalescesTtlExpiryStampede) {
         return std::string("refreshed_") + std::to_string(key);
     };
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             while (!go.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -593,7 +597,7 @@ TEST(ConcurrentEdge, SingleflightCoalescesTtlExpiryStampede) {
     go.store(true, std::memory_order_release);
     for (auto& th : threads) th.join();
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         EXPECT_EQ(results[t], std::string("refreshed_7"))
             << "thread " << t << " got unexpected value";
     }
@@ -612,7 +616,7 @@ TEST(ConcurrentEdge, SingleflightWorksWithProductionCache) {
     c.set_per_cache_handle_tracking(false);
     c.set_singleflight_enabled(true);
 
-    constexpr int kThreads = 16;
+    constexpr std::size_t kThreads = 16;
     std::atomic<int> provider_invocations{0};
     std::atomic<bool> go{false};
     std::vector<std::thread> threads;
@@ -624,7 +628,7 @@ TEST(ConcurrentEdge, SingleflightWorksWithProductionCache) {
         return std::string("val_") + std::to_string(key);
     };
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             while (!go.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -635,7 +639,7 @@ TEST(ConcurrentEdge, SingleflightWorksWithProductionCache) {
     go.store(true, std::memory_order_release);
     for (auto& th : threads) th.join();
 
-    for (int t = 0; t < kThreads; ++t) {
+    for (std::size_t t = 0; t < kThreads; ++t) {
         EXPECT_EQ(results[t], std::string("val_123"))
             << "thread " << t << " got unexpected value";
     }
@@ -683,16 +687,17 @@ TEST(ConcurrentEdge, PinnedSkipCountIncrementsOnConcurrentEvict) {
 // ============================================================================
 TEST(ConcurrentEdge, BulkGetHandleSurvivesEviction) {
     safe_cache<int, std::string> c(20);
-    constexpr int kKeys = 8;
+    constexpr std::size_t kKeys = 8;
 
     // Pre-populate.
-    for (int i = 0; i < kKeys; ++i) {
-        c.set(i, "v" + std::to_string(i));
+    for (std::size_t i = 0; i < kKeys; ++i) {
+        // P0-3: i is std::size_t, the cache key type is int.
+        c.set(static_cast<int>(i), "v" + std::to_string(i));
     }
 
     // Snapshot the keys we want to verify.
     std::vector<int> keys(kKeys);
-    for (int i = 0; i < kKeys; ++i) keys[i] = i;
+    for (std::size_t i = 0; i < kKeys; ++i) keys[i] = static_cast<int>(i);
 
     // Acquire handles via bulk_get.
     auto handles = c.bulk_get(keys.begin(), keys.end());
@@ -710,7 +715,7 @@ TEST(ConcurrentEdge, BulkGetHandleSurvivesEviction) {
     });
 
     // While evictions are happening, dereference each handle.
-    for (int i = 0; i < kKeys; ++i) {
+    for (std::size_t i = 0; i < kKeys; ++i) {
         ASSERT_TRUE(handles[i].has_value());
         std::string v = **handles[i];
         EXPECT_EQ(v, "v" + std::to_string(i));
@@ -719,7 +724,7 @@ TEST(ConcurrentEdge, BulkGetHandleSurvivesEviction) {
     evictor.join();
 
     // After evictions, the handles must STILL be valid (they pin the items).
-    for (int i = 0; i < kKeys; ++i) {
+    for (std::size_t i = 0; i < kKeys; ++i) {
         ASSERT_TRUE(handles[i].has_value());
         std::string v = **handles[i];
         EXPECT_EQ(v, "v" + std::to_string(i));

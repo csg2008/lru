@@ -20,6 +20,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace lru_test {
@@ -49,6 +50,63 @@ inline std::uint64_t read_test_seed(std::uint64_t default_seed) {
     } catch (...) {
         return default_seed;
     }
+}
+
+// P0-3 (fix.01 方案 B, type convergence): std::mt19937's seed type is unsigned
+// (result_type == uint32_t), whereas a test suite naturally derives a
+// per-thread seed from a signed loop counter or an unsigned index:
+//
+//     std::mt19937 rng(t * 7919 + 31);   // int    -> unsigned : -Wsign-conversion
+//     std::mt19937 rng(t);               // size_t -> uint32_t: -Wconversion
+//
+// This project builds with -Wconversion -Wsign-conversion -Werror, so every
+// such construction site would need a cast. Route the seed expression through
+// this helper instead: the single narrowing/sign conversion happens explicitly,
+// once, in one documented place, and the seed VALUE is unchanged:
+//
+//     auto rng = lru_test::seed_rng(t * 7919 + 31);
+//
+// The parameter is a constrained template so that both signed and unsigned
+// seed types reach it without a diagnostic at the call site.
+template <typename Seed, typename = std::enable_if_t<std::is_integral_v<Seed>>>
+[[nodiscard]] inline std::mt19937 seed_rng(Seed seed_value) noexcept {
+    return std::mt19937(static_cast<std::mt19937::result_type>(seed_value));
+}
+
+// P0-3 companion to seed_rng(): the ubiquitous bounded-draw idiom
+//
+//     int key = rng() % bound;
+//
+// crosses the signed/unsigned boundary twice per draw — `bound` is converted to
+// std::mt19937::result_type (uint32_t) for the modulo, and the unsigned result
+// is converted back to int for the assignment. This project builds with
+// -Wconversion -Wsign-conversion -Werror, so every such site would need a cast.
+//
+// `rng_int(rng)` makes the draw int-valued, so the modulo and the assignment are
+// both int operations:
+//
+//     int key = lru_test::rng_int(rng) % bound;
+//
+// The computed value is bit-identical to `rng() % bound` for every bound the
+// test suite uses (all bounds are >= 1 and far below 2^31).
+class int_draw {
+public:
+    explicit int_draw(std::mt19937::result_type value) noexcept : value_(value) {}
+
+    template <typename Bound, typename = std::enable_if_t<std::is_integral_v<Bound>>>
+    [[nodiscard]] int operator%(Bound bound) const noexcept {
+        using result_type = std::mt19937::result_type;
+        return static_cast<int>(value_ % static_cast<result_type>(bound));
+    }
+
+    [[nodiscard]] std::mt19937::result_type raw() const noexcept { return value_; }
+
+private:
+    std::mt19937::result_type value_;
+};
+
+[[nodiscard]] inline int_draw rng_int(std::mt19937& engine) noexcept {
+    return int_draw(engine());
 }
 
 // Watchdog: runs a callable and fails (returns false) if it does not

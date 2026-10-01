@@ -155,9 +155,9 @@ TEST(ConcurrentMMStrategies, TinyLfuReadHeavyCorrectness) {
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             for (int i = 0; i < kOpsPerThread; ++i) {
-                int key = rng() % 100;
+                int key = lru_test::rng_int(rng) % 100;
                 if (i % 50 == 0) {
                     c.set(key, "v" + std::to_string(key));
                 } else {

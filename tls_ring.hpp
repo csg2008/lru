@@ -2135,7 +2135,7 @@ public:
         const auto now_ns = static_cast<std::uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count());
         const std::uint64_t threshold_ns =
-            static_cast<std::uint64_t>(idle_threshold.count() * 1000000ULL);  // ms → ns
+            static_cast<std::uint64_t>(idle_threshold.count()) * 1000000ULL;  // ms → ns
 
         std::size_t drained_threads = 0;
         std::vector<Key> all_drained_keys;

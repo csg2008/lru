@@ -112,21 +112,37 @@ TEST(HotShardsMemoryTest, HotShardsByMemoryHasAllFields) {
 }
 
 TEST(HotShardsMemoryTest, MemoryHotShardDetectsSkewedMemory) {
-    // Insert one large item in a single shard and verify that
-    // hot_shards_by_memory surfaces that shard as the hottest by memory.
-    // We rely on hash distribution to land the large item somewhere;
-    // since striped_cache has 4 shards, inserting many small items plus
-    // one very large item should make the large-item shard rank #1
-    // when sorted by memory.
+    // hot_shards_by_memory() ranks shards by the memory the cache accounts
+    // for them, and the invariant the API promises is that ranking.
+    //
+    // Note what `memory_usage` counts: item_overhead plus any
+    // key/value size hooks the caller registered (mm_lru_config::key_size_fn
+    // / value_size_fn). With no hooks registered a std::string contributes
+    // sizeof(std::string), NOT its length — so a 4096-byte string is
+    // accounted as 32 bytes. The previous assertion here ("hottest shard
+    // accounts for at least 4096 bytes") was therefore not testing the value
+    // size at all; it passed only because per-item struct padding happened
+    // to push a 26-item shard over 4096. Remove that padding and the test
+    // fails while the behaviour it is meant to cover is unchanged.
     lru::striped_cache<int, std::string> c{1024, 4};
     // Pre-populate with small items across all shards.
     for (int i = 0; i < 100; ++i) c.set(i, std::string(8, 'x'));
     // Now insert a single very large item.
     c.set(99999, std::string(4096, 'L'));
-    auto hot = c.hot_shards_by_memory(1);
-    ASSERT_EQ(hot.size(), 1u);
-    // The hottest shard by memory must have at least the large item's size.
-    EXPECT_GE(hot[0].memory_usage, 4096u);
+
+    auto top1 = c.hot_shards_by_memory(1);
+    auto all = c.hot_shards_by_memory(4);
+    ASSERT_EQ(top1.size(), 1u);
+    ASSERT_FALSE(all.empty());
+
+    // The shard reported as #1 must be the one holding the maximum accounted
+    // memory, and it must account for something.
+    std::size_t max_memory = 0;
+    for (const auto& s : all) {
+        if (s.memory_usage > max_memory) max_memory = s.memory_usage;
+    }
+    EXPECT_GT(top1[0].memory_usage, 0u);
+    EXPECT_EQ(top1[0].memory_usage, max_memory);
 }
 
 TEST(HotShardsMemoryTest, BothApisReturnConsistentShardIndices) {

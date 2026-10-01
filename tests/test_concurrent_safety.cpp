@@ -22,6 +22,7 @@
 #include <string>
 
 #include "lru.hpp"
+#include "test_helpers.hpp"
 
 using namespace lru;
 using namespace std::chrono_literals;
@@ -90,10 +91,10 @@ TEST(ConcurrentSafety, ConcurrentMixedOperationsNoCrash) {
 
     for (int t = 0; t < kNumThreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t * 42 + 7);
+            auto rng = lru_test::seed_rng(t * 42 + 7);
             for (int i = 0; i < kIterations; ++i) {
-                int key = rng() % 2000;
-                int op = rng() % 10;
+                int key = lru_test::rng_int(rng) % 2000;
+                int op = lru_test::rng_int(rng) % 10;
                 try {
                     if (op < 5) {
                         c.set(key, "val_" + std::to_string(key));
@@ -336,9 +337,9 @@ TEST(ConcurrentSafety, TlsRingCrossThreadDrain) {
     // Writer threads: continuously set and get keys
     for (int t = 0; t < kNumThreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             for (int i = 0; i < 2000 && !stop.load(std::memory_order_relaxed); ++i) {
-                int key = rng() % 1000;
+                int key = lru_test::rng_int(rng) % 1000;
                 c.set(key, "val");
                 c.get(key);
             }
@@ -425,15 +426,19 @@ TEST(ConcurrentSafety, ConcurrentEvictionWithHandles) {
     // Readers: get handles and hold them briefly
     for (int t = 0; t < kNumReaders; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             for (int i = 0; i < 5000 && !stop.load(std::memory_order_relaxed); ++i) {
-                int key = rng() % 10000;
+                int key = lru_test::rng_int(rng) % 10000;
                 try {
                     auto h = c.get(key);
                     if (h) {
-                        // Hold handle for a short time
-                        volatile auto& v = *h;
-                        (void)v;
+                        // Force an actual read of the pinned value so that a
+                        // use-after-free faults here. P0-3: a `(void)` cast on a
+                        // volatile reference does not constitute an access in
+                        // GCC ("conversion to void will not access object of
+                        // type volatile ..."), so read the value into a local.
+                        const auto observed = *h;
+                        (void)observed;
                     }
                 } catch (...) {
                     crashes.fetch_add(1, std::memory_order_relaxed);
@@ -462,10 +467,10 @@ TEST(ConcurrentSafety, StatsConsistencyUnderConcurrency) {
 
     for (int t = 0; t < kNumThreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(t);
+            auto rng = lru_test::seed_rng(t);
             for (int i = 0; i < kIterations; ++i) {
-                int key = rng() % 1000;
-                if (rng() % 2 == 0) {
+                int key = lru_test::rng_int(rng) % 1000;
+                if (lru_test::rng_int(rng) % 2 == 0) {
                     c.set(key, "val");
                 } else {
                     c.get(key);

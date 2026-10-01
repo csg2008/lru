@@ -232,7 +232,9 @@ TEST(LatencyHistogramSum, ConcurrentRecordProducesExactSum) {
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&h, per_thread]() {
+        // P0-3: per_thread is a constant expression, so capturing it is
+        // unnecessary (-Wunused-lambda-capture).
+        threads.emplace_back([&h]() {
             for (int i = 1; i <= per_thread; ++i) {
                 h.record(static_cast<uint64_t>(i));
             }
@@ -353,7 +355,11 @@ TEST(LatencyHistogramSum, ConcurrentRecordDistinctValuesExactSum) {
     const uint64_t tri = static_cast<uint64_t>(per_thread) * (per_thread + 1) / 2;
     uint64_t expected_sum = 0;
     for (int t = 0; t < num_threads; ++t) {
-        expected_sum += static_cast<uint64_t>(per_thread) * (base * t) + tri;
+        // P0-3: (base * t) needs an explicit unsigned conversion — base is
+        // uint64_t while t is int, and this project builds with
+        // -Wsign-conversion.
+        expected_sum += static_cast<uint64_t>(per_thread) *
+                            (base * static_cast<uint64_t>(t)) + tri;
     }
     const uint64_t expected_count =
         static_cast<uint64_t>(num_threads) * per_thread;
@@ -361,7 +367,9 @@ TEST(LatencyHistogramSum, ConcurrentRecordDistinctValuesExactSum) {
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&h, t, base, per_thread]() {
+        // P0-3: base is a constant expression and per_thread is unused inside
+        // the lambda body -> neither needs capturing.
+        threads.emplace_back([&h, t]() {
             for (int i = 1; i <= per_thread; ++i) {
                 h.record(base * static_cast<uint64_t>(t) +
                          static_cast<uint64_t>(i));

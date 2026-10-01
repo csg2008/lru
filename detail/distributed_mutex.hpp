@@ -127,10 +127,16 @@ inline std::size_t current_numa_node() noexcept {
     // Win7+: GetCurrentProcessorNumber + GetNumaProcessorNode.
     // node == 0xFF indicates the processor doesn't belong to a NUMA
     // node (shouldn't happen on NUMA hardware, but defensive).
-    DWORD cpu = ::GetCurrentProcessorNumber();
-    UCHAR node = 0;
-    if (::GetNumaProcessorNode(cpu, &node) && node != 0xFF) {
-        return static_cast<std::size_t>(node);
+    const DWORD cpu = ::GetCurrentProcessorNumber();
+    // GetNumaProcessorNode takes the processor number as a UCHAR, so a
+    // machine with more than 255 logical processors cannot be described by
+    // it. Range-check rather than silently truncating (which would report a
+    // wrong NUMA node).
+    if (cpu <= 0xFFu) {
+        UCHAR node = 0;
+        if (::GetNumaProcessorNode(static_cast<UCHAR>(cpu), &node) && node != 0xFF) {
+            return static_cast<std::size_t>(node);
+        }
     }
     return 0;
 #else
@@ -471,8 +477,14 @@ public:
             return false;
         }
         uint32_t expected = 0;
+        // seq_cst, paired with the reader's seq_cst increment on
+        // reader_nodes_: the two RMWs must share one total order, otherwise
+        // a writer can claim kWriterFlag while the reader's increment is
+        // still in flight in the other direction and both enter (see
+        // lock_shared()). On x86-64 this is already the `lock cmpxchg`
+        // barrier and costs nothing.
         if (!state_.compare_exchange_weak(expected, kWriterFlag,
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            std::memory_order_seq_cst, std::memory_order_relaxed)) {
             record_try_fail();
             return false;
         }
@@ -561,11 +573,25 @@ public:
         // cache line, so concurrent readers on different nodes do not
         // ping-pong a shared line.
         std::size_t my_node = pick_reader_node();
-        // G23: relaxed is sufficient — the subsequent state_.load(acquire)
-        // provides the required synchronization; acquire here is redundant
-        // and adds a barrier on ARM (dmb ish). The fetch_add only needs
-        // atomicity, not a happens-before edge with other threads' writes.
-        reader_nodes_[my_node].value.fetch_add(1, std::memory_order_relaxed);
+        // The increment must be seq_cst, NOT relaxed or acquire.
+        //
+        // This is a store-load pair split across two variables: the reader
+        // writes reader_nodes_[my_node] and then reads state_; the writer
+        // RMWs state_ and then reads every reader_nodes_[]. Without a
+        // common total order on the two RMWs, both sides can miss each
+        // other — the reader sees no kWriterFlag and enters, while the
+        // writer's sum_readers() has not yet observed the increment and
+        // also enters. Mutual exclusion is broken.
+        //
+        // An acquire/release pair does not fix this: acquire orders later
+        // accesses against this one, but does not prevent this store from
+        // being delayed past the subsequent load. seq_cst on both RMWs is
+        // what gives the two operations a single total order.
+        //
+        // On x86-64 the RMW is `lock xadd`, already a full barrier, so this
+        // costs nothing; on AArch64/Power it adds the `dmb ish` that makes
+        // the lock actually correct there.
+        reader_nodes_[my_node].value.fetch_add(1, std::memory_order_seq_cst);
         // Re-check state_ for kWriterFlag (writer may have just acquired).
         if (state_.load(std::memory_order_acquire) & kWriterFlag) {
             // A writer holds the lock — undo increment and go to slow path.
@@ -591,24 +617,44 @@ public:
         // reader overall — nothing to wake.
         if (readers_in_node > 0) return;
         // Our node drained to zero — we may be the last reader overall.
-        // Check writer-wait flag first (single atomic load) to avoid the
-        // O(N) sum_readers() call when no writer is waiting.
+        // Only a queued writer needs waking, and the check for one is a
+        // single atomic load.
+        //
+        // The "only readers can be waiting" branch below is NOT dead code,
+        // even though a reader can never observe kWriterFlag set on itself:
+        // readers that were parked while a writer held the lock are still
+        // sitting inside do_wait_reader(), and unlock() only ever wakes ONE
+        // of them. This chain is what releases the rest.
+        //
+        // Removing it on the reasoning that "with both flags clear nobody
+        // can be waiting" starves every parked reader except the first —
+        // exactly what DistributedMutexTest.WriterFairPreventsWriterStarvation
+        // caught. (state_ is not the right authority here: what matters is
+        // whether a thread is parked in the wait primitive, which is not
+        // visible in state_.)
+        //
+        // sum_readers() is O(kNumReaderNodes) and is paid only on the path
+        // where this thread's own node drained to zero. That is the price of
+        // knowing whether we are the last reader, and therefore whether the
+        // wake chain has to continue.
         if (state_.load(std::memory_order_acquire) & kWriterWaitFlag) {
-            // A writer is queued — wake ALL waiters only if we are the last
-            // reader. Waking all ensures the writer is served; in writer_fair
-            // mode readers may also be waiting on the same CV (blocked by
-            // kWriterWaitFlag), and notify_one could wake one of them instead
-            // of the writer — leaving the writer starved.
+            // A writer is queued — wake ALL waiters once we are the last
+            // reader. Waking all ensures the writer is served; in
+            // writer_fair mode readers may also be waiting on the same CV
+            // (blocked by kWriterWaitFlag), and notify_one could wake one of
+            // them instead of the writer, leaving the writer starved.
             // P0-1/B: pay O(kNumReaderNodes) only when our own node drained
-            // AND a writer is queued — the rarest case in read-heavy workloads.
+            // AND a writer is queued — the rarest case in read-heavy
+            // workloads.
             if (sum_readers() == 0) {
                 do_wake_all();
             }
         } else {
-            // Only readers may be waiting — chain-wake: wake just one reader
-            // if we are the last reader overall. That reader will propagate
-            // the wake in its own unlock_shared(), avoiding the thundering-
-            // herd problem where all waiting readers wake simultaneously.
+            // Only readers may be waiting — chain-wake: wake exactly one, and
+            // let that reader propagate the wake from its own
+            // unlock_shared(), which avoids the thundering-herd problem where
+            // all parked readers wake at once. See the note above on why this
+            // branch is required.
             if (sum_readers() == 0) {
                 do_wake_one();
             }
@@ -1058,8 +1104,10 @@ private:
             // has kWriterWaitFlag set and kWriterFlag clear) and stores
             // kWriterFlag (kWriterFlag set, kWriterWaitFlag clear).
             if (!(state & kWriterFlag)) {
+                // seq_cst claim, paired with the reader's seq_cst increment
+                // on reader_nodes_ — see try_lock() / lock_shared().
                 if (state_.compare_exchange_weak(state, kWriterFlag,
-                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                        std::memory_order_seq_cst, std::memory_order_relaxed)) {
                     // Acquired — drain outstanding readers before returning.
                     // T-P3-2: bounded spin with yield + periodic sleep to
                     // avoid unbounded CPU burn if a reader is preempted by
@@ -1136,9 +1184,10 @@ private:
                 continue;
             }
 
-            // No writer holds — increment per-node counter (acquire).
-            // P0-1/B: no shared aggregate RMW.
-            reader_nodes_[my_node].value.fetch_add(1, std::memory_order_acquire);
+            // No writer holds — increment per-node counter. seq_cst for the
+            // same reason as the fast path: the increment and the writer's
+            // state_ RMW need one total order (see lock_shared()).
+            reader_nodes_[my_node].value.fetch_add(1, std::memory_order_seq_cst);
             // Re-check state_ for kWriterFlag — if set, undo and retry.
             if (state_.load(std::memory_order_acquire) & kWriterFlag) {
                 reader_nodes_[my_node].value.fetch_sub(1, std::memory_order_release);
@@ -1178,8 +1227,9 @@ private:
                 continue;
             }
             // No writer active or waiting — increment per-node counter.
-            // P0-1/B: no shared aggregate RMW.
-            reader_nodes_[my_node].value.fetch_add(1, std::memory_order_acquire);
+            // seq_cst for the same reason as the fast path: the increment and
+            // the writer's state_ RMW need one total order (see lock_shared()).
+            reader_nodes_[my_node].value.fetch_add(1, std::memory_order_seq_cst);
             // Re-check — if a writer activated or queued, undo and retry.
             if (state_.load(std::memory_order_acquire) &
                 (kWriterFlag | kWriterWaitFlag)) {

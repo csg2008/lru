@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -69,8 +70,17 @@ inline std::size_t sample_rss_bytes() {
     HMODULE psapi = ::LoadLibraryW(L"psapi.dll");
     if (!psapi) return 0;
     using GetProcessMemoryInfo_t = BOOL(WINAPI*)(HANDLE, void*, DWORD);
-    auto fn = reinterpret_cast<GetProcessMemoryInfo_t>(
-        ::GetProcAddress(psapi, "GetProcessMemoryInfo"));
+    // P0-3: GetProcAddress returns FARPROC (int(*)()), an incompatible
+    // function-pointer type; launder the address through memcpy rather than a
+    // function-pointer cast, which trips GCC's -Wcast-function-type (and, for
+    // the two-step void(*)() form, Clang's -Wcast-function-type-strict).
+    GetProcessMemoryInfo_t fn = nullptr;
+    {
+        FARPROC raw = ::GetProcAddress(psapi, "GetProcessMemoryInfo");
+        static_assert(sizeof(fn) == sizeof(raw),
+                      "resolved signature must fit GetProcAddress's result");
+        std::memcpy(&fn, &raw, sizeof(fn));
+    }
     if (!fn) { ::FreeLibrary(psapi); return 0; }
     struct PMC {
         DWORD  cb; DWORD PageFaultCount;
@@ -125,10 +135,10 @@ void run_configurable_concurrent(
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(static_cast<unsigned>(t * 7919 + 1));
+            auto rng = lru_test::seed_rng(static_cast<unsigned>(t * 7919 + 1));
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = static_cast<int>(rng() % key_space);
-                if (rng() % 100 < read_percent) {
+                int key = static_cast<int>(lru_test::rng_int(rng) % key_space);
+                if (lru_test::rng_int(rng) % 100 < read_percent) {
                     auto h = c.try_get(key);
                     if (h && **h != key * 10) {
                         value_mismatch.fetch_add(1, std::memory_order_relaxed);
@@ -163,10 +173,10 @@ void run_fixed_ops_concurrent(
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(static_cast<unsigned>(t * 7919 + 1));
+            auto rng = lru_test::seed_rng(static_cast<unsigned>(t * 7919 + 1));
             for (int i = 0; i < ops_per_thread; ++i) {
-                int key = static_cast<int>(rng() % key_space);
-                if (rng() % 100 < read_percent) {
+                int key = static_cast<int>(lru_test::rng_int(rng) % key_space);
+                if (lru_test::rng_int(rng) % 100 < read_percent) {
                     auto h = c.try_get(key);
                     if (h && **h != key * 10) {
                         value_mismatch.fetch_add(1, std::memory_order_relaxed);
@@ -282,10 +292,10 @@ TEST(HighConcurrencySuite, ExtremeReadRatio999Percent) {
     std::vector<std::thread> threads;
     for (int t = 0; t < nthreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(static_cast<unsigned>(t * 7919 + 1));
+            auto rng = lru_test::seed_rng(static_cast<unsigned>(t * 7919 + 1));
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = static_cast<int>(rng() % 5000);
-                if (rng() % 1000 < 1) {
+                int key = static_cast<int>(lru_test::rng_int(rng) % 5000);
+                if (lru_test::rng_int(rng) % 1000 < 1) {
                     // 0.1% writes
                     c.set(key, key * 10);
                 } else {
@@ -343,10 +353,10 @@ TEST(HighConcurrencySuite, ExtremeReadRatio9999Percent) {
     std::vector<std::thread> threads;
     for (int t = 0; t < nthreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(static_cast<unsigned>(t * 7919 + 1));
+            auto rng = lru_test::seed_rng(static_cast<unsigned>(t * 7919 + 1));
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = static_cast<int>(rng() % 5000);
-                if (rng() % 10000 < 1) {
+                int key = static_cast<int>(lru_test::rng_int(rng) % 5000);
+                if (lru_test::rng_int(rng) % 10000 < 1) {
                     // 0.01% writes
                     c.set(key, key * 10);
                 } else {
@@ -426,10 +436,10 @@ TEST(HighConcurrencySuite, EpochAdvancementUnderReadHeavyLoad) {
     std::vector<std::thread> threads;
     for (int t = 0; t < nthreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(static_cast<unsigned>(t * 7919 + 1));
+            auto rng = lru_test::seed_rng(static_cast<unsigned>(t * 7919 + 1));
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = static_cast<int>(rng() % key_space);
-                if (rng() % 100 < 20) {
+                int key = static_cast<int>(lru_test::rng_int(rng) % key_space);
+                if (lru_test::rng_int(rng) % 100 < 20) {
                     c.set(key, key * 10);
                 } else {
                     auto h = c.try_get(key);
@@ -504,9 +514,9 @@ TEST(HighConcurrencySuite, ExtendedSoak32Threads) {
         c.set(i, i * 10);
     }
     {
-        std::mt19937 rng(12345);
+        auto rng = lru_test::seed_rng(12345);
         for (int i = 0; i < 2000; ++i) {
-            int key = static_cast<int>(rng() % 5000);
+            int key = static_cast<int>(lru_test::rng_int(rng) % 5000);
             if (i % 20 == 0) c.set(key, key * 10);
             else c.try_get(key);
         }
@@ -521,10 +531,10 @@ TEST(HighConcurrencySuite, ExtendedSoak32Threads) {
     std::vector<std::thread> threads;
     for (int t = 0; t < nthreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(static_cast<unsigned>(t * 7919 + 1));
+            auto rng = lru_test::seed_rng(static_cast<unsigned>(t * 7919 + 1));
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = static_cast<int>(rng() % 5000);
-                if (rng() % 100 < 5) {
+                int key = static_cast<int>(lru_test::rng_int(rng) % 5000);
+                if (lru_test::rng_int(rng) % 100 < 5) {
                     c.set(key, key * 10);
                 } else {
                     auto h = c.try_get(key);
@@ -649,10 +659,10 @@ TEST(HighConcurrencySuite, DeferredPromotion32Threads) {
     std::vector<std::thread> threads;
     for (int t = 0; t < nthreads; ++t) {
         threads.emplace_back([&, t]() {
-            std::mt19937 rng(static_cast<unsigned>(t * 7919 + 1));
+            auto rng = lru_test::seed_rng(static_cast<unsigned>(t * 7919 + 1));
             while (!stop.load(std::memory_order_relaxed)) {
-                int key = static_cast<int>(rng() % key_space);
-                if (rng() % 100 < 5) {
+                int key = static_cast<int>(lru_test::rng_int(rng) % key_space);
+                if (lru_test::rng_int(rng) % 100 < 5) {
                     c.set(key, key * 10);
                 } else {
                     auto h = c.try_get(key);

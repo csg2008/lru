@@ -6,10 +6,12 @@
 // own codebase rather than scattering the calls across business logic.
 //
 // Build:
-//   cmake -B build -G "MinGW Makefiles" \
-//       -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
+//   cmake -B build -G "MinGW Makefiles"
+//       -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
 //       -DCMAKE_BUILD_TYPE=Release -DLRU_BUILD_EXAMPLES=ON
 //   mingw32-make -C build -j2 production_example
+// (P0-3: the original comment used trailing backslashes for line continuation,
+//  which turns the block into one multi-line comment and trips -Wcomment.)
 
 #include <chrono>
 #include <iostream>
