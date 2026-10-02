@@ -32,6 +32,8 @@
 #define LRU_DETAIL_REFCOUNT_HPP
 
 #include <atomic>
+#include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 
@@ -316,14 +318,30 @@ public:
         }
     }
 
-    /// Decrement access_ref. Throws on underflow. Returns new value with admin bits.
+    /// fix.01: count of observed access_ref underflows — a handle released
+    /// twice. Exposed so the condition is diagnosable instead of fatal.
+    static std::size_t underflow_count() noexcept {
+        return s_underflow_count_.load(std::memory_order_relaxed);
+    }
+
+    /// Decrement access_ref. Never throws — see the underflow branch below.
+    /// Returns the new value with admin bits.
     Value decRef() {
         Value old = value_.load(std::memory_order_acquire);
         uint32_t spins = 0;  // T-P2-2: CAS backoff counter
         while (true) {
             Value access = old & kAccessRefMask;
             if (access == 0) {
-                throw std::underflow_error("refcount_with_flags: access_ref underflow");
+                // fix.01: do NOT throw. decRef() is reached from
+                // read_handle::release(), which the noexcept destructor calls —
+                // throwing there is std::terminate, not a catchable error.
+                // Underflow means a handle was released twice; the counter is
+                // already at its floor, so report it, assert in debug builds so
+                // the bug is not silently tolerated during development, and
+                // return the value unchanged.
+                assert(false && "refcount_with_flags: access_ref underflow");
+                s_underflow_count_.fetch_add(1, std::memory_order_relaxed);
+                return old;
             }
             Value desired = old - 1ULL;
             if (value_.compare_exchange_weak(old, desired,
@@ -565,6 +583,9 @@ public:
     }
 
 private:
+    /// fix.01: process-wide count of access_ref underflows (double release).
+    static inline std::atomic<std::size_t> s_underflow_count_{0};
+
     // Deliberately NOT cache-line aligned.
     //
     // False sharing is a problem for a counter that many threads update

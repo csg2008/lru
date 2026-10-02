@@ -1298,9 +1298,21 @@ void deserialize(sharded_mm_lru<Key, Value, Hash, KeyEqual>& cache,
         throw std::runtime_error("deserialization: num_shards mismatch");
     }
 
+    // fix.01 P1-32: two-phase — parse and validate EVERY shard before touching
+    // the cache. The old code deserialized shard by shard, so a corrupt shard
+    // in the middle threw after earlier shards had already been replaced,
+    // leaving the cache half-updated (and unrecoverable, since the caller sees
+    // only an exception). Parsing first means a failure leaves the cache
+    // exactly as it was. This matches every other MM's deserialize().
+    std::vector<detail::parsed_deserialization_data<Key, Value>> parsed;
+    parsed.reserve(num_shards);
     for (uint32_t i = 0; i < num_shards; ++i) {
         auto shard_span = r.read_span();
-        deserialize(cache.shard(i), shard_span);
+        parsed.push_back(detail::parse_serialized_data<Key, Value>(
+            detail::mm_type_id::lru, shard_span));
+    }
+    for (uint32_t i = 0; i < num_shards; ++i) {
+        detail::rebuild_from_parsed(cache.shard(i), parsed[i]);
     }
 }
 
@@ -1310,16 +1322,56 @@ void deserialize(sharded_mm_lru<Key, Value, Hash, KeyEqual>& cache,
 
 #ifdef LRU_SERIALIZATION_FILE_IO
 
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
+#if defined(_WIN32)
+    #include <io.h>       // _commit, _fileno
+#else
+    #include <unistd.h>   // fsync, fileno
+#endif
 
-/// Save serialized data to a file.
+/// Save serialized data to a file ATOMICALLY.
+///
+/// fix.01 P1-31: this used to write straight into the destination, so an
+/// interrupted write (crash, power loss, or a reader racing the save) left a
+/// truncated cache file behind. It now writes a sibling temp file, forces it
+/// to disk, and only then renames it over the destination — the same
+/// crash-safe pattern the warm_cache snapshots use.
+///
+/// The explicit flush-to-disk is not redundant with rename(): rename only
+/// orders the directory entry, not the file's data blocks, so without it a
+/// power loss can leave the new name pointing at blocks that were never
+/// written.
 inline void save_to_file(const std::vector<uint8_t>& data, const std::string& path) {
-    std::ofstream file(path, std::ios::binary);
-    if (!file) {
-        throw std::runtime_error("save_to_file: cannot open " + path);
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) {
+        throw std::runtime_error("save_to_file: cannot open " + tmp);
     }
-    file.write(reinterpret_cast<const char*>(data.data()),
-               static_cast<std::streamsize>(data.size()));
+    const bool wrote_ok =
+        data.empty() || std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    const bool flush_ok = std::fflush(f) == 0;
+    bool sync_ok = false;
+    if (wrote_ok && flush_ok) {
+#if defined(_WIN32)
+        sync_ok = ::_commit(::_fileno(f)) == 0;
+#else
+        sync_ok = ::fsync(::fileno(f)) == 0;
+#endif
+    }
+    std::fclose(f);
+    if (!wrote_ok || !flush_ok || !sync_ok) {
+        std::remove(tmp.c_str());
+        throw std::runtime_error("save_to_file: failed to write " + tmp);
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::remove(tmp.c_str());
+        throw std::runtime_error("save_to_file: cannot rename " + tmp + " -> " +
+                                 path + ": " + ec.message());
+    }
 }
 
 /// Load serialized data from a file.

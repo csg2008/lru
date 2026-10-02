@@ -148,6 +148,15 @@ public:
         /// key is auto-unregistered. Default: 0.5 (i.e., 500 hits/sec
         /// when threshold is 1000).
         double auto_unregister_ratio = 0.5;
+
+        /// fix.01 P1-26: the hit-sampling rate of the event_tracker feeding
+        /// auto_subscribe(). Set this to the tracker's
+        /// `config::hit_sampling_rate` (default 0.01). top_keys() reports
+        /// SAMPLED counts, so without this the QPS thresholds above were
+        /// compared against ~1% of the real traffic and auto_subscribe
+        /// needed on the order of 100x the intended QPS before it ever
+        /// registered a key.
+        double tracker_hit_sampling_rate = 0.01;
     };
 
     /// Construct the manager wrapping `cache`.
@@ -213,6 +222,16 @@ public:
     /// event_tracker's hot-key list. Idempotent.
     void register_candidate(const key_type& key) {
         std::unique_lock<std::shared_mutex> lock(candidate_mutex_);
+        // fix.01 P1-26: bound the registry. Nothing ever removed entries
+        // automatically, so an application that registers candidates
+        // dynamically (e.g. every key it sees) grew this set without limit
+        // while auto_subscribe() re-scanned all of it on every poll. Past the
+        // cap the application is registering more keys than the replica set
+        // could ever hold, so refusing new candidates is the honest outcome
+        // (call unregister_candidate() to make room).
+        if (candidates_.size() >= kMaxCandidates && candidates_.find(key) == candidates_.end()) {
+            return;
+        }
         candidates_.insert(key);
     }
 
@@ -279,10 +298,19 @@ public:
         hot_map.reserve(hot.size());
         for (auto& [h, c] : hot) hot_map[h] = c;
 
-        const std::size_t register_threshold =
-            static_cast<std::size_t>(cfg_.auto_qps_threshold * interval_sec);
+        // fix.01 P1-26: scale by the tracker's hit-sampling rate (see
+        // config::tracker_hit_sampling_rate). top_keys() returns sampled
+        // counts, so a 1000 QPS threshold has to become "1000 * interval *
+        // sampling_rate" sampled hits — otherwise the comparison demanded
+        // ~100x the configured traffic at the default 1% sampling.
+        const double sr = cfg_.tracker_hit_sampling_rate > 0.0
+                              ? cfg_.tracker_hit_sampling_rate
+                              : 1.0;
+        const std::size_t register_threshold = static_cast<std::size_t>(
+            static_cast<double>(cfg_.auto_qps_threshold) * interval_sec * sr);
         const std::size_t unregister_threshold = static_cast<std::size_t>(
-            cfg_.auto_qps_threshold * cfg_.auto_unregister_ratio * interval_sec);
+            static_cast<double>(cfg_.auto_qps_threshold) *
+            cfg_.auto_unregister_ratio * interval_sec * sr);
 
         // Snapshot candidates.
         std::vector<key_type> cand_snapshot;
@@ -775,8 +803,17 @@ private:
             constexpr int width = static_cast<int>(sizeof(U)) * 8;
             constexpr int half = width / 2;
             const U marker = static_cast<U>(0xDBu) << half;
-            const U idx_mask = (static_cast<U>(idx) << (half - 4))
-                               & ((~U{0}) << half);
+            // fix.01 P1-25: put `idx` in the high half. The old shift was
+            // `half - 4`, which for a 32-bit key is 12 — every idx the caller
+            // actually passes (0..replica_factor-1, default 0..3) stayed below
+            // bit `half`, the mask then ANDed it away, and idx_mask was 0 for
+            // ALL of them. So every replica key collapsed onto the same value:
+            // integer keys got no replication at all while replica_count()
+            // still reported replicas. Shifting by `half` puts idx in the high
+            // half; XORing with the marker keeps distinct idx distinct (both
+            // occupy the high half's low byte only when replica_factor <= 256,
+            // which the count is bounded by anyway).
+            const U idx_mask = static_cast<U>(idx) << half;
             return static_cast<key_type>(k ^ marker ^ idx_mask);
         } else {
             static_assert(!std::is_same_v<key_type, key_type>,
@@ -826,6 +863,9 @@ private:
     /// auto-replicate. Protected by candidate_mutex_ (independent from
     /// metadata_mutex_ so candidate updates don't block replica reads).
     mutable std::shared_mutex candidate_mutex_;
+    /// fix.01 P1-26: cap on the candidate registry (see register_candidate()).
+    static constexpr std::size_t kMaxCandidates = 4096;
+
     std::unordered_set<key_type> candidates_;
 
     /// T-G9: Background auto_subscribe worker.

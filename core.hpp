@@ -1794,8 +1794,17 @@ struct cache_stats {
     padded_atomic_size eviction_failed{};
 
     // TTL diagnostics
-    padded_atomic_size ttl_expired_count{};        // total expired items cleaned up
-    std::atomic<std::size_t> ttl_cleanup_backlog{0};      // items still expired at last cleanup scan (read-mostly)
+    // Total items that expired — counted both where a reader discovered the
+    // expiry (peek_for_get/check_expiry) and where the background cleaner
+    // reaped it (fix.01 P1-19: the cleaner path used not to count at all, so
+    // this read as "items a reader happened to notice").
+    padded_atomic_size ttl_expired_count{};
+    // fix.01 P1-19: per-shard flag — 1 when the last TTL sweep filled its
+    // batch budget on this shard (expired items still pending), 0 otherwise.
+    // The cross-shard sum therefore reads as "shards with pending expiry",
+    // which is the operator-actionable signal that the cleaner is falling
+    // behind. The field was exported as a gauge but never written before.
+    std::atomic<std::size_t> ttl_cleanup_backlog{0};
     // P1-10: Total TTL checks performed on the read path (peek_for_get).
     // Increments every time an item with expiry_ns != 0 is accessed —
     // whether or not it is expired. ttl_expired_count / ttl_checked_count
@@ -2816,7 +2825,14 @@ public:
     read_handle(const read_handle& other) noexcept
         : value_(other.value_),
           refcount_(other.refcount_),
-          per_cache_stats_(other.per_cache_stats_) {
+          per_cache_stats_(other.per_cache_stats_),
+          // fix.01 P1-33b: propagate the notifier. Every constructor that sets
+          // per_cache_stats_ must also set notifier_, because release() uses
+          // it to decide whether cache-owned state is still alive; a copied
+          // handle that lost it would fall back to dereferencing
+          // per_cache_stats_ unconditionally (use-after-free after the cache
+          // was destroyed).
+          notifier_(other.notifier_) {
         if (refcount_) {
             auto result = refcount_->incRef();
             if (result != detail::IncResult::kIncOk) {
@@ -2838,7 +2854,8 @@ public:
     read_handle(const read_handle<U>& other) noexcept
         : value_(other.get()),
           refcount_(other.refcount_ptr()),
-          per_cache_stats_(other.per_cache_stats_ptr()) {
+          per_cache_stats_(other.per_cache_stats_ptr()),
+          notifier_(other.notifier_ptr()) {  // fix.01 P1-33b: see copy ctor
         if (refcount_) {
             auto result = refcount_->incRef();
             if (result != detail::IncResult::kIncOk) {
@@ -2877,6 +2894,7 @@ public:
             value_ = other.value_;
             refcount_ = other.refcount_;
             per_cache_stats_ = new_stats;
+            notifier_ = other.notifier_;  // fix.01 P1-33b: see copy ctor
         }
         return *this;
     }
@@ -2885,19 +2903,33 @@ public:
     template <typename U>
         requires std::convertible_to<U*, T*>
     read_handle& operator=(const read_handle<U>& other) noexcept {
+        // fix.01 P1-33b: this overload used to leave `per_cache_stats_` (and
+        // `notifier_`) pointing at the PREVIOUS handle's cache. The new item's
+        // per-cache handle count was never incremented, while release() would
+        // later decrement the stale counter — a per-cache accounting leak that
+        // also made the notifier point at the wrong cache. Capture both from
+        // the source.
+        cache_stats* new_stats = other.per_cache_stats_ptr();
         if (other.refcount_) {
             auto result = other.refcount_->incRef();
             if (result != detail::IncResult::kIncOk) {
                 release();
                 value_ = nullptr;
                 refcount_ = nullptr;
+                per_cache_stats_ = nullptr;
+                notifier_ = nullptr;
                 return *this;
             }
             inc_active_count_debug();
+            if (new_stats) {
+                new_stats->active_handle_count.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         release();
         value_ = other.get();
         refcount_ = other.refcount_ptr();
+        per_cache_stats_ = new_stats;
+        notifier_ = other.notifier_ptr();
         return *this;
     }
 
@@ -2905,10 +2937,12 @@ public:
     read_handle(read_handle&& other) noexcept
         : value_(other.value_),
           refcount_(other.refcount_),
-          per_cache_stats_(other.per_cache_stats_) {
+          per_cache_stats_(other.per_cache_stats_),
+          notifier_(other.notifier_) {  // fix.01 P1-33b: see copy ctor
         other.value_ = nullptr;
         other.refcount_ = nullptr;
         other.per_cache_stats_ = nullptr;
+        other.notifier_ = nullptr;
     }
 
     /// Move assignment.
@@ -2918,9 +2952,11 @@ public:
             value_ = other.value_;
             refcount_ = other.refcount_;
             per_cache_stats_ = other.per_cache_stats_;
+            notifier_ = other.notifier_;  // fix.01 P1-33b: see copy ctor
             other.value_ = nullptr;
             other.refcount_ = nullptr;
             other.per_cache_stats_ = nullptr;
+            other.notifier_ = nullptr;
         }
         return *this;
     }
@@ -3026,6 +3062,11 @@ public:
 
     /// Internal: expose the per-cache stats pointer for cross-instantiation conversions.
     cache_stats* per_cache_stats_ptr() const noexcept { return per_cache_stats_; }
+
+    /// Internal: expose the notifier pointer for cross-instantiation
+    /// conversions (fix.01 P1-33b: the notifier must travel with the stats
+    /// pointer through every copy/move/conversion).
+    handle_release_notifier* notifier_ptr() const noexcept { return notifier_; }
 
     /// Task C: Attach (or re-attach) a per-cache stats pointer to a handle
     /// that was constructed with nullptr (e.g., returned by peek_for_get).

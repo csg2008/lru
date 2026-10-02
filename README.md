@@ -232,6 +232,8 @@ fifo_cache<int, std::string> c(1000);
 | `get_multi(keys)` | 批量读取（`span<const Key>`），按 stripe 分组减少锁获取 |
 | `set_multi(pairs)` | 批量写入（`span<const pair<K,V>>`），按 stripe 分组减少锁获取 |
 | `bulk_get(first, last)` | 按 shard 分组批量读取，每 shard 仅获取一次读锁 |
+| `bulk_get(std::span<const Key>)` | 同上，接受任意连续区间（`vector` / `array` / C 数组）；`bulk_get({k1,k2})` 亦可 |
+| `bulk_try_get(...)` | 同 `bulk_get` 的三种调用形式，但为**非抛出版本**：shutdown 后返回全 `nullopt` 而非抛异常（对应单键的 `get` / `try_get` 区别） |
 | `flush()` | 清空所有条目 |
 | `size()` | 当前条目数 |
 | `max_size()` / `max_size(n)` | 容量上限 getter/setter |
@@ -315,11 +317,16 @@ if (monitor.should_admit(item_size)) {
 
 ```cpp
 // 启用 slab 分配器（11 大小类：64 ~ 65536 字节）
-cache.set_slab_allocator_options(slab_allocator_options{...});
-cache.enable_slab_allocator();
+// 真实 API 是 enable_slab_allocator(const slab_allocator::config&)；
+// 历史上文档中的 set_slab_allocator_options() / start_slab_rebalancer()
+// 在代码里并不存在（后台 rebalancer 已移除），已按实现更正。
+cache.enable_slab_allocator(slab_allocator::config{
+    .slab_size = 65536,
+    // per_class_slab_sizes / per_class_max_slabs / numa_node 均为构造期参数
+});
 
-// 后台再平衡
-cache.start_slab_rebalancer();
+// 运行期只可调整单个大小类的上限：
+cache.mm().set_max_slots_for_class(/*class_index=*/3, /*max=*/64);
 ```
 
 - 每大小类独立 lock-free Treiber stack（ABA-safe tagged pointer）
@@ -339,7 +346,7 @@ cache.start_slab_rebalancer();
     ┌────────▼────────┐  ┌─────────▼────────┐  ┌─────────▼────────┐
     │ Segmented Hash  │  │  Sharded MM LRU  │  │ 64-stripe Lock   │
     │ Table (64 seg)  │  │  (64 shards)     │  │ (dist_shared_mutex)│
-    │ per-seg rehash  │  │  per-shard lock  │  │  writer_fair 默认 │
+    │ per-seg rehash  │  │  per-shard lock  │  │ 见下方说明（非固定）│
     └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
              │                    │                     │
     ┌────────▼────────┐  ┌───────▼────────┐  ┌────────▼────────┐
@@ -354,8 +361,9 @@ cache.start_slab_rebalancer();
 - **find_and_pin()**：原子化 find + incRef，消除 TOCTOU
 - **TLS 延迟提升**：`get()` 在 TLS ring buffer 中记录访问，非阻塞 `drain_access_ring()` 批量提升
 - **defer_promotion 默认开启**：`get()` 命中时不强制触发写锁，延迟到 TLS ring 批量提升，显著降低读路径锁压力
-- **refcount_with_flags**：CAS 无锁引用计数（11-bit flags + 3-bit admin_ref + 18-bit access_ref）
-- **distributed_shared_mutex**：默认 `writer_fair` 公平模式（防止写者饥饿），fast path 单 CAS ~10ns，WaitOnAddress/futex 慢路径；运行时可切换 `reader_preferred`；支持运行时锁顺序检查开关 `set_lock_order_checking()`
+- **refcount_with_flags**：CAS 无锁引用计数（5-bit flags + 3-bit admin_ref + 32-bit access_ref，单个 64 位原子字；实际位宽见 `detail/refcount.hpp`）
+- **distributed_shared_mutex**：**互斥体自身**默认 `writer_fair`（防止写者饥饿）；fast path 单 CAS ~10ns，WaitOnAddress/futex 慢路径；运行时可切换 `reader_preferred`。
+  ⚠️ 但**缓存别名**的默认值不同：`safe_cache` / `striped_cache` / `read_heavy_*` 经各自的 trait 默认 **`reader_preferred`**（见 `cache_trait.hpp` 的 `safe_lru_trait` / `safe_sharded_lru_trait`），而 `concurrent_hash_table` 内部锁也默认 `reader_preferred`。三者默认值并不一致，排障时请以 `c.get_fairness_mode()` 的实际返回为准，不要照搬文档。
 - **segmented rehash**：64 段独立 rehash，不阻塞其他段读写
 - **增量 rehash**（chain / F14 / segmented 三种模式均支持）：`set_incremental_rehash(true)` 启用后，rehash 分批迁移桶，避免写路径一次性停顿。F14 模式按 14-slot chunk 迁移并使用 dual-array lookup；segmented 模式对 64 个段独立应用增量 rehash，任一时刻只阻塞 1/64 的桶。`segmented_*` / `production_*` 别名在构造时自动启用。
 - **bulk_get 优化**：按 shard 分组，每 shard 仅获取一次读锁；`record_access` 移出锁范围以避免 drain 死锁
@@ -657,6 +665,49 @@ while (c.active_handle_count() > 0) {
 - ❌ 切换 `set_fairness_mode` 时未等待 quiescent —— 文档要求在无活跃锁时切换，
   否则可能让正在排队的 writer 永久等待（debug 构建有 assert）。
 - ❌ 频繁 `set_incremental_rehash(true/false)` 运行时切换 —— 一次配置后保持。
+
+## 统一配置对象 `lru::config`
+
+> fix.01 P1-38：库里有约 20 个分子系统 config 结构体与约 50 个运行时 setter，
+> 「可配置」在细节上成立，但**没有单一对象**可以构造、校验、打印或传递。
+> `lru::config` 把部署中最常调的开关聚合成一个对象，`apply_config()` 一次性下发。
+
+```cpp
+#include "lru.hpp"
+
+lru::production_cache<int, std::string> c(1'000'000);
+
+lru::config cfg;
+cfg.max_size                   = 1'000'000;
+cfg.max_memory                 = 512ull * 1024 * 1024;  // unlimited = 不限制
+cfg.memory_soft_watermark      = 0.85;   // 超过即触发激进淘汰
+cfg.memory_critical_watermark  = 0.95;   // 超过即拒绝新插入
+cfg.num_stripes                = 128;    // 高核机器建议 128+
+cfg.num_shards                 = 64;
+cfg.incremental_rehash         = true;   // 扩容不全局停顿
+cfg.defer_promotion            = true;   // get() 命中不抢写锁
+cfg.fairness                   = lru::detail::fairness_mode::reader_preferred;
+cfg.ebr                        = true;   // 仅 LRU/sharded 变体支持
+cfg.ttl_cleaner_interval       = std::chrono::seconds(1);  // 0 = 不启动清理线程
+cfg.ttl_evict_batch_size       = 64;     // 0 = 每次持锁清完所有过期项
+cfg.ttl_jitter_enabled         = true;
+cfg.ttl_jitter_pct             = 0.10;
+cfg.async_callbacks            = false;
+cfg.latency_tracking           = false;  // 默认关（开启约 +68% 单次操作延迟）
+
+lru::apply_config(c, cfg);              // 校验失败会抛 std::invalid_argument
+std::cout << cfg.to_string() << "\n";   // 单行快照，可直接进日志
+```
+
+要点：
+
+- **先构造、后下发**：容量与分片数仍由缓存构造函数决定，`apply_config()` 负责其余开关。
+- **全部 `requires` 守卫**：把 `lru::config` 传给 `compact_cache`、`ttl_cache` 等不实现某个
+  开关的类型时，该开关是 no-op 而不是编译错误。
+- **`validate()` 显式失败**：软水位 > 硬水位、分片数为 0、jitter 为负等会抛异常，
+  不再静默产生行为怪异的缓存。
+- 未被 `lru::config` 覆盖的参数（slab 大小类、TLS ring 阈值、准入策略等）仍通过
+  各自的子系统 config 传递，例如 `lru::slab_allocator::config`、`lru::tls_access_ring_config`。
 
 ## 2Q / TinyLFU / W-TinyLFU 缓存
 

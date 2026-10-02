@@ -43,6 +43,7 @@
 #include <mutex>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "ankerl/unordered_dense.h"
@@ -977,14 +978,16 @@ public:
                                           std::make_move_iterator(drained.entries.begin()),
                                           std::make_move_iterator(drained.entries.end()));
                 }
+                // T20.3 + fix.01 P1-45: also drain this instance's slice of the
+                // backup buffer (events pushed by exited threads). It must be
+                // per-instance — see push_to_backup().
+                auto backup = drain_backup(e.instance_id);
+                if (!backup.entries.empty()) {
+                    result.entries.insert(result.entries.end(),
+                                          std::make_move_iterator(backup.entries.begin()),
+                                          std::make_move_iterator(backup.entries.end()));
+                }
             }
-        }
-        // T20.3: Drain the backup buffer (events from exited threads).
-        auto backup = drain_backup();
-        if (!backup.entries.empty()) {
-            result.entries.insert(result.entries.end(),
-                                  std::make_move_iterator(backup.entries.begin()),
-                                  std::make_move_iterator(backup.entries.end()));
         }
         return result;
     }
@@ -1017,7 +1020,7 @@ public:
         // threads). This ensures dying-thread events are surfaced before
         // any newly-recorded events on live threads, preserving temporal
         // order to the extent possible.
-        auto backup = drain_backup();
+        auto backup = drain_backup(instance_id_);  // fix.01 P1-45
         if (!backup.entries.empty()) {
             result.entries = std::move(backup.entries);
         }
@@ -1071,32 +1074,65 @@ public:
     /// Push events from a dying thread's TLS ring into the global backup.
     /// Called by `thread_exit_sentinel` when the thread is about to exit.
     /// Safe to call from any thread; the backup is mutex-protected.
-    static void push_to_backup(std::vector<event_entry>&& entries) {
+    static void push_to_backup(std::uint64_t instance_id,
+                               std::vector<event_entry>&& entries) {
         if (entries.empty()) return;
         auto& bk = backup_buffer();
         std::lock_guard<std::mutex> lock(bk.mutex);
-        bk.entries.insert(bk.entries.end(),
-                          std::make_move_iterator(entries.begin()),
-                          std::make_move_iterator(entries.end()));
+        auto& slot = bk.by_instance[instance_id];
+        slot.insert(slot.end(),
+                    std::make_move_iterator(entries.begin()),
+                    std::make_move_iterator(entries.end()));
     }
 
-    /// Drain the global backup buffer, returning all events accumulated
-    /// from exited threads. After this call the backup buffer is empty.
-    /// Safe to call from any thread.
-    static drain_result drain_backup() {
+    /// Drain the backup buffer for ONE instance, returning events that dying
+    /// threads pushed for it. Safe to call from any thread.
+    static drain_result drain_backup(std::uint64_t instance_id) {
         drain_result result;
         auto& bk = backup_buffer();
         std::lock_guard<std::mutex> lock(bk.mutex);
-        result.entries = std::move(bk.entries);
-        bk.entries.clear();
+        auto it = bk.by_instance.find(instance_id);
+        if (it == bk.by_instance.end()) return result;
+        result.entries = std::move(it->second);
+        bk.by_instance.erase(it);
         return result;
     }
 
-    /// Whether the global backup buffer has any pending events.
-    static bool has_backup_entries() {
+    /// Whether this instance's backup has any pending events.
+    static bool has_backup_entries(std::uint64_t instance_id) {
         auto& bk = backup_buffer();
         std::lock_guard<std::mutex> lock(bk.mutex);
-        return !bk.entries.empty();
+        auto it = bk.by_instance.find(instance_id);
+        return it != bk.by_instance.end() && !it->second.empty();
+    }
+
+    /// fix.01 P1-45: drain EVERY instance's backup slice and return the union.
+    ///
+    /// Callers that own a specific tracker use `drain_backup(id)`; this
+    /// aggregate form exists for teardown and for code (tests, diagnostics)
+    /// that does not track instance ids. It intentionally crosses instances,
+    /// so it is not what the per-instance drain path uses.
+    static drain_result drain_all_backups() {
+        drain_result result;
+        auto& bk = backup_buffer();
+        std::lock_guard<std::mutex> lock(bk.mutex);
+        for (auto& kv : bk.by_instance) {
+            result.entries.insert(result.entries.end(),
+                std::make_move_iterator(kv.second.begin()),
+                std::make_move_iterator(kv.second.end()));
+        }
+        bk.by_instance.clear();
+        return result;
+    }
+
+    /// Whether ANY instance's backup has pending events.
+    static bool has_any_backup_entries() {
+        auto& bk = backup_buffer();
+        std::lock_guard<std::mutex> lock(bk.mutex);
+        for (const auto& kv : bk.by_instance) {
+            if (!kv.second.empty()) return true;
+        }
+        return false;
     }
 
 private:
@@ -1215,7 +1251,12 @@ private:
     // --------------------------------------------------------------------
     struct backup_storage {
         std::mutex mutex;
-        std::vector<event_entry> entries;
+        // fix.01 P1-45: keyed by instance id. This used to be a single
+        // specialization-wide vector, so with two event_tracker<Key> instances
+        // alive, events a dying thread pushed on behalf of instance A were
+        // consumed by B's drain_all_threads() and counted into B's totals —
+        // silently corrupting both trackers' reports.
+        std::unordered_map<std::uint64_t, std::vector<event_entry>> by_instance;
     };
 
     /// Backup buffer singleton — one per Key/Hash/N specialization.
@@ -1301,7 +1342,7 @@ private:
                 // However, the backup is static (one per template
                 // instantiation), so any instance of the same type shares
                 // the same backup. We can therefore push directly.
-                push_to_backup(std::move(entries));
+                push_to_backup(inst_id, std::move(entries));
             }
         }
     };

@@ -147,6 +147,16 @@ std::size_t write_bytes(const T& v, void* dst, std::size_t cap) {
         if (dst && cap >= n) std::memcpy(dst, v.data(), n);
         return n;
     } else if constexpr (is_std_vector<T>::value) {
+        // fix.01 P1-23: only trivially copyable elements may be memcpy'd. For
+        // std::vector<std::string> this branch copied the string OBJECTS (each
+        // holding a heap pointer), and read_bytes() on the process that
+        // attaches then copy-CONSTRUCTED strings from the writer process's
+        // pointers — a use-after-free. Non-trivial element types must supply
+        // their own serialize/deserialize (the branch above takes precedence).
+        static_assert(std::is_trivially_copyable_v<typename T::value_type>,
+            "shared-memory serialization of std::vector<T> requires a "
+            "trivially copyable T; provide free serialize()/deserialize() "
+            "overloads for containers of non-trivial types");
         std::size_t n = v.size() * sizeof(typename T::value_type);
         if (dst && cap >= n) std::memcpy(dst, v.data(), n);
         return n;
@@ -170,6 +180,13 @@ template <typename T>
                 v.clear();
             }
         } else if constexpr (is_std_vector<T>::value) {
+            // fix.01 P1-23: see write_bytes — element type must be trivially
+            // copyable, otherwise this reconstructs objects from another
+            // process's pointers.
+            static_assert(std::is_trivially_copyable_v<typename T::value_type>,
+                "shared-memory deserialization of std::vector<T> requires a "
+                "trivially copyable T; provide free serialize()/deserialize() "
+                "overloads for containers of non-trivial types");
             if (len > 0) {
                 v.assign(static_cast<const typename T::value_type*>(src),
                          len / sizeof(typename T::value_type));
@@ -339,7 +356,14 @@ public:
                 return;
             }
         } else {
-            newly_created_ = true;
+            // fix.01 P1-22: only a first-try success of an O_CREAT|O_EXCL open
+            // means WE created the segment. With create == false the open above
+            // carries no O_CREAT, so success means the segment already existed
+            // — marking it "new" then ftruncate()d it and re-initialised the
+            // header, wiping the persisted cache on every attach. (The Windows
+            // path checks ERROR_ALREADY_EXISTS and got this right; the two
+            // platforms disagreed.)
+            newly_created_ = config.create;
         }
 
         // Set the size if we created the segment
@@ -734,24 +758,33 @@ private:
 // T5.3: CRC32 (IEEE 802.3 polynomial, table-less branchless implementation)
 // ----------------------------------------------------------------------------
 
-inline uint32_t crc32_compute(const void* data, std::size_t len) noexcept {
-    // Polynomial 0xEDB88320 (reflected). Use a lazily-initialized table
-    // for throughput on large data regions; fall back to byte-by-byte
-    // computation otherwise.
+/// fix.01 P2-18: the 256-entry CRC table, initialized exactly once.
+///
+/// The previous version guarded the table with a hand-rolled
+/// `std::atomic<int>` flag: two threads could both observe "not initialised"
+/// and write the non-atomic `table[]` concurrently (a data race), while a
+/// third could observe the flag set by the first and read entries the second
+/// was still writing. A function-local `static const` gets C++11's guaranteed
+/// thread-safe one-time initialisation, with no flag and no fallback path.
+inline const std::array<uint32_t, 256>& crc32_table() noexcept {
+    // Polynomial 0xEDB88320 (reflected).
     static constexpr uint32_t kPoly = 0xEDB88320u;
-    static uint32_t table[256];
-    static std::atomic<int> table_init{0};  // 0 = not init, 1 = init done
-    if (table_init.load(std::memory_order_acquire) == 0) {
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t{};
         for (uint32_t i = 0; i < 256; ++i) {
             uint32_t c = i;
             for (int k = 0; k < 8; ++k) {
                 c = (c & 1u) ? (kPoly ^ (c >> 1)) : (c >> 1);
             }
-            table[i] = c;
+            t[i] = c;
         }
-        table_init.store(1, std::memory_order_release);
-    }
+        return t;
+    }();
+    return table;
+}
 
+inline uint32_t crc32_compute(const void* data, std::size_t len) noexcept {
+    const auto& table = crc32_table();
     const auto* p = static_cast<const uint8_t*>(data);
     uint32_t crc = 0xFFFFFFFFu;
     for (std::size_t i = 0; i < len; ++i) {

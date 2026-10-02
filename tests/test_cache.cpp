@@ -812,8 +812,8 @@ TEST(MemoryMonitorTest, SetRejectsNewKeyWhenOverCriticalWatermark) {
     // so each item is larger. Use a generous memory limit to ensure
     // the first two keys fit but the third is rejected.
     cfg.max_memory_bytes.store(2048);
-    cfg.high_watermark_fraction.store(1.0);
-    cfg.critical_watermark_fraction.store(0.5);
+    cfg.throttle_fraction.store(1.0);
+    cfg.critical_fraction.store(0.5);
     c.set_memory_monitor(cfg);
     EXPECT_TRUE(c.monitor().active());
 
@@ -846,8 +846,8 @@ TEST(MemoryMonitorTest, ExistingKeyUpdateRespectsAdmission) {
     cache<int, int> c(100);
     memory_monitor::config cfg;
     cfg.max_memory_bytes.store(4096);
-    cfg.high_watermark_fraction.store(1.0);
-    cfg.critical_watermark_fraction.store(0.5);
+    cfg.throttle_fraction.store(1.0);
+    cfg.critical_fraction.store(0.5);
     c.set_memory_monitor(cfg);
 
     // Below critical watermark: update succeeds.
@@ -880,8 +880,8 @@ TEST(MemoryMonitorTest, AddReturnsFalseWhenRejected) {
     // from 1024 → 2048 so the first two keys still fit before critical
     // watermark is hit.
     cfg.max_memory_bytes.store(2048);
-    cfg.high_watermark_fraction.store(1.0);
-    cfg.critical_watermark_fraction.store(0.5);
+    cfg.throttle_fraction.store(1.0);
+    cfg.critical_fraction.store(0.5);
     c.set_memory_monitor(cfg);
 
     EXPECT_TRUE(c.add(1, 10));
@@ -902,8 +902,8 @@ TEST(MemoryMonitorTest, ReplaceAlwaysAllowsExistingKeyUpdate) {
     cache<int, int> c(100);
     memory_monitor::config cfg;
     cfg.max_memory_bytes.store(4096);
-    cfg.high_watermark_fraction.store(1.0);
-    cfg.critical_watermark_fraction.store(0.5);
+    cfg.throttle_fraction.store(1.0);
+    cfg.critical_fraction.store(0.5);
     c.set_memory_monitor(cfg);
 
     c.set(1, 10);
@@ -917,8 +917,8 @@ TEST(MemoryMonitorTest, ReplaceReturnsFalseForMissingKey) {
     cache<int, int> c(100);
     memory_monitor::config cfg;
     cfg.max_memory_bytes.store(4096);
-    cfg.high_watermark_fraction.store(1.0);
-    cfg.critical_watermark_fraction.store(0.5);
+    cfg.throttle_fraction.store(1.0);
+    cfg.critical_fraction.store(0.5);
     c.set_memory_monitor(cfg);
 
     EXPECT_FALSE(c.replace(1, 10));
@@ -931,8 +931,8 @@ TEST(MemoryMonitorTest, GetOrFetchWithProviderRespectsAdmission) {
     // from 1024 → 2048 so the first two keys still fit before critical
     // watermark is hit.
     cfg.max_memory_bytes.store(2048);
-    cfg.high_watermark_fraction.store(1.0);
-    cfg.critical_watermark_fraction.store(0.5);
+    cfg.throttle_fraction.store(1.0);
+    cfg.critical_fraction.store(0.5);
     c.set_memory_monitor(cfg);
 
     int provider_calls = 0;
@@ -996,8 +996,8 @@ TEST(MemoryMonitorTest, StripeCacheAdmission) {
     // from 1024 → 2048 so the first two keys still fit before critical
     // watermark is hit.
     cfg.max_memory_bytes.store(2048);
-    cfg.high_watermark_fraction.store(1.0);
-    cfg.critical_watermark_fraction.store(0.5);
+    cfg.throttle_fraction.store(1.0);
+    cfg.critical_fraction.store(0.5);
     c.set_memory_monitor(cfg);
 
     c.set(1, 10);

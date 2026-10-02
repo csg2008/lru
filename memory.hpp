@@ -173,7 +173,22 @@ public:
         auto pos = head_.fetch_add(1, std::memory_order_acq_rel);
         auto mask = mask_.load(std::memory_order_acquire);
         buffer_[pos & mask].store(value, std::memory_order_release);
-        count_.fetch_add(1, std::memory_order_relaxed);
+        // fix.01 P2-16: SATURATING increment, capped at the window capacity.
+        //
+        // count_ means "samples currently held in the ring", but it used to be
+        // incremented unconditionally, so after the first lap it kept growing
+        // past the capacity forever. Both consumers then broke: normalized_rate()
+        // divides by `cnt - 1`, so the estimated rate decayed toward zero as the
+        // process ran (exceeded()/throttle() stopped limiting anything), and it
+        // indexes the "oldest" slot as `head - cnt`, which with cnt > capacity
+        // points outside the live window. Saturating fixes both.
+        const std::size_t cap = window_size_.load(std::memory_order_relaxed);
+        std::size_t prev = count_.load(std::memory_order_relaxed);
+        while (prev < cap &&
+               !count_.compare_exchange_weak(prev, prev + 1,
+                   std::memory_order_relaxed, std::memory_order_relaxed)) {
+            // prev refreshed by the failed CAS; loop until it stops advancing.
+        }
     }
 
     /// P1-16 (2): explicit "is the rate of change above the budget?" verdict.
@@ -654,15 +669,17 @@ public:
         /// throttling activates. 0 = never throttle based on rate.
         std::atomic<std::size_t> max_growth_rate_bytes{0};
 
-        /// High watermark: when current_memory exceeds this fraction of max,
-        /// aggressive throttling kicks in [0.0, 1.0].
-        std::atomic<double> high_watermark_fraction{0.90};
-
-        /// Critical watermark: when exceeded, all new insertions are rejected [0.0, 1.0].
-        std::atomic<double> critical_watermark_fraction{0.98};
-
-        /// Low watermark: throttling is released when memory drops below this [0.0, 1.0].
-        std::atomic<double> low_watermark_fraction{0.75};
+        // fix.01 P1-35: ONE watermark pair, not two.
+        //
+        // This struct used to carry two independent, overlapping triples —
+        // {high,critical,low}_watermark_fraction and
+        // {throttle,critical}_fraction — and the admission logic silently took
+        // `std::min()` of the two criticals and of the two throttles. So a
+        // caller who set one pair and read the other got different numbers,
+        // and setting e.g. high = 0.9 had no effect at all while the default
+        // (declared "reserved for future hysteresis", never read) is gone with
+        // them. The CacheLib-style names below are now the single source of
+        // truth.
 
         /// Start throttling at this occupancy fraction [0.0, 1.0].
         /// Below this, all insertions are accepted (pressure_level::normal).
@@ -680,9 +697,8 @@ public:
             max_memory_bytes.store(other.max_memory_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
             rate_window_size.store(other.rate_window_size.load(std::memory_order_relaxed), std::memory_order_relaxed);
             max_growth_rate_bytes.store(other.max_growth_rate_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            high_watermark_fraction.store(other.high_watermark_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            critical_watermark_fraction.store(other.critical_watermark_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            low_watermark_fraction.store(other.low_watermark_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            throttle_fraction.store(other.throttle_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            critical_fraction.store(other.critical_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
             throttle_fraction.store(other.throttle_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
             critical_fraction.store(other.critical_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
@@ -692,9 +708,8 @@ public:
                 max_memory_bytes.store(other.max_memory_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 rate_window_size.store(other.rate_window_size.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 max_growth_rate_bytes.store(other.max_growth_rate_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                high_watermark_fraction.store(other.high_watermark_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                critical_watermark_fraction.store(other.critical_watermark_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                low_watermark_fraction.store(other.low_watermark_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                throttle_fraction.store(other.throttle_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                critical_fraction.store(other.critical_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 throttle_fraction.store(other.throttle_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 critical_fraction.store(other.critical_fraction.load(std::memory_order_relaxed), std::memory_order_relaxed);
             }
@@ -713,12 +728,6 @@ public:
                                        std::memory_order_relaxed);
         config_.max_growth_rate_bytes.store(cfg.max_growth_rate_bytes.load(std::memory_order_relaxed),
                                             std::memory_order_relaxed);
-        config_.high_watermark_fraction.store(cfg.high_watermark_fraction.load(std::memory_order_relaxed),
-                                              std::memory_order_relaxed);
-        config_.critical_watermark_fraction.store(cfg.critical_watermark_fraction.load(std::memory_order_relaxed),
-                                                  std::memory_order_relaxed);
-        config_.low_watermark_fraction.store(cfg.low_watermark_fraction.load(std::memory_order_relaxed),
-                                             std::memory_order_relaxed);
         config_.throttle_fraction.store(cfg.throttle_fraction.load(std::memory_order_relaxed),
                                         std::memory_order_relaxed);
         config_.critical_fraction.store(cfg.critical_fraction.load(std::memory_order_relaxed),
@@ -783,8 +792,8 @@ public:
 
         double fraction = static_cast<double>(mem) / static_cast<double>(max);
 
-        if (fraction >= config_.critical_watermark_fraction.load(std::memory_order_relaxed)) return state::critical;
-        if (fraction >= config_.high_watermark_fraction.load(std::memory_order_relaxed)) return state::high;
+        if (fraction >= config_.critical_fraction.load(std::memory_order_relaxed)) return state::critical;
+        if (fraction >= config_.throttle_fraction.load(std::memory_order_relaxed)) return state::high;
         if (growth_rate_exceeded_.load(std::memory_order_relaxed)) return state::throttled;
         return state::normal;
     }
@@ -957,16 +966,11 @@ public:
         double fraction = static_cast<double>(projected) / static_cast<double>(max);
         auto crit_frac = config_.critical_fraction.load(std::memory_order_relaxed);
         auto throttle_frac = config_.throttle_fraction.load(std::memory_order_relaxed);
-        auto crit_wm = config_.critical_watermark_fraction.load(std::memory_order_relaxed);
-        auto high_wm = config_.high_watermark_fraction.load(std::memory_order_relaxed);
-
-        // Use the lower of critical_fraction and critical_watermark_fraction
-        // as the effective critical threshold, so that both the tiered model
-        // and the legacy watermark model are respected.
-        double effective_crit = std::min(crit_frac, crit_wm);
-        // Similarly, use the lower of throttle_fraction and high_watermark_fraction
-        // as the effective throttle threshold.
-        double effective_throttle = std::min(throttle_frac, high_wm);
+        // fix.01 P1-35: a single pair of thresholds now. The `std::min()` of
+        // two independent watermark pairs is gone with the duplicate fields —
+        // see the note on config::throttle_fraction.
+        const double effective_crit = crit_frac;
+        const double effective_throttle = throttle_frac;
 
         // Critical: reject new insertions + aggressive background eviction.
         // Uses probabilistic rejection: the further above the critical threshold,
@@ -1224,11 +1228,11 @@ public:
     }
 
     void set_high_watermark(double fraction) {
-        config_.high_watermark_fraction.store(std::clamp(fraction, 0.0, 1.0), std::memory_order_relaxed);
+        config_.throttle_fraction.store(std::clamp(fraction, 0.0, 1.0), std::memory_order_relaxed);
     }
 
     void set_critical_watermark(double fraction) {
-        config_.critical_watermark_fraction.store(std::clamp(fraction, 0.0, 1.0), std::memory_order_relaxed);
+        config_.critical_fraction.store(std::clamp(fraction, 0.0, 1.0), std::memory_order_relaxed);
     }
 
     void reset() {
@@ -1256,12 +1260,6 @@ public:
                                        std::memory_order_relaxed);
         config_.max_growth_rate_bytes.store(cfg.max_growth_rate_bytes.load(std::memory_order_relaxed),
                                             std::memory_order_relaxed);
-        config_.high_watermark_fraction.store(cfg.high_watermark_fraction.load(std::memory_order_relaxed),
-                                              std::memory_order_relaxed);
-        config_.critical_watermark_fraction.store(cfg.critical_watermark_fraction.load(std::memory_order_relaxed),
-                                                  std::memory_order_relaxed);
-        config_.low_watermark_fraction.store(cfg.low_watermark_fraction.load(std::memory_order_relaxed),
-                                             std::memory_order_relaxed);
         config_.throttle_fraction.store(cfg.throttle_fraction.load(std::memory_order_relaxed),
                                         std::memory_order_relaxed);
         config_.critical_fraction.store(cfg.critical_fraction.load(std::memory_order_relaxed),
@@ -1379,7 +1377,6 @@ private:
     std::atomic<std::size_t> pressure_normal_count_{0};
     std::atomic<std::size_t> pressure_throttled_count_{0};
     std::atomic<std::size_t> pressure_critical_count_{0};
-    // low_watermark_fraction reserved for future hysteresis implementation
     rate_limiter growth_limiter_;
 
     /// P1-17: bounded retry budget for `try_reserve()`'s CAS. A reservation
@@ -1930,7 +1927,14 @@ public:
         , owner_node_(static_cast<std::int16_t>(owner_node))
         , class_size_(class_size)
         , slab_size_(slab_size)
-        , items_per_slab_(slab_size / class_size) {
+        // fix.01 P2-19: guarantee at least one item per slab. A slab_size
+        // smaller than class_size (reachable through the per-class config
+        // override) truncated to 0, and add_slab() then carved zero items —
+        // leaving that size class permanently "exhausted" with no diagnostic.
+        // Placing the object in the first slab of its own size is the sane
+        // fallback; consuming a whole slab for it is visible in the
+        // per-class stats.
+        , items_per_slab_(slab_size / class_size > 0 ? slab_size / class_size : 1) {
         // 一次性提示：16 字节原子非编译期锁自由时（如 MSYS2 MinGW GCC），
         // free-list CAS 经 libatomic 锁池回退仍正确工作；此提示引导启用 cmpxchg16b。
         static const bool s_warned = []() noexcept {
@@ -2863,6 +2867,15 @@ private:
 
         // ---- Shared memory allocation ----
         if (shared_mem_base_) {
+            // fix.01 P1-21: the shared-memory arena is a SINGLE global resource,
+            // but add_slab() runs under the PER-CLASS slab mutex — so two size
+            // classes growing concurrently both read and advanced
+            // shared_mem_next_slab_offset_ and were handed the SAME byte range:
+            // their slabs overlapped and clobbered each other. A dedicated
+            // mutex is used rather than bookkeeping_mutex_ because the latter
+            // is taken again further down this function (std::mutex is not
+            // recursive).
+            std::lock_guard<std::mutex> arena_lock(shared_mem_arena_mutex_);
             std::size_t offset = shared_mem_next_slab_offset_;
             if (kSharedMemHeaderSize + offset + slab_size <= shared_mem_size_) {
                 slab = static_cast<char*>(shared_mem_base_) + kSharedMemHeaderSize + offset;
@@ -2907,6 +2920,13 @@ private:
         }
 
         // ---- Regular aligned allocation (fallback or non-NUMA) ----
+        // fix.01 P2-17: record HOW the slab was obtained instead of inferring
+        // it from its address later. The release path used to decide between
+        // `_aligned_free`/`free` and `::operator delete` by testing
+        // `addr % slab_size == 0`, which is also true for an ordinary
+        // `::operator new` block that happens to land on a slab_size boundary
+        // — and `_aligned_free` on operator-new memory corrupts the heap.
+        bool slab_is_aligned_alloc = false;
         if (!slab) {
 #if defined(_WIN32)
             slab = _aligned_malloc(slab_size, slab_size);
@@ -2915,11 +2935,13 @@ private:
 #else
             slab = std::aligned_alloc(slab_size, slab_size);
 #endif
+            slab_is_aligned_alloc = (slab != nullptr);
         }
 
         if (!slab) {
             // Aligned allocation failed — fall back to ordinary allocation
             slab = ::operator new(slab_size);
+            slab_is_aligned_alloc = false;
         }
 
         // ---- Linux NUMA binding via mbind() syscall ----
@@ -2957,8 +2979,10 @@ private:
                 // so they are not recorded in aligned_slabs_.
                 shared_mem_slabs_.insert(addr);
             } else {
-                // Record whether this slab was aligned (addr is a multiple of slab_size)
-                if ((addr % static_cast<std::uintptr_t>(slab_size)) == 0) {
+                // fix.01 P2-17: record the ACTUAL allocation method (captured
+                // above), not an address-alignment guess — see the note at the
+                // allocation site.
+                if (slab_is_aligned_alloc) {
                     aligned_slabs_.insert(addr);
                 }
                 if (numa_allocated) {
@@ -3011,6 +3035,9 @@ private:
     /// slab-destruction path, so it does not affect the
     /// lock-free fast path of `allocate()` / `deallocate()`.
     mutable std::mutex bookkeeping_mutex_;
+    /// fix.01 P1-21: guards the shared-memory arena bump allocator
+    /// (shared_mem_next_slab_offset_), which is global across size classes.
+    mutable std::mutex shared_mem_arena_mutex_;
 
     // ----------------------------------------------------------------
     // T-P2-10: Per-class locks and per-class configuration

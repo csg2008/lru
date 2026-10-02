@@ -69,9 +69,11 @@ struct ttl_entry {
     /// returns dur unchanged.
     ///
     /// Implementation delegates to detail::apply_ttl_jitter (defined in
-    /// cache_trait.hpp) — see there for PRNG details.
+    /// cache_trait.hpp) — see there for PRNG details. P0-6 (fix.01): the
+    /// return type is nanoseconds so sub-second jitter survives even when
+    /// the caller passes an integer-seconds duration.
     template <typename Rep, typename Period>
-    static std::chrono::duration<Rep, Period>
+    static std::chrono::nanoseconds
     apply_jitter(std::chrono::duration<Rep, Period> dur, double jitter_pct) {
         return detail::apply_ttl_jitter(dur, jitter_pct);
     }
@@ -155,7 +157,8 @@ public:
     /// @tparam Rep,Period Any duration type (e.g., milliseconds, seconds).
     template <typename Rep, typename Period>
     explicit ttl_cache(std::chrono::duration<Rep, Period> default_ttl, size_type max_size = unlimited)
-        : default_ttl_(std::chrono::duration_cast<duration_type>(default_ttl)), max_size_(max_size) {
+        : default_ttl_(std::chrono::duration_cast<std::chrono::nanoseconds>(default_ttl)),
+          max_size_(max_size) {
         if (max_size != unlimited) {
             cache_.max_size(max_size);
         }
@@ -223,7 +226,7 @@ public:
         auto lock = acquire_ttl_write_lock(key);
         if (stopped_.load(std::memory_order_acquire)) return;
         insert_locked(key, std::forward<V>(value),
-                      default_ttl_ != duration_type::zero()
+                      default_ttl_ != std::chrono::nanoseconds::zero()
                           ? std::optional<time_point>(clock::now() + default_ttl_)
                           : std::nullopt);
     }
@@ -441,7 +444,8 @@ public:
     void set_default_ttl(duration_type ttl) {
         auto lock = acquire_ttl_global_write_lock();
         if (stopped_.load(std::memory_order_acquire)) return;
-        default_ttl_ = ttl;
+        // fix.01 P1-20: store in nanoseconds like the constructor.
+        default_ttl_ = std::chrono::duration_cast<std::chrono::nanoseconds>(ttl);
     }
 
     /// Read the default TTL.
@@ -455,7 +459,9 @@ public:
     /// them without introducing atomic semantics into the class.
     duration_type default_ttl() const {
         auto lock = acquire_ttl_global_read_lock();
-        return default_ttl_;
+        // fix.01 P1-20: the member is stored in nanoseconds; report in the
+        // cache's Duration type.
+        return std::chrono::duration_cast<duration_type>(default_ttl_);
     }
 
     // --------------------------------------------------------------------
@@ -481,7 +487,7 @@ public:
         auto& uc = c.cache_;
 
         os << "ttl_cache @" << &c;
-        if (c.default_ttl_ != duration_type::zero()) {
+        if (c.default_ttl_ != std::chrono::nanoseconds::zero()) {
             os << "  default_ttl="
                << std::chrono::duration_cast<std::chrono::seconds>(c.default_ttl_).count() << "s";
         } else {
@@ -542,7 +548,23 @@ private:
     void insert_locked(const Key& key, V&& value,
                        std::optional<time_point> expiry) {
         if (!expiry) {
-            cache_.set(key, entry_type(std::forward<V>(value), std::nullopt));
+            // fix.01 P1-17: clear the item-level TTL explicitly instead of
+            // falling back to a plain set(). A plain set() left whatever
+            // expiry_ns the previous value carried, so `set_no_ttl(k, v)` (and
+            // any set() with no default TTL) produced an entry that the value
+            // layer considered immortal while the MM still expired and deleted
+            // it at the OLD deadline — `peek`/`contains` reported it present
+            // and `get` reported it missing, off the same item. Writing 0 is
+            // the documented "no expiration" sentinel and keeps both layers in
+            // agreement.
+            if constexpr (requires { cache_.set_with_absolute_expiry(key, value, std::uint64_t{0}); }) {
+                cache_.set_with_absolute_expiry(
+                    key, entry_type(std::forward<V>(value), std::nullopt),
+                    std::uint64_t{0});
+            } else {
+                // Caches without native TTL: the value layer is authoritative.
+                cache_.set(key, entry_type(std::forward<V>(value), std::nullopt));
+            }
             return;
         }
         // Same storage convention as unified_cache::set_with_ttl():
@@ -618,6 +640,21 @@ private:
         for (const auto& key : expired_keys) {
             // 逐 key 获取对应 stripe 的写锁删除
             auto wlock = acquire_ttl_write_lock(key);
+            // fix.01 P1-16: re-validate expiry under the write lock.
+            //
+            // The scan above released the MM read lock before we got here, so
+            // a concurrent set() may have refreshed this key with a new value
+            // and a new TTL in the meantime. Deleting it now would silently
+            // drop a live entry — the exact hazard ttl_cache::get() already
+            // guards against on its lazy-deletion path (see the recheck there).
+            // Holding the per-key write lock makes this recheck authoritative,
+            // because set() takes the same lock.
+            {
+                auto recheck = cache_.peek(key);
+                if (!recheck || !recheck->is_expired_at(clock::now())) {
+                    continue;  // gone, or refreshed by a concurrent set()
+                }
+            }
             if (cache_.del(key)) {
                 ++count;
             }
@@ -630,7 +667,16 @@ private:
     // underlying cache's const APIs (which themselves acquire internal
     // shared/read locks). P2-5: no longer used for lazy expiry mutation.
     mutable entry_cache_type cache_;
-    duration_type default_ttl_;
+    /// fix.01 P1-20: stored in NANOSECONDS, not in `duration_type`.
+    ///
+    /// The constructor used to `duration_cast` the caller's TTL into the
+    /// cache's Duration type (seconds by default), so `ttl_cache<int, V>
+    /// c(500ms, n)` stored 0s — and 0 is the "never expires" sentinel, meaning
+    /// the cache silently had no TTL at all instead of a 500 ms one. Storing
+    /// nanoseconds keeps any sub-second TTL the caller passed. `remaining_ttl`
+    /// and `default_ttl()` still report in `duration_type`, which is also the
+    /// unit the rest of this class computes expiry in.
+    std::chrono::nanoseconds default_ttl_{0};
     size_type max_size_ = unlimited;
     /// Once stopped_, all mutating operations become no-ops and get/peek/contains return early.
     std::atomic<bool> stopped_{false};

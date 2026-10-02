@@ -19,16 +19,24 @@ using lru::tls_event_ring;
 using lru::event_tracker;
 using lru::event_type;
 
-// Helper: drain backup and count entries.
+// Helper: drain every instance's backup slice and count entries.
+//
+// fix.01 P1-45: the backup buffer is now keyed by instance id, so this
+// teardown helper uses the aggregate form. Individual trackers drain their own
+// slice via drain_backup(instance_id) — which is what makes two trackers of
+// the same type unable to consume each other's events.
 static std::size_t drain_backup_count() {
-    auto r = tls_event_ring<int>::drain_backup();
+    auto r = tls_event_ring<int>::drain_all_backups();
     return r.entries.size();
 }
+
+// Synthetic instance id for the tests that push directly (no real tracker).
+constexpr std::uint64_t kTestInstance = 1;
 
 TEST(TlsEventBackupTest, BackupBufferStartsEmpty) {
     // Drain any leftover state first so the test starts clean.
     (void)drain_backup_count();
-    EXPECT_FALSE(tls_event_ring<int>::has_backup_entries());
+    EXPECT_FALSE(tls_event_ring<int>::has_any_backup_entries());
 }
 
 TEST(TlsEventBackupTest, PushToBackupIsRetrievable) {
@@ -38,12 +46,12 @@ TEST(TlsEventBackupTest, PushToBackupIsRetrievable) {
     e.key_hash = 42;
     e.type = event_type::insert;
     entries.push_back(e);
-    tls_event_ring<int>::push_to_backup(std::move(entries));
-    EXPECT_TRUE(tls_event_ring<int>::has_backup_entries());
-    auto drained = tls_event_ring<int>::drain_backup();
+    tls_event_ring<int>::push_to_backup(kTestInstance, std::move(entries));
+    EXPECT_TRUE(tls_event_ring<int>::has_backup_entries(kTestInstance));
+    auto drained = tls_event_ring<int>::drain_backup(kTestInstance);
     EXPECT_EQ(drained.entries.size(), 1u);
     EXPECT_EQ(drained.entries[0].key_hash, 42u);
-    EXPECT_FALSE(tls_event_ring<int>::has_backup_entries());
+    EXPECT_FALSE(tls_event_ring<int>::has_backup_entries(kTestInstance));
 }
 
 TEST(TlsEventBackupTest, ThreadExitPushesEventsToBackup) {
@@ -70,7 +78,9 @@ TEST(TlsEventBackupTest, ThreadExitPushesEventsToBackup) {
     // After the thread exits, the backup buffer should contain at least
     // some events. (The exact count depends on ring size and drain timing,
     // but with kEvents=10 and ring size=256, all 10 should survive.)
-    auto backup = tls_event_ring<int>::drain_backup();
+    // fix.01 P1-45: the real tracker's instance id is not exposed to the
+    // test, so drain the aggregate form here.
+    auto backup = tls_event_ring<int>::drain_all_backups();
     EXPECT_GE(backup.entries.size(), 1u);
     // With kEvents=10 << kRingSize=256, no overflow should occur.
     EXPECT_LE(backup.entries.size(), static_cast<std::size_t>(kEvents));
@@ -207,17 +217,17 @@ TEST(TlsEventBackupTest, BackupBufferIsPerTemplateSpecialization) {
     // T20.4: Different Key types should have independent backup buffers.
     // Recording int events should not affect the std::string backup buffer.
     (void)drain_backup_count();
-    (void)tls_event_ring<std::string>::drain_backup();
+    (void)tls_event_ring<std::string>::drain_all_backups();
 
     std::vector<tls_event_ring<int>::event_entry> int_entries;
     tls_event_ring<int>::event_entry e;
     e.key_hash = 42;
     e.type = event_type::insert;
     int_entries.push_back(e);
-    tls_event_ring<int>::push_to_backup(std::move(int_entries));
+    tls_event_ring<int>::push_to_backup(kTestInstance, std::move(int_entries));
 
-    EXPECT_TRUE(tls_event_ring<int>::has_backup_entries());
-    EXPECT_FALSE(tls_event_ring<std::string>::has_backup_entries());
+    EXPECT_TRUE(tls_event_ring<int>::has_any_backup_entries());
+    EXPECT_FALSE(tls_event_ring<std::string>::has_any_backup_entries());
 
     // Cleanup.
     (void)drain_backup_count();
@@ -225,6 +235,6 @@ TEST(TlsEventBackupTest, BackupBufferIsPerTemplateSpecialization) {
 
 TEST(TlsEventBackupTest, EmptyBackupDrainReturnsEmpty) {
     (void)drain_backup_count();
-    auto drained = tls_event_ring<int>::drain_backup();
+    auto drained = tls_event_ring<int>::drain_backup(kTestInstance);
     EXPECT_TRUE(drained.entries.empty());
 }

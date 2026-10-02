@@ -106,7 +106,8 @@ public:
                     slot->value_ptr()->~Value();
                 }
             }
-            ::operator delete(block);
+            // fix.01 P2-13: matching aligned delete (see allocate_block).
+            ::operator delete(block, std::align_val_t{alignof(slot_type)});
         }
     }
 
@@ -150,8 +151,16 @@ public:
 
 private:
     void allocate_block() {
+        // fix.01 P2-13: honour the slot's alignment. The default kAlignment is
+        // alignof(std::max_align_t) (16), but the documented NUMA/high-
+        // contention setting is hardware_destructive_interference_size (64),
+        // and plain ::operator new only guarantees 16 — so the block, and with
+        // it every slot's alignas, was under-aligned: undefined behaviour. The
+        // aligned form is valid for any alignment, and the matching aligned
+        // delete below keeps the pair consistent.
         auto* block = static_cast<slot_type*>(
-            ::operator new(kSlotsPerBlock * sizeof(slot_type)));
+            ::operator new(kSlotsPerBlock * sizeof(slot_type),
+                          std::align_val_t{alignof(slot_type)}));
         blocks_.push_back(block);
 
         for (std::size_t i = 0; i < kSlotsPerBlock; ++i) {
@@ -234,15 +243,9 @@ public:
 
 private:
     // Conditional mutex storage: only present for thread-safe policies.
-    // Uses [[no_unique_address]] so that single-threaded caches pay zero overhead.
-    // Uses distributed_shared_mutex for stripe locks, providing shared (read) /
-    // exclusive (write) semantics without relying on MinGW's buggy pthread_rwlock_t.
-    using striped_mutex_storage = std::conditional_t<
-        is_thread_safe,
-        detail::striped_mutex<detail::distributed_shared_mutex>,
-        std::tuple<>
-    >;
-
+    // Uses [[no_unique_address]] so that single-threaded caches pay zero
+    // overhead. Uses distributed_shared_mutex for shared (read) / exclusive
+    // (write) semantics without relying on MinGW's buggy pthread_rwlock_t.
 
 public:
 
@@ -294,25 +297,62 @@ public:
         }
 
         // Evict if at capacity
+        // fix.01 P1-29: `max_size_ == 0` is the legal "store nothing" request
+        // (npos, not 0, means unlimited). evict_lru() returns immediately on an
+        // empty list, so the loop below spun forever in that case. Refuse the
+        // insert, and in every case stop if eviction stops making progress so
+        // the loop can never hang.
+        if (max_size_ == 0) {
+            return;
+        }
         while (size_unlocked() >= max_size_ && max_size_ != npos) {
+            const size_type before = size_unlocked();
             evict_lru();
+            if (size_unlocked() >= before) break;  // no progress — give up
         }
         while (should_evict_memory() && !map_.empty()) {
             evict_lru();
         }
 
         // Allocate new slot
+        //
+        // fix.01 P2-14: every step that can throw is rolled back. Previously a
+        // throwing Key/Value constructor leaked the slot permanently (never
+        // returned to the free list, with the already-constructed Key never
+        // destroyed), and a throwing hash-map insert left the slot linked into
+        // the LRU list but absent from the map — so evict_lru() walked a node
+        // whose map entry did not exist and dereferenced map_.end().
         auto* slot = allocator_.allocate();
-        ::new (slot->key_ptr()) Key(key);
-        ::new (slot->value_ptr()) Value(std::forward<V>(value));
+        try {
+            ::new (slot->key_ptr()) Key(key);
+        } catch (...) {
+            allocator_.deallocate(slot);   // occupied == false → no dtors
+            throw;
+        }
+        try {
+            ::new (slot->value_ptr()) Value(std::forward<V>(value));
+        } catch (...) {
+            slot->key_ptr()->~Key();
+            allocator_.deallocate(slot);
+            throw;
+        }
         slot->occupied = true;
         slot->hook.update_time = current_time_sec();
         slot->hook.clear_accessed();
 
+        // Register in the map BEFORE linking into the LRU list, so a throwing
+        // map insert cannot leave a linked-but-unmapped slot behind.
+        try {
+            map_[key] = slot;
+        } catch (...) {
+            slot->occupied = false;
+            slot->value_ptr()->~Value();
+            slot->key_ptr()->~Key();
+            allocator_.deallocate(slot);
+            throw;
+        }
         // Link at head (MRU) via intrusive_list
         lru_list_.link_at_head(*slot);
-
-        map_[key] = slot;
 
         stats_.current_size.store(size_unlocked());
         current_memory_ += calc_item_memory(key, *slot->value_ptr());
@@ -357,8 +397,14 @@ public:
     }
 
     /// Peek without promoting.
+    ///
+    /// P0-2 (fix.01): takes the SAME lock as the mutating paths
+    /// (`acquire_read_lock()` shares `write_mutex_`). It previously used a
+    /// per-key stripe lock from a *separate* mutex object, so `map_.find()`
+    /// could run concurrently with `map_[key] = slot` / `map_.erase()` on the
+    /// write path — a data race on the hash map itself.
     std::optional<std::reference_wrapper<const Value>> peek(const key_type& key) const {
-        auto lock = acquire_read_lock_for_key(key);
+        auto lock = acquire_read_lock();
         auto it = map_.find(key);
         if (it == map_.end()) return std::nullopt;
         return std::cref(*it->second->value_ptr());
@@ -377,7 +423,8 @@ public:
     }
 
     bool contains(const key_type& key) const {
-        auto lock = acquire_read_lock_for_key(key);
+        // P0-2 (fix.01): share the write path's mutex (see peek()).
+        auto lock = acquire_read_lock();
         return map_.contains(key);
     }
 
@@ -680,11 +727,6 @@ public:
     void set_fairness_mode(detail::fairness_mode mode) {
         if constexpr (is_thread_safe) {
             write_mutex_.set_fairness_mode(mode);
-            // striped_mutex<>::set_fairness_mode is a SFINAEd template that
-            // is a no-op for mutex types without fairness support.
-            if constexpr (requires { striped_mutex_.set_fairness_mode(mode); }) {
-                striped_mutex_.set_fairness_mode(mode);
-            }
         }
         (void)mode;
     }
@@ -900,22 +942,52 @@ private:
             return;
         }
 
+        // fix.01 P1-29: `max_size_ == 0` is the legal "store nothing" request
+        // (npos, not 0, means unlimited). evict_lru() returns immediately on an
+        // empty list, so the loop below spun forever in that case. Refuse the
+        // insert, and in every case stop if eviction stops making progress so
+        // the loop can never hang.
+        if (max_size_ == 0) {
+            return;
+        }
         while (size_unlocked() >= max_size_ && max_size_ != npos) {
+            const size_type before = size_unlocked();
             evict_lru();
+            if (size_unlocked() >= before) break;  // no progress — give up
         }
         while (should_evict_memory() && !map_.empty()) {
             evict_lru();
         }
 
         auto* slot = allocator_.allocate();
-        ::new (slot->key_ptr()) Key(key);
-        ::new (slot->value_ptr()) Value(std::forward<V>(value));
+        // fix.01 P2-14: same rollback contract as set() above — see there.
+        try {
+            ::new (slot->key_ptr()) Key(key);
+        } catch (...) {
+            allocator_.deallocate(slot);
+            throw;
+        }
+        try {
+            ::new (slot->value_ptr()) Value(std::forward<V>(value));
+        } catch (...) {
+            slot->key_ptr()->~Key();
+            allocator_.deallocate(slot);
+            throw;
+        }
         slot->occupied = true;
         slot->hook.update_time = current_time_sec();
         slot->hook.clear_accessed();
 
+        try {
+            map_[key] = slot;
+        } catch (...) {
+            slot->occupied = false;
+            slot->value_ptr()->~Value();
+            slot->key_ptr()->~Key();
+            allocator_.deallocate(slot);
+            throw;
+        }
         lru_list_.link_at_head(*slot);
-        map_[key] = slot;
 
         stats_.current_size.store(size_unlocked());
         current_memory_ += calc_item_memory(key, *slot->value_ptr());
@@ -973,19 +1045,6 @@ private:
         }
     }
 
-    /// Acquire a shared read lock for a specific key's stripe.
-    /// This allows concurrent per-key reads across different stripes.
-    /// For single-threaded policies, returns a noop_lock.
-    auto acquire_read_lock_for_key(const key_type& key) const {
-        if constexpr (is_thread_safe) {
-            auto hash = Hash{}(key);
-            auto stripe = striped_mutex_.stripe_for(hash);
-            return striped_mutex_.make_shared_lock(stripe);
-        } else {
-            return noop_lock{};
-        }
-    }
-
     // --- Members ---
     // 使用 intrusive_list 接管 LRU 链表管理，复用其 ASAN/TSAN 集成
     slot_list lru_list_;
@@ -993,12 +1052,14 @@ private:
     map_type map_;
     compact_slot_allocator<Key, Value, kSlotAlignment> allocator_;
 
-    /// Write mutex for thread safety. Empty tuple for single-threaded policies.
+    /// Mutex for thread safety. Empty tuple for single-threaded policies.
+    ///
+    /// P0-2 (fix.01): every lock in this class (read AND write) now goes
+    /// through `write_mutex_`. The previous separate per-key stripe mutex
+    /// protected reads of `map_` that the write path did not take, which is
+    /// exactly the race this fix removes. A single mutex also means readers
+    /// and writers are properly ordered rather than silently interleaving.
     [[no_unique_address]] mutable write_mutex_storage write_mutex_{};
-
-    /// Striped mutex for per-key read operations. Empty tuple for single-threaded
-    /// policies. Default-constructed with 64 stripes for thread-safe variants.
-    [[no_unique_address]] mutable striped_mutex_storage striped_mutex_{};
 
     size_type max_size_ = npos;
     size_type max_memory_ = npos;

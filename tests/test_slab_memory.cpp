@@ -155,9 +155,8 @@ TEST(MemoryPressureTest, NormalToThrottledToCriticalToNormal) {
     // Use a very small max_memory so we can easily trigger watermarks
     memory_monitor::config cfg;
     cfg.max_memory_bytes.store(1000);
-    cfg.high_watermark_fraction.store(0.70);
-    cfg.critical_watermark_fraction.store(0.90);
-    cfg.low_watermark_fraction.store(0.50);
+    cfg.throttle_fraction.store(0.70);
+    cfg.critical_fraction.store(0.90);
     memory_monitor mon(cfg);
 
     // Initially: normal state, should admit, not throttled
@@ -194,9 +193,8 @@ TEST(MemoryPressureTest, NormalToThrottledToCriticalToNormal) {
 TEST(MemoryPressureTest, CriticalRejectsAdmission) {
     memory_monitor::config cfg;
     cfg.max_memory_bytes.store(1000);
-    cfg.high_watermark_fraction.store(0.70);
-    cfg.critical_watermark_fraction.store(0.90);
-    cfg.low_watermark_fraction.store(0.50);
+    cfg.throttle_fraction.store(0.70);
+    cfg.critical_fraction.store(0.90);
     memory_monitor mon(cfg);
 
     // Fill past critical watermark
@@ -215,9 +213,8 @@ TEST(MemoryPressureTest, MemoryAwareEvictorLifecycle) {
 
     memory_monitor::config cfg;
     cfg.max_memory_bytes.store(10000);
-    cfg.high_watermark_fraction.store(0.60);
-    cfg.critical_watermark_fraction.store(0.90);
-    cfg.low_watermark_fraction.store(0.40);
+    cfg.throttle_fraction.store(0.60);
+    cfg.critical_fraction.store(0.90);
     c.set_memory_monitor(cfg);
 
     // Fill the cache to trigger throttled state

@@ -388,3 +388,81 @@ jobs:
           done
           echo "Total formatting differences: $total"
           echo "(informational only — see the comment above this job)"
+
+  # fix.01 §4.4: static analysis. .clang-tidy is configured
+  # (cert-*, concurrency-*, clang-analyzer-*, …) but nothing ever ran it, so
+  # the configuration was decoration. REPORT ONLY for now, for the same reason
+  # the clang-format job above is: the tree has never been analysed and a hard
+  # gate would be red on day one.
+  #
+  # To make it a gate: fix the findings, then drop `continue-on-error` and add
+  # `-warnings-as-errors='*'` to the clang-tidy invocation.
+  clang-tidy:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang clang-tidy libssl-dev
+          git clone --depth 1 https://github.com/martinus/unordered_dense.git ../unordered_dense
+
+      - name: Configure (export compile commands)
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DLRU_BUILD_TESTS=ON -DLRU_BUILD_EXAMPLES=OFF
+
+      - name: Run clang-tidy on changed headers
+        run: |
+          set -uo pipefail
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          mapfile -t files < <(
+            git diff --name-only --diff-filter=ACMR \
+              "origin/${{ github.base_ref }}...HEAD" -- '*.hpp' '*.cpp'
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No C++ files changed — nothing to check."
+            exit 0
+          fi
+          # Headers have no compile-command entry of their own; analyse them
+          # through a test TU that includes the umbrella header.
+          clang-tidy -p build --quiet --warnings-as-errors='' \
+            "${files[@]}" 2>&1 | head -400 || true
+          echo "(informational only — see the comment above this job)"
+
+  # fix.01 §4.4: the deserializer is an untrusted-input boundary and had no
+  # fuzz coverage at all. libFuzzer ships with clang, so this adds no
+  # third-party dependency.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang
+          git clone --depth 1 https://github.com/martinus/unordered_dense.git ../unordered_dense
+
+      - name: Configure with libFuzzer
+        run: |
+          cmake -B build-fuzz -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang \
+            -DLRU_BUILD_FUZZERS=ON -DLRU_BUILD_TESTS=OFF -DLRU_BUILD_EXAMPLES=OFF
+
+      - name: Build fuzzers
+        run: cmake --build build-fuzz -j4
+
+      - name: Fuzz the deserializer (60s per target)
+        run: |
+          for f in build-fuzz/fuzz/*; do
+            [ -x "$f" ] || continue
+            echo "=== $f ==="
+            "$f" -max_total_time=60 -print_final_stats=1
+          done

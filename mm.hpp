@@ -347,16 +347,6 @@ struct mm_lru_config {
     /// B15: 淘汰搜索次数上限——当 EvictionPredicate 否决时最多继续搜索的项数。
     size_t eviction_search_tries = 3;
 
-    /// Use segmented LRU list with per-segment spinlocks for higher
-    /// read-concurrency. When true, record_access() locks only the source
-    /// segment + segment 0 (MRU) instead of a global update_mutex_.
-    /// Default false — use the traditional single intrusive_list.
-    bool use_segmented_lru = false;
-
-    /// Number of segments for the segmented LRU list (only when use_segmented_lru=true).
-    /// Must be in [1, 256]. Default 64.
-    uint8_t segmented_lru_num_segments = 64;
-
     /// Use epoch-based reclamation (EBR) instead of hazard pointers for
     /// deferred deletion of evicted items. EBR has faster read-path overhead
     /// (only an atomic load + branch) compared to hazptr (acquire_slot +
@@ -433,6 +423,11 @@ struct mm_lru_config {
     // B4: 配置校验——lru_insertion_point_spec 必须在 [0, 7] 范围内
     mm_lru_config() noexcept = default;
 
+    /// fix.01 P1-33: called from every constructor, not just the sharded path.
+    ///
+    /// The default (non-sharded) constructors never validated their config, so
+    /// an out-of-range value was silently accepted and produced a cache that
+    /// behaved oddly with no diagnostic at all.
     void validate() const {
         if (lru_insertion_point_spec > 7) {
             throw std::invalid_argument(
@@ -441,6 +436,10 @@ struct mm_lru_config {
         if (!(lru_refresh_ratio >= 0.0)) {
             throw std::invalid_argument(
                 "mm_lru_config: lru_refresh_ratio must be non-negative");
+        }
+        if (overflow_tolerance < 0.0) {
+            throw std::invalid_argument(
+                "mm_lru_config: overflow_tolerance must be non-negative");
         }
     }
 };
@@ -451,21 +450,35 @@ struct mm_lru_config {
 
 namespace detail {
 
-/// Cached epoch time (seconds) — samples real clock at ~6.25% rate.
-/// Uses thread_local uint32_t with constant initialization (plain primitive
-/// to avoid MinGW TLS struct initialization issues in gtest context).
+/// fix.01: single PROCESS-WIDE origin for the cached epoch.
+///
+/// This used to be a `thread_local const uint32_t` initialised at each
+/// thread's first call, which made every thread measure elapsed time from a
+/// DIFFERENT origin (its own start). Item `update_time` is shared state
+/// written by whichever thread last promoted the item and compared by
+/// whichever thread checks it — with per-thread origins the two numbers come
+/// from incomparable timelines, so a thread that started later saw a smaller
+/// `curr` than an item's `update_time` and silently suppressed the promotion
+/// (and a thread that started much earlier could overflow the subtraction and
+/// promote on every access). One process-wide origin restores a single
+/// timeline. It is a namespace-scope `inline const`, so it is initialised
+/// once during static initialisation and every thread just reads it.
+inline const uint32_t kEpochBaseSec = static_cast<uint32_t>(
+    std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+
+/// Cached epoch time (seconds since kEpochBaseSec) — samples the real clock at
+/// ~6.25% rate. Uses thread_local uint32_t with constant initialization (plain
+/// primitive to avoid MinGW TLS struct initialization issues in gtest context).
 inline uint32_t cached_epoch_sec() noexcept {
     thread_local uint32_t tl_cached = 0;
     thread_local uint32_t tl_counter = 0;
-    thread_local const uint32_t tl_epoch_base = static_cast<uint32_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
 
     if ((tl_counter++ & 0xF) == 0) [[unlikely]] {
         auto now = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
-        auto elapsed = now - tl_epoch_base;
+        auto elapsed = now - kEpochBaseSec;
         // Monotonicity: never go backwards (defensive, steady_clock guarantees this)
         if (elapsed > tl_cached) {
             tl_cached = elapsed;
@@ -503,9 +516,6 @@ public:
 
     // Intrusive list type
     using item_list = detail::intrusive_list<item_type, detail::intrusive_hook, detail::default_get_hook<item_type>>;
-
-    // Segmented intrusive list type (per-segment spinlocks for read-heavy concurrency)
-    using segmented_item_list = detail::segmented_intrusive_list<item_type, detail::intrusive_hook, detail::default_get_hook<item_type>, 64>;
 
     using iterator = typename item_list::iterator;
     using const_iterator = typename item_list::const_iterator;
@@ -554,7 +564,14 @@ public:
         , lru_refresh_time_(config.default_lru_refresh_time)
         , next_reconfigure_time_(config.mm_reconfigure_interval_secs == 0
             ? std::numeric_limits<uint32_t>::max()
-            : current_time_sec() + config.mm_reconfigure_interval_secs) {}
+            : current_time_sec() + config.mm_reconfigure_interval_secs) {
+        // fix.01 P1-33: this constructor is the funnel for every constructor of
+        // this strategy, so validating here covers direct construction and the
+        // (max_size, config) / (max_size, max_memory, config) overloads alike.
+        // The sharded path already validated its config; the plain ones never
+        // did, so an out-of-range value was silently accepted.
+        config.validate();
+    }
 
     mm_lru(size_type max_size, const mm_lru_config& config = mm_lru_config{})
         : mm_lru([&] {
@@ -790,7 +807,14 @@ public:
         auto pin_fn = [](auto* item) {
             return item->refcount.incRef() == detail::IncResult::kIncOk;
         };
-        auto ptr = map_.find_and_pin_lockfree_with_hash(key, hash, pin_fn);
+        // fix.01 P1-8: the lock-free traversal is only safe while the EBR
+        // guard actually holds a slot. When every slot is busy enter_critical()
+        // registers nothing (it degrades silently), so the traversal would run
+        // unprotected against reclamation. Detect that and take the
+        // shared-lock lookup instead of dereferencing reclaimable pointers.
+        auto ptr = (config_.use_ebr && !ebr_guard->valid())
+            ? map_.find_and_pin_with_hash(key, hash, pin_fn)
+            : map_.find_and_pin_lockfree_with_hash(key, hash, pin_fn);
         if (!ptr) return {};
         // P1-1: Inline TTL check. Fast path: expiry_ns == 0 (no TTL) skips
         // steady_clock::now() entirely. Only items with a TTL set pay the
@@ -1052,14 +1076,8 @@ public:
     /// Check if any item (in the list or pending deletion) has an active handle.
     /// Useful for verifying that no read_handles outlive the cache.
     bool has_active_handles() const noexcept {
-        if (use_segmented_lru()) {
-            for (auto it = segmented_items_.begin(); it != segmented_items_.end(); ++it) {
-                if (it->has_active_handle()) return true;
-            }
-        } else {
-            for (auto it = items_.begin(); it != items_.end(); ++it) {
-                if (it->has_active_handle()) return true;
-            }
+        for (auto it = items_.begin(); it != items_.end(); ++it) {
+            if (it->has_active_handle()) return true;
         }
         for (auto* item : pending_deletion_) {
             if (item->has_active_handle()) return true;
@@ -1107,17 +1125,6 @@ public:
     iterator end() noexcept { return items_.end(); }
     const_iterator begin() const noexcept { return items_.begin(); }
     const_iterator end() const noexcept { return items_.end(); }
-
-    /// Segmented list iterators (use when use_segmented_lru is true)
-    using segmented_iterator = typename segmented_item_list::iterator;
-    using segmented_const_iterator = typename segmented_item_list::const_iterator;
-    using segmented_reverse_iterator = typename segmented_item_list::reverse_iterator;
-    using segmented_const_reverse_iterator = typename segmented_item_list::const_reverse_iterator;
-
-    segmented_iterator segmented_begin() noexcept { return segmented_items_.begin(); }
-    segmented_iterator segmented_end() noexcept { return segmented_items_.end(); }
-    segmented_const_iterator segmented_begin() const noexcept { return segmented_items_.begin(); }
-    segmented_const_iterator segmented_end() const noexcept { return segmented_items_.end(); }
 
     /// Reverse iterators: traverse from LRU tail to MRU head.
     /// rbegin() 指向 LRU 端, rend() 指向 MRU 端之前。
@@ -1623,7 +1630,6 @@ public:
 
 protected:
     item_list items_;
-    segmented_item_list segmented_items_;  // Used when config_.use_segmented_lru == true
     map_type map_;
 
     size_type max_size_ = unlimited;
@@ -1719,112 +1725,39 @@ private:
     alignas(64) mutable std::atomic<std::uint64_t> cached_now_ns_{0};
 
     // ====================================================================
-    // Segmented LRU dispatch helpers
+    // List helpers
+    //
+    // These used to dispatch between a single intrusive list and a
+    // `segmented_intrusive_list` selected by `config_.use_segmented_lru`.
+    // That option was removed by fix.01 P1-14/P1-15: the segmented path was
+    // unreachable AND broken — every item ended up in segment 0 (the
+    // rebalancing that would spread them across segments was never written),
+    // so it behaved like a single list protected by one spinlock while paying
+    // an O(num_segments) scan on every tail operation; and while
+    // `segment_idx` was uniformly 0 the cross-segment unlink invariant in
+    // segmented_intrusive_list::unlink_locked() was never exercised, so the
+    // path was a latent corruption waiting for its first real user. No caller
+    // anywhere in the library ever enabled it, and real concurrency comes from
+    // sharded_mm_lru instead. The helpers are kept as thin forwards so the
+    // rest of mm_lru reads unchanged.
     // ====================================================================
 
-    /// Whether segmented LRU is active.
-    bool use_segmented_lru() const noexcept { return config_.use_segmented_lru; }
-
-    /// Dispatch: link_at_head
-    void list_link_at_head(item_type& item) {
-        if (use_segmented_lru()) {
-            segmented_items_.link_at_head(item);
-        } else {
-            items_.link_at_head(item);
-        }
-    }
-
-    /// Dispatch: link_at_tail
-    void list_link_at_tail(item_type& item) {
-        if (use_segmented_lru()) {
-            segmented_items_.link_at_tail(item);
-        } else {
-            items_.link_at_tail(item);
-        }
-    }
-
-    /// Dispatch: insert_before
+    void list_link_at_head(item_type& item) { items_.link_at_head(item); }
+    void list_link_at_tail(item_type& item) { items_.link_at_tail(item); }
     void list_insert_before(item_type& next_node, item_type& item) {
-        if (use_segmented_lru()) {
-            segmented_items_.insert_before(next_node, item);
-        } else {
-            items_.insert_before(next_node, item);
-        }
+        items_.insert_before(next_node, item);
     }
-
-    /// Dispatch: remove
-    void list_remove(item_type& item) {
-        if (use_segmented_lru()) {
-            segmented_items_.remove(item);
-        } else {
-            items_.remove(item);
-        }
-    }
-
-    /// Dispatch: replace
+    void list_remove(item_type& item) { items_.remove(item); }
     void list_replace(item_type& old_node, item_type& new_node) {
-        if (use_segmented_lru()) {
-            segmented_items_.replace(old_node, new_node);
-        } else {
-            items_.replace(old_node, new_node);
-        }
+        items_.replace(old_node, new_node);
     }
-
-    /// Dispatch: head
-    item_type* list_head() const {
-        if (use_segmented_lru()) {
-            return segmented_items_.head();
-        }
-        return items_.head();
-    }
-
-    /// Dispatch: tail
-    item_type* list_tail() const {
-        if (use_segmented_lru()) {
-            return segmented_items_.tail();
-        }
-        return items_.tail();
-    }
-
-    /// Dispatch: size
-    size_type list_size() const {
-        if (use_segmented_lru()) {
-            return segmented_items_.size();
-        }
-        return items_.size();
-    }
-
-    /// Dispatch: empty
-    bool list_empty() const {
-        if (use_segmented_lru()) {
-            return segmented_items_.empty();
-        }
-        return items_.empty();
-    }
-
-    /// Dispatch: get_next
-    item_type* list_get_next(const item_type& node) const {
-        if (use_segmented_lru()) {
-            return segmented_items_.get_next(node);
-        }
-        return items_.get_next(node);
-    }
-
-    /// Dispatch: get_prev
-    item_type* list_get_prev(const item_type& node) const {
-        if (use_segmented_lru()) {
-            return segmented_items_.get_prev(node);
-        }
-        return items_.get_prev(node);
-    }
-
-    /// Dispatch: pop_tail
-    item_type* list_pop_tail() {
-        if (use_segmented_lru()) {
-            return segmented_items_.pop_tail();
-        }
-        return items_.pop_tail();
-    }
+    item_type* list_head() const { return items_.head(); }
+    item_type* list_tail() const { return items_.tail(); }
+    size_type list_size() const { return items_.size(); }
+    bool list_empty() const { return items_.empty(); }
+    item_type* list_get_next(const item_type& node) const { return items_.get_next(node); }
+    item_type* list_get_prev(const item_type& node) const { return items_.get_prev(node); }
+    item_type* list_pop_tail() { return items_.pop_tail(); }
 
     /// Dispatch: clear
     // P0-2 (fix.01 方案 A): list_clear() was dead code — no caller anywhere in
@@ -2013,58 +1946,11 @@ private:
         auto promote = [this, item, curr, &promote_bookkeeping]() {
             reconfigure_locked(curr);
             ensure_not_insertion_point(item);
-            if (config_.use_segmented_lru) {
-                segmented_items_.move_to_head(*item);
-            } else {
-                items_.move_to_head(*item);
-            }
+            items_.move_to_head(*item);
             promote_bookkeeping();
         };
 
-        // Segmented try-lock path only. try_lock_two_segments() has already
-        // acquired the item's source-segment lock and segment 0's lock, so the
-        // relink must adopt them rather than re-acquire them: segment_spinlock
-        // is non-recursive, and calling the plain move_to_head() here spun
-        // forever on the lock this thread already held.
-        auto promote_segmented_locked =
-            [this, item, curr, &promote_bookkeeping]() {
-                reconfigure_locked(curr);
-                ensure_not_insertion_point(item);
-                segmented_items_.move_to_head_locked(*item);
-                promote_bookkeeping();
-            };
-
-        if (config_.use_segmented_lru) {
-            // Segmented LRU: use per-segment spinlocks instead of global update_mutex_.
-            // move_to_head() locks only the source segment + segment 0 (MRU),
-            // enabling concurrent promotions of items in different segments.
-            auto src_idx = item->hook.segment_idx;
-            if (try_lock_update_enabled()) {
-                // Try-lock mode: attempt to acquire segment locks without blocking.
-                auto result = segmented_items_.try_lock_two_segments(src_idx, 0);
-                if (!result.success) {
-                    stats_.try_lock_fail_count.fetch_add(1, std::memory_order_relaxed);
-                    return false;
-                }
-                // result still holds both segment locks here, so use the
-                // adopt-the-locks variant (see promote_segmented_locked).
-                promote_segmented_locked();
-            } else {
-                // Blocking mode: acquire segment locks in address order (handled by move_to_head).
-                // But we still need to coordinate with reconfigure_locked and insertion point.
-                // Use the global update_mutex_ as a fallback for non-try_lock path
-                // to avoid complex lock ordering with segment locks.
-                // G5: promote() calls move_to_head() which mutates the intrusive list
-                // (prev/next pointers), so it is a WRITE operation and requires an
-                // EXCLUSIVE lock — not a shared lock. Previously this used
-                // shared_scoped_lock under the mistaken assumption that "promotion
-                // is a read path"; that caused a data race on list pointers when
-                // two threads held the shared lock concurrently. Aligned with
-                // mm_2q / mm_tiny_lfu / mm_fifo which all use exclusive locking.
-                std::unique_lock<detail::shared_spinlock> lock(update_mutex_.m);
-                promote();
-            }
-        } else if (try_lock_update_enabled()) {
+        if (try_lock_update_enabled()) {
             // G5: promote() mutates the list (move_to_head) — use EXCLUSIVE lock,
             // not shared. Aligned with mm_2q (unique_lock<std::mutex>).
             std::unique_lock<detail::shared_spinlock> lock(update_mutex_.m, std::try_to_lock);
@@ -2446,6 +2332,12 @@ private:
         size_type mem = calc_item_memory(item->key, item->value);
 
         stats_.current_memory.fetch_sub(mem);
+        // fix.01 P1-19: count the expiration. This counter previously had
+        // exactly ONE increment site — the read path in check_expiry() — so
+        // items reaped by the background cleaner were never counted at all and
+        // `lru_cache_ttl_expired_total` reported "items a reader happened to
+        // notice", not "items that expired".
+        stats_.ttl_expired_count.value.fetch_add(1, std::memory_order_relaxed);
         callbacks_.collect_expire(item->key, std::move(item->value));
 
         map_.erase(key);
@@ -3485,6 +3377,12 @@ private:
         auto* item = ptr;
         size_type mem = calc_item_memory(item->key, item->value);
         stats_.current_memory.fetch_sub(mem);
+        // fix.01 P1-19: count the expiration. This counter previously had
+        // exactly ONE increment site — the read path in check_expiry() — so
+        // items reaped by the background cleaner were never counted at all and
+        // `lru_cache_ttl_expired_total` reported "items a reader happened to
+        // notice", not "items that expired".
+        stats_.ttl_expired_count.value.fetch_add(1, std::memory_order_relaxed);
         callbacks_.collect_expire(item->key, std::move(item->value));
         map_.erase(key);
         item->refcount.unmarkInMMContainer();
@@ -3784,7 +3682,14 @@ public:
         , lru_refresh_time_(config.default_lru_refresh_time)
         , next_reconfigure_time_(config.mm_reconfigure_interval_secs == 0
             ? std::numeric_limits<uint32_t>::max()
-            : current_time_sec() + config.mm_reconfigure_interval_secs) {}
+            : current_time_sec() + config.mm_reconfigure_interval_secs) {
+        // fix.01 P1-33: this constructor is the funnel for every constructor of
+        // this strategy, so validating here covers direct construction and the
+        // (max_size, config) / (max_size, max_memory, config) overloads alike.
+        // The sharded path already validated its config; the plain ones never
+        // did, so an out-of-range value was silently accepted.
+        config.validate();
+    }
 
     mm_2q(size_type max_size, const mm_2q_config& config = mm_2q_config{})
         : mm_2q(config) {
@@ -5160,7 +5065,14 @@ private:
 
         auto mem = calc_item_memory(key, value);
         if (max_memory_ != unlimited) {
-            while (!map_.empty() && max_memory_ - stats_.current_memory.load() < mem) {
+            // fix.01 P2-7: compare with current_memory + mem, not
+            // `max_memory_ - current_memory`. When eviction is blocked (all
+            // candidates pinned) current_memory can exceed max_memory_, and the
+            // subtraction then wraps to a huge value: the loop body never runs
+            // and an over-budget item is admitted. mm_lru and mm_fifo already
+            // used the additive form.
+            while (!map_.empty() &&
+                   stats_.current_memory.load() + mem > max_memory_) {
                 auto old_size = size();
                 evict();
                 if (size() == old_size) break;
@@ -5192,11 +5104,6 @@ private:
         // once per eviction.
         const uint8_t target_qid =
             (ghost_capacity() > 0 && ghost_take(key)) ? mm2q::kQueueWarm : mm2q::kQueueHot;
-        // TEMP DEBUG (remove)
-        std::fprintf(stderr, "[ins] key=%d target=%u ghosted=%d cap=%zu\n",
-                     static_cast<int>(key), static_cast<unsigned>(target_qid),
-                     ghost_keys_.contains(key) ? 1 : 0,
-                     static_cast<std::size_t>(ghost_capacity()));
         item->queue_id = target_qid;
         if (target_qid == mm2q::kQueueWarm) {
             // Mark "has been referenced at least once" so that if this item is
@@ -5305,6 +5212,12 @@ private:
         if (item->has_active_handle()) return;
         size_type mem = calc_item_memory(item->key, item->value);
         stats_.current_memory.fetch_sub(mem);
+        // fix.01 P1-19: count the expiration. This counter previously had
+        // exactly ONE increment site — the read path in check_expiry() — so
+        // items reaped by the background cleaner were never counted at all and
+        // `lru_cache_ttl_expired_total` reported "items a reader happened to
+        // notice", not "items that expired".
+        stats_.ttl_expired_count.value.fetch_add(1, std::memory_order_relaxed);
         callbacks_.collect_expire(item->key, std::move(item->value));
         map_.erase(key);
         remove_from_queue(item);
@@ -5664,7 +5577,14 @@ public:
         , lru_refresh_time_(config.default_lru_refresh_time)
         , next_reconfigure_time_(config.mm_reconfigure_interval_secs == 0
             ? std::numeric_limits<uint32_t>::max()
-            : current_time_sec() + config.mm_reconfigure_interval_secs) {}
+            : current_time_sec() + config.mm_reconfigure_interval_secs) {
+        // fix.01 P1-33: this constructor is the funnel for every constructor of
+        // this strategy, so validating here covers direct construction and the
+        // (max_size, config) / (max_size, max_memory, config) overloads alike.
+        // The sharded path already validated its config; the plain ones never
+        // did, so an out-of-range value was silently accepted.
+        config.validate();
+    }
 
     mm_tiny_lfu(size_type max_size, const mm_tiny_lfu_config& config = mm_tiny_lfu_config{})
         : mm_tiny_lfu(config) {
@@ -6723,7 +6643,14 @@ protected:
 
         auto mem = calc_item_memory(key, value);
         if (max_memory_ != unlimited) {
-            while (!map_.empty() && max_memory_ - stats_.current_memory.load() < mem) {
+            // fix.01 P2-7: compare with current_memory + mem, not
+            // `max_memory_ - current_memory`. When eviction is blocked (all
+            // candidates pinned) current_memory can exceed max_memory_, and the
+            // subtraction then wraps to a huge value: the loop body never runs
+            // and an over-budget item is admitted. mm_lru and mm_fifo already
+            // used the additive form.
+            while (!map_.empty() &&
+                   stats_.current_memory.load() + mem > max_memory_) {
                 auto old_size = size();
                 evict();
                 if (size() == old_size) break;
@@ -6764,9 +6691,11 @@ protected:
 
         maybe_promote_from_tiny();
 
-        // 随缓存增长自动扩容 CMS，避免频率估计失真。
-        // 对齐 MMTinyLFU.h 的 add() 末尾扩容语义。
-        sketch_.maybe_grow_access_counters();
+        // fix.01 P1-2: the CMS auto-growth call that used to sit here has been
+        // removed. It took the sketch's exclusive lock on EVERY insert and
+        // could never actually grow (see the note in count_min_sketch.hpp).
+        // The sketch is sized once at construction from the configured
+        // capacity; there is nothing to re-check per insert.
     }
 
     template <typename V>
@@ -7030,6 +6959,12 @@ private:
         if (item->has_active_handle()) return;
         size_type mem = calc_item_memory(item->key, item->value);
         stats_.current_memory.fetch_sub(mem);
+        // fix.01 P1-19: count the expiration. This counter previously had
+        // exactly ONE increment site — the read path in check_expiry() — so
+        // items reaped by the background cleaner were never counted at all and
+        // `lru_cache_ttl_expired_total` reported "items a reader happened to
+        // notice", not "items that expired".
+        stats_.ttl_expired_count.value.fetch_add(1, std::memory_order_relaxed);
         callbacks_.collect_expire(item->key, std::move(item->value));
         remove_from_queue(item);
         map_.erase(key);
@@ -7266,7 +7201,14 @@ public:
         , lru_refresh_time_(config.default_lru_refresh_time)
         , next_reconfigure_time_(config.mm_reconfigure_interval_secs == 0
             ? std::numeric_limits<uint32_t>::max()
-            : current_time_sec() + config.mm_reconfigure_interval_secs) {}
+            : current_time_sec() + config.mm_reconfigure_interval_secs) {
+        // fix.01 P1-33: this constructor is the funnel for every constructor of
+        // this strategy, so validating here covers direct construction and the
+        // (max_size, config) / (max_size, max_memory, config) overloads alike.
+        // The sharded path already validated its config; the plain ones never
+        // did, so an out-of-range value was silently accepted.
+        config.validate();
+    }
 
     mm_wtiny_lfu(size_type max_size, const mm_wtiny_lfu_config& config = mm_wtiny_lfu_config{})
         : mm_wtiny_lfu(config) {
@@ -8487,7 +8429,14 @@ protected:
 
         auto mem = calc_item_memory(key, value);
         if (max_memory_ != unlimited) {
-            while (!map_.empty() && max_memory_ - stats_.current_memory.load() < mem) {
+            // fix.01 P2-7: compare with current_memory + mem, not
+            // `max_memory_ - current_memory`. When eviction is blocked (all
+            // candidates pinned) current_memory can exceed max_memory_, and the
+            // subtraction then wraps to a huge value: the loop body never runs
+            // and an over-budget item is admitted. mm_lru and mm_fifo already
+            // used the additive form.
+            while (!map_.empty() &&
+                   stats_.current_memory.load() + mem > max_memory_) {
                 auto old_size = size();
                 evict();
                 if (size() == old_size) break;
@@ -8523,9 +8472,8 @@ protected:
         this->ttl_index_push(key, expiry_ns);
 
         sketch_.record(key);
-        // B3: auto-grow CMS counters when cache size increases significantly.
-        // Aligns with CacheLib MMWTinyLFU add() calling maybeGrowAccessCountersLocked.
-        sketch_.maybe_grow_access_counters();
+        // fix.01 P1-2: the per-insert CMS auto-growth call was removed here
+        // too — see the note in count_min_sketch.hpp.
         stats_.current_size.store(total_size());
         stats_.current_memory.fetch_add(mem);
         stats_.register_insertion();
@@ -8839,6 +8787,12 @@ private:
         if (item->has_active_handle()) return;
         size_type mem = calc_item_memory(item->key, item->value);
         stats_.current_memory.fetch_sub(mem);
+        // fix.01 P1-19: count the expiration. This counter previously had
+        // exactly ONE increment site — the read path in check_expiry() — so
+        // items reaped by the background cleaner were never counted at all and
+        // `lru_cache_ttl_expired_total` reported "items a reader happened to
+        // notice", not "items that expired".
+        stats_.ttl_expired_count.value.fetch_add(1, std::memory_order_relaxed);
         callbacks_.collect_expire(item->key, std::move(item->value));
         remove_from_queue(item);
         map_.erase(key);
@@ -9640,6 +9594,22 @@ public:
         std::size_t total_rehash_count = 0, total_rehash_migrated = 0;
         std::uint64_t total_rehash_time_ns = 0;
         std::size_t total_tls_flush = 0;
+        // fix.01 P1-42: counters the sharded aggregation used to drop. Because
+        // stats() is hand-written (rather than delegating to
+        // cache_stats::operator+), each new cache_stats field had to be added
+        // here too — and several never were, so on striped (production)
+        // caches the exported values read as a flat zero while the shard-level
+        // ones were fine. `incRef_overflow_count` was the worst case: its whole
+        // purpose is to flag silent handle-leak data loss, and it could never
+        // fire in the only configuration that matters.
+        std::size_t total_ttl_expired = 0, total_ttl_checked = 0;
+        std::size_t total_ttl_backlog = 0, total_incRef_overflow = 0;
+        std::size_t total_stampede = 0, total_tls_dropped = 0;
+        std::size_t total_hash_overload_events = 0;
+        float hash_lf_max = 0.0f;
+        std::size_t max_chain_max = 0;
+        float hash_overload_threshold_min = 0.0f;
+        bool first_shard = true;
         for (const auto& shard : shards_) {
             const auto& s = shard->stats();
             total_hits += s.hits.value.load(std::memory_order_relaxed);
@@ -9657,9 +9627,36 @@ public:
             total_rehash_time_ns += s.rehash_total_time_ns.load(std::memory_order_relaxed);
             total_rehash_migrated += s.rehash_migrated_items.load(std::memory_order_relaxed);
             total_tls_flush += s.tls_ring_flush_count.load(std::memory_order_relaxed);
-            // Aggregate latency histograms bucket-by-bucket (get/set).
+            // fix.01 P1-42: the fields this function used to drop.
+            total_ttl_expired += s.ttl_expired_count.value.load(std::memory_order_relaxed);
+            total_ttl_checked += s.ttl_checked_count.value.load(std::memory_order_relaxed);
+            total_ttl_backlog += s.ttl_cleanup_backlog.load(std::memory_order_relaxed);
+            total_incRef_overflow +=
+                s.incRef_overflow_count.value.load(std::memory_order_relaxed);
+            total_stampede += s.stampede_coalesced_count.load(std::memory_order_relaxed);
+            total_tls_dropped +=
+                s.tls_ring_dropped_promotions.value.load(std::memory_order_relaxed);
+            total_hash_overload_events +=
+                s.hash_overload_events.load(std::memory_order_relaxed);
+            hash_lf_max = std::max(hash_lf_max,
+                s.hash_load_factor.load(std::memory_order_relaxed));
+            max_chain_max = std::max(max_chain_max,
+                s.max_chain_length.load(std::memory_order_relaxed));
+            const float shard_threshold =
+                s.hash_overload_threshold.load(std::memory_order_relaxed);
+            if (first_shard || shard_threshold < hash_overload_threshold_min) {
+                hash_overload_threshold_min = shard_threshold;
+            }
+            first_shard = false;
+            // Aggregate latency histograms bucket-by-bucket.
             total.get_latency.merge_from(s.get_latency);
             total.set_latency.merge_from(s.set_latency);
+            // fix.01 P1-42: these were declared and exported but never
+            // aggregated, so their Prometheus series and stats_snapshot()
+            // fields were permanently empty on striped caches.
+            total.read_lock_wait_latency.merge_from(s.read_lock_wait_latency);
+            total.write_lock_wait_latency.merge_from(s.write_lock_wait_latency);
+            total.eviction_search_steps_hist.merge_from(s.eviction_search_steps_hist);
         }
         total.hits.value.store(total_hits, std::memory_order_relaxed);
         total.misses.value.store(total_misses, std::memory_order_relaxed);
@@ -9676,6 +9673,16 @@ public:
         total.rehash_total_time_ns.store(total_rehash_time_ns, std::memory_order_relaxed);
         total.rehash_migrated_items.store(total_rehash_migrated, std::memory_order_relaxed);
         total.tls_ring_flush_count.store(total_tls_flush, std::memory_order_relaxed);
+        total.ttl_expired_count.value.store(total_ttl_expired, std::memory_order_relaxed);
+        total.ttl_checked_count.value.store(total_ttl_checked, std::memory_order_relaxed);
+        total.ttl_cleanup_backlog.store(total_ttl_backlog, std::memory_order_relaxed);
+        total.incRef_overflow_count.value.store(total_incRef_overflow, std::memory_order_relaxed);
+        total.stampede_coalesced_count.store(total_stampede, std::memory_order_relaxed);
+        total.tls_ring_dropped_promotions.value.store(total_tls_dropped, std::memory_order_relaxed);
+        total.hash_overload_events.store(total_hash_overload_events, std::memory_order_relaxed);
+        total.hash_load_factor.store(hash_lf_max, std::memory_order_relaxed);
+        total.max_chain_length.store(max_chain_max, std::memory_order_relaxed);
+        total.hash_overload_threshold.store(hash_overload_threshold_min, std::memory_order_relaxed);
         return total;
     }
 

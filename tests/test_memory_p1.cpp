@@ -465,8 +465,8 @@ TEST(MemoryP1Test, ShouldAdmitHonoursTheHardCap) {
     cfg.max_memory_bytes.store(1000);
     // Keep the critical band above the projected occupancy used below so the
     // assertions isolate the cap rather than the probabilistic tier.
-    cfg.critical_watermark_fraction.store(0.99);
-    cfg.high_watermark_fraction.store(0.9);
+    cfg.critical_fraction.store(0.99);
+    cfg.throttle_fraction.store(0.9);
     cfg.critical_fraction.store(0.99);
     cfg.throttle_fraction.store(0.9);
     memory_monitor mon(cfg);

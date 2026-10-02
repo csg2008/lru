@@ -716,6 +716,30 @@ public:
             std::rethrow_exception(backend_ex);
         }
 
+        // fix.01 P1-27: the in-flight entry MUST be removed and the leader's
+        // promise satisfied on EVERY exit path from here, including the one
+        // where primary_.set() throws (bad_alloc, a throwing value copy
+        // constructor, or a user eviction callback). Previously the erase and
+        // the set_value only ran on the success path, so a throw left the key
+        // in inflight_maps_ holding a promise nobody would ever fulfil: every
+        // later get() for that key became a follower of an unsatisfiable future
+        // and never consulted the backend again — the key was permanently
+        // poisoned and the entry leaked for the lifetime of the cache. The RAII
+        // guard makes the cleanup unconditional; ordering is preserved because
+        // it runs after the promote below.
+        detail::scope_exit inflight_cleanup{[&] {
+            {
+                const std::size_t stripe = inflight_stripe_for(key);
+                auto inflight_lock = inflight_stripes_.make_unique_lock(stripe);
+                inflight_maps_[stripe].erase(key);
+            }
+            try {
+                leader_prom.set_value(backend_value);
+            } catch (...) {
+                // Promise already satisfied — shouldn't happen, ignore.
+            }
+        }};
+
         // Phase 5: Promote to primary cache BEFORE fulfilling the promise.
         // Followers waking up from future.wait() will then find the value
         // already in the primary cache.
@@ -723,24 +747,6 @@ public:
             primary_.set(key, *backend_value);
             ++backend_hits_;
             ++promotions_;
-        }
-
-        // Phase 6: Erase from in-flight table. New requests arriving after
-        // this point will find the value in the primary cache (or, on a
-        // backend miss, become fresh leaders themselves).
-        {
-            // O4: striped lock — same stripe as the emplace above.
-            const std::size_t stripe = inflight_stripe_for(key);
-            auto inflight_lock =
-                inflight_stripes_.make_unique_lock(stripe);
-            inflight_maps_[stripe].erase(key);
-        }
-
-        // Phase 7: Fulfill the promise to wake all followers.
-        try {
-            leader_prom.set_value(backend_value);
-        } catch (...) {
-            // Promise already satisfied — shouldn't happen, ignore.
         }
 
         if (!backend_value) {

@@ -1038,9 +1038,11 @@ TEST(ExtendedStress, MemoryPressureStress) {
     // Set limit to ~800KB → should hold ~10K items before throttling
     memory_monitor::config cfg;
     cfg.max_memory_bytes = 800 * 1024;       // 800 KB
-    cfg.high_watermark_fraction = 0.85;
-    cfg.critical_watermark_fraction = 0.95;
-    cfg.low_watermark_fraction = 0.70;
+    // fix.01 P1-35: the watermark trio merged into the single
+    // throttle/critical pair (the separate *_watermark_fraction fields are
+    // gone, and so is the never-read low watermark).
+    cfg.throttle_fraction = 0.85;
+    cfg.critical_fraction = 0.95;
     c.set_memory_monitor(cfg);
 
     auto deadline = std::chrono::steady_clock::now() +

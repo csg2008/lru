@@ -217,6 +217,11 @@ unset(_lru_san_summary)
 option(LRU_BUILD_TESTS "Build tests" ON)
 option(LRU_BUILD_EXAMPLES "Build examples" ON)
 option(LRU_BUILD_BENCHMARKS "Build benchmarks" OFF)
+# fix.01 §4.4: libFuzzer targets for the untrusted-input boundaries
+# (deserialization, shared-memory attach). libFuzzer ships with clang, so this
+# introduces no third-party dependency. Off by default because it requires a
+# clang toolchain with -fsanitize=fuzzer.
+option(LRU_BUILD_FUZZERS "Build libFuzzer targets (clang only)" OFF)
 
 # Debug instrumentation (default OFF in Release, ON for Debug builds of tests).
 # When enabled, read_handle<T> maintains a per-T global atomic counter
@@ -406,4 +411,9 @@ endif()
 # Benchmarks (requires Google Benchmark)
 if(LRU_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
+endif()
+
+# Fuzzers (libFuzzer, clang only)
+if(LRU_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
 endif()

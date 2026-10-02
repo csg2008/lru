@@ -186,69 +186,24 @@ public:
         step_decay_locked();
     }
 
-    // Dynamically grow the counter table when cache size increases
-    // significantly. Called when total_accesses_ exceeds 2x max_window_size.
-    // Doubles the width and re-seeds hash functions.
-    void maybe_grow_access_counters() {
-        std::unique_lock<detail::distributed_shared_mutex> write_lock(mutex_);
-        if (total_accesses_.load(std::memory_order_relaxed) <= 2 * max_window_size_.load(std::memory_order_relaxed)) {
-            return;
-        }
-        grow(width_ * 2);
-    }
-
-    // Resize the table to a new width. This is an approximation of
-    // key-preserving growth because the original keys are not stored. We
-    // redistribute the old counters by re-hashing (row, old_column) pairs,
-    // which preserves aggregate counts but not per-key locations.
-    void grow(std::size_t new_capacity) {
-        std::unique_lock<detail::distributed_shared_mutex> write_lock(mutex_);
-        structure_change_guard guard(structure_version_);
-        if (new_capacity <= width_) {
-            return;
-        }
-        // Copy old table values (atomic -> plain)
-        std::vector<uint32_t> old_table;
-        old_table.reserve(table_size_);
-        for (std::size_t i = 0; i < table_size_; ++i) {
-            old_table.push_back(table_[i].load(std::memory_order_relaxed));
-        }
-        auto old_width = width_;
-
-        width_ = new_capacity;
-        resize_table(depth_ * width_);
-
-        // Redistribute old counters into the new, wider table.
-        for (std::size_t i = 0; i < depth_; ++i) {
-            for (std::size_t j = 0; j < old_width; ++j) {
-                uint32_t val = old_table[i * old_width + j];
-                if (val > 0) {
-                    // Approximate re-hash of the old (row, column) pair.
-                    std::size_t h = hash_seeds_[i];
-                    h ^= static_cast<std::size_t>(j + 0x9e3779b9 + (h << 6) + (h >> 2));
-                    std::size_t new_col = h % width_;
-                    std::size_t new_idx = i * width_ + new_col;
-                    auto& cell = table_[new_idx];
-                    auto cur = cell.load(std::memory_order_relaxed);
-                    uint32_t next;
-                    do {
-                        next = cur + val;
-                        if (next < cur) {
-                            // Overflow: saturate
-                            next = std::numeric_limits<uint32_t>::max();
-                        }
-                    } while (!cell.compare_exchange_weak(cur, next,
-                                 std::memory_order_relaxed, std::memory_order_relaxed));
-                }
-            }
-        }
-
-        // Re-initialize hash seeds for better independence with new width
-        init_hash_seeds();
-        total_accesses_.store(0, std::memory_order_relaxed);
-        decay_step_.store(0, std::memory_order_relaxed);
-        recount_saturated();
-    }
+    // fix.01 P1-2: the CMS auto-growth path has been REMOVED, not fixed.
+    //
+    // `maybe_grow_access_counters()` used to be called on every insert of
+    // mm_tiny_lfu and mm_wtiny_lfu, took the sketch's EXCLUSIVE lock each
+    // time, and then almost always returned immediately: its trigger compared
+    // `total_accesses_` against `2 * max_window_size_`, but `record()` resets
+    // `total_accesses_` at every window boundary, so the condition could never
+    // hold. The only thing it reliably did was serialize the hottest write
+    // path in the library against the sketch, for nothing.
+    //
+    // Making it actually grow was tried and rejected. The sketch stores no
+    // keys, so a rebuild can only re-hash (row, column) pairs into a table
+    // with freshly generated hash seeds — the redistributed counts then land
+    // in columns that no key maps to any more, and estimates collapse toward
+    // zero. A "growth" path that silently destroys the frequency estimates it
+    // exists to protect is worse than no growth path at all. The table is
+    // instead sized once, at construction, from the cache's configured
+    // capacity, which is the sizing that actually matters.
 
     void reset() noexcept {
         std::unique_lock<detail::distributed_shared_mutex> write_lock(mutex_);

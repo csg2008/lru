@@ -762,22 +762,26 @@ public:
         // protected entries so a single push_pending() call returns
         // everything to the global pending list.
         if (curr) {
+            // fix.01 P1-7: count the unprocessed tail so `processed` equals
+            // the full length of the chain exchanged out above (see the ledger
+            // release below).
+            std::size_t tail_len = 1;  // `curr` itself
             if (!new_head) {
                 new_head = curr;
                 // Walk to the end of the unprocessed tail to find new_tail.
                 new_tail = curr;
                 while (new_tail->next_) {
                     new_tail = new_tail->next_;
+                    ++tail_len;
                 }
             } else {
                 new_tail->next_ = curr;
                 while (new_tail->next_) {
                     new_tail = new_tail->next_;
+                    ++tail_len;
                 }
             }
-            // P1-10: no need to count the unprocessed tail — the ledger is
-            // released by the number reclaimed, and push_pending() below
-            // re-reserves exactly these objects.
+            processed += tail_len;
         }
 
         // Push remaining protected entries back to the global list
@@ -787,12 +791,21 @@ public:
 
         // Update statistics (relaxed, hot path is try_reclaim itself)
         reclaim_total_.fetch_add(reclaimed_count, std::memory_order_relaxed);
-        // P1-10 (fix.01 方案 C): RELEASE exactly what was reclaimed instead of
-        // storing a recomputed remainder. try_reclaim() removed the whole
-        // pending list from the global chain, so the ledger must drop by the
-        // number of objects actually freed; the protected ones were pushed back
-        // and are already accounted for by push_pending().
-        pending_release(reclaimed_count);
+        // fix.01 P1-7: release exactly what was exchanged OUT of the global
+        // chain — the whole chain, not just the reclaimed prefix.
+        //
+        // The exchange above detached the entire list without touching the
+        // ledger, the survivors were then re-reserved by push_pending(), and
+        // the old code released only `reclaimed_count`. Net change was
+        // `+S - reclaimed = 2S - H` instead of `-reclaimed`, so whenever any
+        // survivor existed (the normal case) pending_count() crept upward and
+        // began triggering reclaims that had nothing to reclaim.
+        //
+        // `processed` now equals the full exchanged-chain length (the loop
+        // counts what it inspects; the block above adds the unprocessed tail).
+        // push_pending() re-reserves the survivors, so the net change is
+        // -reclaimed, as intended.
+        pending_release(processed);
 
         return reclaimed_count;
     }
@@ -1439,6 +1452,15 @@ public:
         if (!valid()) return;
         domain_.store_slot(slot_,
             const_cast<void*>(static_cast<const volatile void*>(ptr)));
+        // fix.01 P0-3: the slot store above is `release`, which orders the
+        // accesses BEFORE it but does not stop this thread's subsequent loads
+        // from being reordered ahead of it (x86-TSO permits StoreLoad
+        // reordering). Without this fence a retirer can read the slot as still
+        // unpublished and free the object exactly as the reader dereferences
+        // it. Putting the fence here (rather than at each call site) makes the
+        // guarantee impossible to forget: every inline traversal in
+        // concurrent_hash_table.hpp calls protect() directly.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
     }
 
     /// Publish `ptr`, then re-read the source through `reload` and only accept
@@ -1455,13 +1477,14 @@ public:
     ///
     /// The seq_cst fence is required, not decorative: it orders the publication
     /// of the slot before the re-read, so a retirer that observes our slot is
-    /// guaranteed to also observe any later value of the source.
+    /// guaranteed to also observe any later value of the source. fix.01 P0-3:
+    /// that fence now lives inside protect() itself, so this helper (and the
+    /// inline traversals that call protect() directly) all get it.
     template <typename T, typename ReloadFn>
     T* protect_and_reload_with(T* ptr, ReloadFn&& reload) {
         if (!valid()) return nullptr;
         for (;;) {
-            protect(ptr);
-            std::atomic_thread_fence(std::memory_order_seq_cst);
+            protect(ptr);  // publishes the slot AND fences (fix.01 P0-3)
             T* current = reload();
             if (current == ptr) {
                 return ptr;  // published value confirmed by the re-read

@@ -248,6 +248,17 @@ public:
         if (use_hit_signal_) {
             auto key_hash = hash_key(key);
             std::lock_guard lock(hit_mutex_);
+            // fix.01 P2-4: bound the signal map. An entry is normally consumed
+            // by should_admit(), but a key that is only ever READ (and never
+            // offered for insertion again) leaves its entry behind forever, so
+            // the map grew without bound under exactly the read-heavy workload
+            // this policy is meant for — an unbounded leak, updated under
+            // hit_mutex_ on the hit path. Past the cap the hint has stopped
+            // being useful; dropping it degrades to the documented "no hit
+            // signal" behaviour (admit on first sight) rather than leaking.
+            if (hit_signals_.size() >= kMaxHitSignals) {
+                hit_signals_.clear();
+            }
             hit_signals_[key_hash] = true;
         }
     }
@@ -321,6 +332,9 @@ private:
 
     approx_split_set tracker_;
     bool use_hit_signal_;
+
+    /// fix.01 P2-4: cap on the hit-signal map (see on_access()).
+    static constexpr std::size_t kMaxHitSignals = 8192;
 
     // Per-hash hit signal: set by on_access(), consumed by should_admit()
     ankerl::unordered_dense::map<std::size_t, bool> hit_signals_;

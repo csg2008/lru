@@ -293,6 +293,19 @@ public:
             return *this;
         }
 
+        /// fix.01 P1-8: whether this guard actually protects the thread.
+        ///
+        /// A guard is *active* whenever it was constructed with a domain, but
+        /// it only *protects* if enter_critical() managed to register the
+        /// thread in a slot. When every slot is occupied, the thread runs
+        /// unregistered and any pointer it dereferences may be reclaimed under
+        /// it. Read paths use this to fall back to the locked path instead of
+        /// traversing unprotected.
+        bool valid() const noexcept {
+            return active_ && domain_ &&
+                   domain_->current_thread_has_slot();
+        }
+
     private:
         epoch_domain* domain_;
         bool active_;
@@ -355,6 +368,15 @@ public:
             // force-advance check sees a consistent (epoch, time) pair.
             slot_batches_[batch][offset].entry_time_ns.store(now_ns, std::memory_order_release);
             cache.cs_depth = 1;
+            // fix.01 P0-3: the release store above only orders the accesses
+            // BEFORE it; it does not stop this thread's subsequent loads of
+            // shared data from being reordered before it (x86-TSO permits
+            // StoreLoad reordering). Without a seq_cst fence a reclaimer can
+            // read the slot as still-inactive, decide this reader is outside
+            // its critical section, and free an object the reader is about to
+            // dereference. Same publication-fence discipline as
+            // hazptr_holder::protect_and_reload_with().
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             return observed;
         }
 
@@ -385,6 +407,8 @@ public:
         slot_batches_[batch][offset].local_epoch.store(observed, std::memory_order_release);
         slot_batches_[batch][offset].entry_time_ns.store(now_ns, std::memory_order_release);
         cache.cs_depth = 1;
+        // fix.01 P0-3: publication fence — see the fast path above.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         return observed;
     }
 
@@ -414,6 +438,19 @@ public:
     /// Create an RAII epoch_guard for a critical section.
     epoch_guard make_guard() {
         return epoch_guard(*this);
+    }
+
+    /// fix.01 P1-8: true if the calling thread is currently registered in one
+    /// of this domain's slots, i.e. a critical section is genuinely active.
+    ///
+    /// Returns false when enter_critical() could not acquire a slot (all slots
+    /// busy). The thread is then NOT protected against reclamation, so read
+    /// paths must fall back to the locked path. Previously there was no way to
+    /// observe this: the guard still reported itself "active", and callers
+    /// kept traversing raw pointers unprotected.
+    bool current_thread_has_slot() const noexcept {
+        const tls_slot_cache& cache = tls_cache();
+        return cache.owner == this && cache.cs_depth > 0;
     }
 
     // ----------------------------------------------------------------
@@ -611,6 +648,13 @@ public:
 
         // Compute the minimum epoch observed by all active threads
         uint64_t min_epoch = compute_min_epoch();
+        // fix.01 P0-3: reclaimer-side fence, symmetric with the reader-side
+        // publication fence in enter_critical(). It orders "read every active
+        // slot" before "free anything": without it, a reader that just stored
+        // its epoch could be missed here (its store not yet visible) while its
+        // subsequent loads are still in flight, freeing an object it is about
+        // to dereference.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
 
         // Walk the list and reclaim safe entries
         hazptr_obj_base* new_head = nullptr;
@@ -679,20 +723,26 @@ public:
         // protected entries so a single push_pending() call returns
         // everything to the global pending list.
         if (curr) {
+            // fix.01 P1-7: count the unprocessed tail into `processed` so that
+            // after this block `processed` equals the length of the chain that
+            // was exchanged out of the shared head above. The ledger release
+            // below then drops exactly that many entries.
+            std::size_t tail_len = 1;  // `curr` itself
             if (!new_head) {
                 new_head = curr;
                 new_tail = curr;
                 while (new_tail->next_) {
                     new_tail = new_tail->next_;
+                    ++tail_len;
                 }
             } else {
                 new_tail->next_ = curr;
                 while (new_tail->next_) {
                     new_tail = new_tail->next_;
+                    ++tail_len;
                 }
             }
-            // P1-10: no need to count the unprocessed tail — the ledger is
-            // released by the number reclaimed and re-reserved by push_pending().
+            processed += tail_len;
         }
 
         // Push remaining entries back to the global list
@@ -702,11 +752,22 @@ public:
 
         // Update statistics
         reclaim_total_.fetch_add(reclaimed_count, std::memory_order_relaxed);
-        // P1-10 (fix.01 方案 C): release exactly what was reclaimed. The whole
-        // pending list was exchanged out above, so the ledger must drop by the
-        // number of objects freed; the protected ones were pushed back and are
-        // re-reserved by push_pending().
-        pending_release(reclaimed_count);
+        // fix.01 P1-7: release exactly what was exchanged OUT of the shared
+        // head — the whole chain, not just the reclaimed prefix.
+        //
+        // The old code released only `reclaimed_count` while the exchange
+        // above removed the whole chain without touching the ledger, and the
+        // survivors were then re-reserved by push_pending(). Net change was
+        // `+S - reclaimed = 2S - H` instead of `-reclaimed`, so with any
+        // survivors present (the normal case) pending_count() drifted upward
+        // without bound, spuriously triggering maybe_auto_reclaim() on nearly
+        // every flush and distorting the reclamation metrics.
+        //
+        // `processed` now equals the full exchanged-chain length (the loop
+        // counts what it inspects, and the block above adds the unprocessed
+        // tail). push_pending() re-reserves the survivors, so the net change
+        // is -reclaimed, as intended.
+        pending_release(processed);
 
         return reclaimed_count;
     }

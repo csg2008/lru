@@ -81,6 +81,11 @@ public:
     using value_type = T;
     static constexpr std::size_t kChunkSize = ChunkSize;
     static constexpr std::size_t kChunkHeaderSize = 2 * sizeof(void*) + sizeof(uint32_t) + sizeof(detail::refcount_with_flags);
+    // fix.01 M6: a zero-payload chunk makes assemble()/assign_raw()
+    // loop forever in their `while (remaining > 0)` fill loops — the
+    // existing static_assert only bounds the size from above.
+    static_assert(ChunkSize > kChunkHeaderSize,
+        "ChunkSize must exceed the chunk header, or chunks hold no data");
     static constexpr std::size_t kDataPerChunk = ChunkSize - kChunkHeaderSize;
 
     // --------------------------------------------------------------------
@@ -485,6 +490,13 @@ private:
             if (!head_) head_ = new_c;
             tail = new_c;
         }
+        // fix.01 P2-3: mirror assign_raw() — a copy that owns chunks must mark
+        // the parent kHasChainedItem, or has_chained_items() reports false for
+        // it and the cascading-eviction path treats a chained copy as a plain
+        // value (leaking the chunk chain and mis-sizing the item).
+        if (head_) {
+            parent_refcount_.setFlag<detail::Flags::kHasChainedItem>();
+        }
     }
 };
 
@@ -502,6 +514,11 @@ public:
     using value_type = std::string;
     static constexpr std::size_t kChunkSize = ChunkSize;
     static constexpr std::size_t kChunkHeaderSize = 2 * sizeof(void*) + sizeof(uint32_t) + sizeof(detail::refcount_with_flags);
+    // fix.01 M6: a zero-payload chunk makes assemble()/assign_raw()
+    // loop forever in their `while (remaining > 0)` fill loops — the
+    // existing static_assert only bounds the size from above.
+    static_assert(ChunkSize > kChunkHeaderSize,
+        "ChunkSize must exceed the chunk header, or chunks hold no data");
     static constexpr std::size_t kDataPerChunk = ChunkSize - kChunkHeaderSize;
 
     struct chunk {
@@ -785,6 +802,11 @@ private:
             if (tail) tail->next = new_c;
             if (!head_) head_ = new_c;
             tail = new_c;
+        }
+        // fix.01 P2-3: see the generic copy_chunks_from — a copy that owns
+        // chunks must set kHasChainedItem on the parent.
+        if (head_) {
+            parent_refcount_.setFlag<detail::Flags::kHasChainedItem>();
         }
     }
 };

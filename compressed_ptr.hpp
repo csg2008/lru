@@ -122,7 +122,7 @@ private:
             throw std::overflow_error("compressed_ptr: pointer is below base address");
         }
         auto diff = ptr_addr - base_addr;
-        if (diff > kMaxOffset) {
+        if (diff > kNullOffset - 1) {
             throw std::overflow_error("compressed_ptr: offset exceeds 4GB limit");
         }
         return static_cast<offset_type>(diff);
@@ -222,7 +222,12 @@ struct alignas(8) compressed_intrusive_hook {
             throw std::overflow_error("compressed_intrusive_hook::set_prev: pointer below base address");
         }
         auto diff = ptr_addr - base_addr;
-        if (diff > std::numeric_limits<uint32_t>::max()) {
+        // fix.01 P2-22: the bound must be kNullOffset - 1, not UINT32_MAX.
+        // kNullOffset is the "null" sentinel, so accepting diff == UINT32_MAX
+        // stored a value that every reader decodes as NULL — the node silently
+        // lost its predecessor. compressed_ptr (the non-hook variant) already
+        // used kMaxOffset = kNullOffset - 1.
+        if (diff > kNullOffset - 1) {
             throw std::overflow_error("compressed_intrusive_hook::set_prev: offset exceeds 32-bit range");
         }
         prev_offset = static_cast<uint32_t>(diff);
@@ -240,7 +245,8 @@ struct alignas(8) compressed_intrusive_hook {
             throw std::overflow_error("compressed_intrusive_hook::set_next: pointer below base address");
         }
         auto diff = ptr_addr - base_addr;
-        if (diff > std::numeric_limits<uint32_t>::max()) {
+        // fix.01 P2-22: see set_prev — UINT32_MAX is the null sentinel.
+        if (diff > kNullOffset - 1) {
             throw std::overflow_error("compressed_intrusive_hook::set_next: offset exceeds 32-bit range");
         }
         next_offset = static_cast<uint32_t>(diff);

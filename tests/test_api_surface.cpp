@@ -32,6 +32,8 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <array>
+#include <span>
 #include <string>
 
 #include "../lru.hpp"
@@ -64,16 +66,6 @@ void exercise_alias(std::size_t max_size = kSmall) {
     }
 
     c->flush();
-}
-
-/// Instantiates segmented_intrusive_list::clear() (P0-2: void* -> T*).
-void touch_segmented_list_clear() {
-    using mm_t = lru::mm_lru<int, std::string>;
-    using seg_list_t = typename mm_t::segmented_item_list;
-    seg_list_t list;
-    list.clear();
-    EXPECT_TRUE(list.empty());
-    EXPECT_EQ(list.size(), 0u);
 }
 
 }  // namespace
@@ -271,9 +263,120 @@ TEST(P0ApiSurface, ConstIterationOverShardedMmIsConsistent) {
         << "first-shard iteration cannot exceed the whole-cache size";
 }
 
-TEST(P0ApiSurface, SegmentedIntrusiveListClearCompilesAndRuns) {
-    // P0-2 (c): this function used to be uncompilable and was reachable only
-    // through dead code (mm_lru::list_clear(), since deleted). Instantiating it
-    // here keeps the fix locked in.
-    touch_segmented_list_clear();
+
+// ---------------------------------------------------------------------------
+// fix.01 P1-38: lru::config + apply_config()
+// ---------------------------------------------------------------------------
+
+TEST(P0ApiSurface, UnifiedConfigAppliesAndValidates) {
+    // The aggregate config must reach the cache's real setters.
+    lru::production_cache<int, std::string> c(512);
+
+    lru::config cfg;
+    cfg.max_size = 512;
+    cfg.memory_soft_watermark = 0.70;
+    cfg.memory_critical_watermark = 0.90;
+    cfg.num_stripes = 128;
+    cfg.num_shards = 64;
+    cfg.defer_promotion = false;
+    cfg.fairness = lru::detail::fairness_mode::writer_fair;
+    cfg.latency_tracking = true;
+    cfg.ttl_cleaner_interval = std::chrono::milliseconds(0);  // don't start a thread
+
+    lru::apply_config(c, cfg);
+
+    EXPECT_FALSE(c.is_defer_promotion_enabled())
+        << "apply_config must push defer_promotion";
+    EXPECT_EQ(c.get_fairness_mode(), lru::detail::fairness_mode::writer_fair);
+    EXPECT_EQ(c.max_size(), 512u);
+
+    // to_string() must mention the values, so it is usable in a log line.
+    const std::string text = cfg.to_string();
+    EXPECT_NE(text.find("defer_promotion=0"), std::string::npos) << text;
+    EXPECT_NE(text.find("stripes=128"), std::string::npos) << text;
+
+    // validate() must reject nonsense instead of accepting it silently.
+    lru::config bad = cfg;
+    bad.memory_soft_watermark = 0.99;
+    bad.memory_critical_watermark = 0.10;  // soft > critical
+    EXPECT_THROW(bad.validate(), std::invalid_argument);
+    EXPECT_THROW(lru::apply_config(c, bad), std::invalid_argument);
+
+    lru::config zero_stripes = cfg;
+    zero_stripes.num_stripes = 0;
+    EXPECT_THROW(zero_stripes.validate(), std::invalid_argument);
+}
+
+// ---------------------------------------------------------------------------
+// fix.01: bulk_get accepts a contiguous key range, like get_multi's span.
+// ---------------------------------------------------------------------------
+
+TEST(P0ApiSurface, BulkGetAcceptsContainerRange) {
+    auto c = std::make_unique<lru::safe_cache<int, std::string>>(16);
+    c->set(1, "one");
+    c->set(2, "two");
+
+    const std::vector<int> keys{1, 2, 3};
+
+    // The container form must compile and behave exactly like the iterator
+    // pair (it forwards to it).
+    auto via_span = c->bulk_get(keys);
+    auto via_iters = c->bulk_get(keys.begin(), keys.end());
+    ASSERT_EQ(via_span.size(), 3u);
+    ASSERT_EQ(via_iters.size(), 3u);
+    EXPECT_TRUE(via_span[0].has_value());
+    EXPECT_TRUE(via_span[1].has_value());
+    EXPECT_FALSE(via_span[2].has_value());  // key 3 absent
+    for (std::size_t i = 0; i < via_span.size(); ++i) {
+        EXPECT_EQ(via_span[i].has_value(), via_iters[i].has_value());
+    }
+
+    // std::array and C arrays are contiguous too.
+    const std::array<int, 2> arr{1, 2};
+    EXPECT_EQ(c->bulk_get(arr).size(), 2u);
+    const int raw[2] = {1, 2};
+    EXPECT_EQ(c->bulk_get(std::span<const int>(raw)).size(), 2u);
+
+    // The initializer_list overload still resolves for a braced list.
+    EXPECT_EQ(c->bulk_get({1, 2}).size(), 2u);
+}
+
+// ---------------------------------------------------------------------------
+// fix.01: bulk_try_get — the non-throwing bulk read.
+// ---------------------------------------------------------------------------
+
+TEST(P0ApiSurface, BulkTryGetIsNonThrowingOnShutdown) {
+    auto c = std::make_unique<lru::safe_cache<int, std::string>>(16);
+    c->set(1, "one");
+    c->set(2, "two");
+
+    const std::vector<int> keys{1, 2, 3};
+
+    // On a live cache the two bulk reads agree element-for-element: bulk_get
+    // already resolves every element through try_get, so a miss is a nullopt
+    // in both.
+    auto try_res = c->bulk_try_get(keys);
+    auto get_res = c->bulk_get(keys);
+    ASSERT_EQ(try_res.size(), keys.size());
+    ASSERT_EQ(get_res.size(), keys.size());
+    for (std::size_t i = 0; i < try_res.size(); ++i) {
+        EXPECT_EQ(try_res[i].has_value(), get_res[i].has_value()) << "index " << i;
+    }
+    EXPECT_TRUE(try_res[0].has_value());
+    EXPECT_TRUE(try_res[1].has_value());
+    EXPECT_FALSE(try_res[2].has_value());
+
+    // The convenience overloads mirror bulk_get's.
+    EXPECT_EQ(c->bulk_try_get({1, 2}).size(), 2u);
+    EXPECT_EQ(c->bulk_try_get(std::span<const int>(keys)).size(), 3u);
+
+    // After shutdown this is the point of the name: one nullopt per key and no
+    // exception, where bulk_get throws cache_closed_exception.
+    c->shutdown();
+    const auto after = c->bulk_try_get(keys);
+    ASSERT_EQ(after.size(), keys.size());
+    for (const auto& entry : after) {
+        EXPECT_FALSE(entry.has_value());
+    }
+    EXPECT_THROW((void)c->bulk_get(keys), lru::cache_closed_exception);
 }

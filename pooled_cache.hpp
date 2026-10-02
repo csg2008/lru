@@ -364,7 +364,13 @@ public:
     void resize_pool(std::string_view name, size_type new_max) {
         std::unique_lock lock(mutex_);
         auto& entry = get_pool(name);
+        // fix.01 P1-30: max_size(n) can evict, which mutates the pool's size
+        // and memory. Refresh the aggregate counters afterwards, as the other
+        // capacity-changing paths do — leaving them stale made
+        // should_evict_global() permanently true, so the rebalancer evicted on
+        // every tick and the drift compounded.
         entry.cache->max_size(new_max);
+        recompute_totals_unlocked();
         mark_eviction_dirty();
     }
 

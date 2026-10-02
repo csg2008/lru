@@ -799,11 +799,19 @@ inline constexpr bool has_peek_v = has_peek<MmType, Key>::value;
 // Uses a thread-local xorshift64 PRNG seeded from thread_id — ~5ns per call,
 // no locks, no allocation. Quality is sufficient for jitter; do not reuse
 // for cryptographic purposes. jitter_pct <= 0 returns dur unchanged.
+//
+// P0-6 (fix.01): the result is ALWAYS nanoseconds, regardless of the input
+// duration's period. The previous signature returned the caller's duration
+// type, so a `std::chrono::seconds` TTL of 1s jittered to 0.9s truncated to
+// 0s (immediate expiry) ~50% of the time. Returning nanoseconds makes the
+// sub-second jitter meaningful and keeps every expiry computation in one
+// unit.
 // ============================================================================
 template <typename Rep, typename Period>
-std::chrono::duration<Rep, Period>
+std::chrono::nanoseconds
 apply_ttl_jitter(std::chrono::duration<Rep, Period> dur, double jitter_pct) {
-    if (jitter_pct <= 0.0) return dur;
+    auto ns_count = std::chrono::duration_cast<std::chrono::nanoseconds>(dur).count();
+    if (jitter_pct <= 0.0) return std::chrono::nanoseconds(ns_count);
     thread_local uint64_t state = static_cast<uint64_t>(
         std::hash<std::thread::id>{}(std::this_thread::get_id())) | 1u;
     state ^= state << 13;
@@ -812,14 +820,9 @@ apply_ttl_jitter(std::chrono::duration<Rep, Period> dur, double jitter_pct) {
     double u = static_cast<double>(state >> 11) *
                (1.0 / static_cast<double>(1ull << 53));
     double factor = 1.0 + jitter_pct * (2.0 * u - 1.0);
-    // Operate in nanoseconds to preserve sub-second precision. Without this,
-    // a 1s TTL with ±10% jitter would truncate 0.9s → 0s (immediate expiry)
-    // ~50% of the time. Converting via nanoseconds keeps the full resolution.
-    auto ns_count = std::chrono::duration_cast<std::chrono::nanoseconds>(dur).count();
     auto jittered_ns = static_cast<long long>(static_cast<double>(ns_count) * factor);
     if (jittered_ns < 1) jittered_ns = 1;
-    return std::chrono::duration_cast<std::chrono::duration<Rep, Period>>(
-        std::chrono::nanoseconds(jittered_ns));
+    return std::chrono::nanoseconds(jittered_ns);
 }
 
 // ============================================================================
@@ -2698,15 +2701,18 @@ public:
         // avalanches when many keys share the same nominal TTL.
         std::uint64_t expiry_ns = 0;
         if (ttl > std::chrono::duration<Rep, Period>::zero()) {
-            auto effective_ttl = ttl;
+            // P0-6: keep the whole computation in nanoseconds. Jitter applied
+            // in the caller's duration type (usually seconds) truncated
+            // 0.9s -> 0s, so a 1s TTL expired immediately ~50% of the time.
+            std::chrono::nanoseconds effective_ttl =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ttl);
             if (ttl_jitter_enabled_.load(std::memory_order_relaxed) &&
                 ttl_jitter_pct_ > 0.0) {
                 effective_ttl = detail::apply_ttl_jitter(ttl, ttl_jitter_pct_);
             }
-            auto now = std::chrono::steady_clock::now();
-            auto expiry = now + std::chrono::duration_cast<
-                std::chrono::steady_clock::duration>(effective_ttl);
-            expiry_ns = static_cast<std::uint64_t>(expiry.time_since_epoch().count());
+            const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch());
+            expiry_ns = static_cast<std::uint64_t>((now_ns + effective_ttl).count());
         }
         set_with_expiry_ns_impl(key, std::forward<V>(value), expiry_ns);
     }
@@ -3755,6 +3761,10 @@ public:
     ///
     /// For all other use cases, prefer `get()` or `try_get()`.
     read_handle<Value> fast_get(const Key& key) {
+        // P1-34 (fix.01): the doc block above promises an EMPTY handle on
+        // shutdown, but the implementation had no such check, so a shut-down
+        // cache still served reads. Honour the documented contract.
+        if (is_shutdown()) return {};
         // T14.1: Compact path — no fast variant; fall back to get().
         // compact_cache::get() already runs a per-key striped lock with
         // no extra overhead, so the fast path is the same as the slow.
@@ -3798,12 +3808,19 @@ public:
     /// peek_for_get(), and promotions are batched via the TLS ring to
     /// minimize write lock contention.
     ///
-    /// @tparam InputIt  Input iterator type over keys.
+    /// @tparam InputIt  FORWARD iterator type over keys. It must be a forward
+    ///                  iterator, not merely an input iterator: the size is
+    ///                  obtained with `std::distance(first, last)` and the
+    ///                  range is then iterated, which for a single-pass input
+    ///                  iterator would consume the range and silently produce
+    ///                  an all-miss (or short) result. The constraint makes
+    ///                  that a compile error instead of a wrong answer.
     /// @param first     Start of key range.
     /// @param last      End of key range.
     /// @return Vector of optional read_handles, one per input key.
     ///         Hit positions are engaged; miss positions are nullopt.
     template <typename InputIt>
+        requires std::forward_iterator<InputIt>
     std::vector<std::optional<read_handle<Value>>> bulk_get(InputIt first, InputIt last) {
         if (is_shutdown()) {
             throw cache_closed_exception("unified_cache::bulk_get: cache is shut down");
@@ -3895,6 +3912,67 @@ public:
     /// Bulk get overload for initializer_list.
     std::vector<std::optional<read_handle<Value>>> bulk_get(std::initializer_list<Key> keys) {
         return bulk_get(keys.begin(), keys.end());
+    }
+
+    /// Bulk get overload for a contiguous key range.
+    ///
+    /// fix.01: `get_multi()` and `set_multi()` take a `std::span`, but the
+    /// `bulk_get` family only accepted an iterator pair — so the natural call
+    /// `c.bulk_get(keys)` (a `std::vector` / `std::array` / C array of keys)
+    /// did not compile, even though the sibling API made it look like it
+    /// should. This overload restores that symmetry; it forwards to the
+    /// iterator-pair form, so there is exactly one implementation.
+    std::vector<std::optional<read_handle<Value>>> bulk_get(std::span<const Key> keys) {
+        return bulk_get(keys.begin(), keys.end());
+    }
+
+    // ------------------------------------------------------------------
+    // bulk_try_get — the non-throwing bulk read
+    // ------------------------------------------------------------------
+    //
+    // This is the bulk form of the get()/try_get() pair, and the difference
+    // from bulk_get() is the SAME difference those two have:
+    //
+    //   - get()      throws cache_closed_exception after shutdown
+    //   - try_get()  returns nullopt
+    //   - bulk_get() throws cache_closed_exception after shutdown
+    //   - bulk_try_get() returns one nullopt per key
+    //
+    // On a live cache the two produce identical results: bulk_get() already
+    // resolves every element through try_get(), so a miss is a nullopt in both
+    // and neither throws for a miss. (Like try_get, "non-throwing" here means
+    // it does not throw for the documented cache-state reasons — a user
+    // callback or a failed allocation can still propagate.)
+    //
+    // It would not be worth adding a pure alias; the shutdown contract is what
+    // makes the name meaningful, and it is the reason a caller holding keys
+    // during teardown reaches for this instead of bulk_get().
+
+    /// Non-throwing bulk read over an iterator range.
+    /// Same forward-iterator requirement as bulk_get() — see there.
+    template <typename InputIt>
+        requires std::forward_iterator<InputIt>
+    std::vector<std::optional<read_handle<Value>>> bulk_try_get(InputIt first, InputIt last) {
+        if (is_shutdown()) {
+            // Match try_get(): a shut-down cache reports every key as absent
+            // rather than throwing. The result keeps the input's cardinality
+            // so callers can index it positionally, exactly like bulk_get().
+            return std::vector<std::optional<read_handle<Value>>>(
+                static_cast<std::size_t>(std::distance(first, last)));
+        }
+        return bulk_get(first, last);
+    }
+
+    /// Non-throwing bulk read over a contiguous key range
+    /// (`std::vector` / `std::array` / C array), mirroring the span overload
+    /// of bulk_get().
+    std::vector<std::optional<read_handle<Value>>> bulk_try_get(std::span<const Key> keys) {
+        return bulk_try_get(keys.begin(), keys.end());
+    }
+
+    /// Non-throwing bulk read over a braced key list.
+    std::vector<std::optional<read_handle<Value>>> bulk_try_get(std::initializer_list<Key> keys) {
+        return bulk_try_get(keys.begin(), keys.end());
     }
 
     /// Non-blocking get-or-fetch: like get_or_fetch but uses try_get
@@ -4366,6 +4444,10 @@ public:
         requires std::invocable<Eq, const Value&, const Value&> &&
                  std::convertible_to<std::invoke_result_t<Eq, const Value&, const Value&>, bool>
     bool cas(const Key& key, const Value& expected, Value desired, Eq&& eq_pred) {
+        // P0-5 (fix.01): cas mutates the cache, so it honours the
+        // shutdown/quiesce guard like every other write path. It previously
+        // slipped past it, letting a quiesced cache be mutated mid-snapshot.
+        (void)pre_write_check("cas");
         // Task B: cache shard_idx once per call.
         const std::size_t shard_idx = [&]() -> std::size_t {
             if constexpr (is_striped) return mm_.shard_for(key);
@@ -4438,6 +4520,8 @@ public:
         // The policy parameter selects this overload; only lockfree is valid.
         // (kLockedPredicate callers use the 4-arg overload above.)
         (void)policy;
+        // P0-5 (fix.01): see the 4-arg overload.
+        (void)pre_write_check("cas");
         // Task B: cache shard_idx once per call.
         const std::size_t shard_idx = [&]() -> std::size_t {
             if constexpr (is_striped) return mm_.shard_for(key);
@@ -4702,6 +4786,8 @@ public:
     /// The returned shared_ptr holds a copy of the value, safe to use even if the
     /// cache entry is later evicted. Returns nullptr on cache miss.
     std::shared_ptr<Value> get_shared(const Key& key) {
+        // P1-34 (fix.01): reject reads after shutdown (see contains()).
+        if (is_shutdown()) return nullptr;
         // Task B: cache shard_idx once per call.
         const std::size_t shard_idx = [&]() -> std::size_t {
             if constexpr (is_striped) return mm_.shard_for(key);
@@ -4755,7 +4841,11 @@ public:
     auto get_view(const Key& key) const {
         // Lock-free: peek() uses find_and_pin() to atomically pin the item.
         // The read_handle h keeps the item alive during view construction.
-        auto h = mm_.peek(key);
+        // P1-34 (fix.01): reject reads after shutdown (see contains()).
+        auto h = [&]() {
+            if (is_shutdown()) return decltype(mm_.peek(key)){};
+            return mm_.peek(key);
+        }();
         if (!h) {
             if constexpr (std::is_same_v<Value, std::string>) {
                 return std::optional<std::string_view>{};
@@ -4796,6 +4886,10 @@ public:
     }
 
     bool del(const Key& key) {
+        // P0-5 (fix.01): every mutating path must honour the shutdown/quiesce
+        // guard. Deletes only free memory, so the memory-critical rejection is
+        // intentionally ignored here; a closed cache must not mutate, though.
+        (void)pre_write_check("del");
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
             auto result = mm_.del(key);
@@ -4815,6 +4909,8 @@ public:
     /// The item is removed from the cache immediately; memory is
     /// freed when all outstanding handles are released.
     bool force_del(const Key& key) {
+        // P0-5 (fix.01): see del().
+        (void)pre_write_check("force_del");
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
             bool result;
@@ -4849,6 +4945,8 @@ public:
 
     /// Delete with extended result code.
     DelResult del_ex(const Key& key) {
+        // P0-5 (fix.01): see del().
+        (void)pre_write_check("del_ex");
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
             DelResult result;
@@ -4883,6 +4981,8 @@ public:
 
     // B16: 返回 RemoveRes 的删除操作
     RemoveRes remove(const Key& key) {
+        // P0-5 (fix.01): see del().
+        (void)pre_write_check("remove");
         // T14.1: Compact path.
         if constexpr (Trait::is_compact) {
             bool removed = compact().del(key);
@@ -4913,6 +5013,8 @@ public:
     ///
     /// All current MM types implement pop(); this function requires that method.
     std::optional<Value> pop(const Key& key) {
+        // P0-5 (fix.01): see del().
+        (void)pre_write_check("pop");
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
             std::optional<Value> result;
@@ -4944,6 +5046,8 @@ public:
     /// Pop the LRU item from the cache. Unlike eviction, this does NOT fire
     /// eviction callbacks. Returns std::nullopt if the cache is empty.
     std::optional<std::pair<Key, Value>> pop_lru() {
+        // P0-5 (fix.01): see del().
+        (void)pre_write_check("pop_lru");
         // P1-1 (T2.2): Drain TLS ring before write lock — see set().
         maybe_drain_tls_ring_pre_evict();
         flush_guard fg{mm_};
@@ -4962,6 +5066,8 @@ public:
     /// Evict one item according to the MM strategy. This fires eviction callbacks.
     /// Returns true if an item was evicted.
     bool evict() {
+        // P0-5 (fix.01): see del().
+        (void)pre_write_check("evict");
         // P1-1 (T2.2): Drain TLS ring before write lock — see set().
         maybe_drain_tls_ring_pre_evict();
         flush_guard fg{mm_};
@@ -5156,11 +5262,23 @@ public:
         per_shard_ebr_domains_.resize(n);
         for (std::size_t i = 0; i < n; ++i) {
             if (!per_shard_ebr_domains_[i]) {
-                auto dom = std::make_unique<detail::epoch_domain>();
+                // fix.01 P1-9: deliberately LEAKED (never deleted) so the
+                // domains outlive this cache. Every thread caches its
+                // owning domain pointer in TLS (`tls_slot_cache::owner`,
+                // `tls_retire_buffer::owner_domain`) and dereferences it on
+                // thread exit and on its next critical section. A domain owned
+                // by the cache's unique_ptr died with the cache, leaving those
+                // TLS pointers dangling — a use-after-free in any thread that
+                // touched the cache and outlived it. Allocating here (instead
+                // of std::make_unique) makes the lifetime process-wide, the
+                // same strategy default_domain() already uses for exactly this
+                // reason. The cost is one domain per shard retained until
+                // process exit.
+                auto* dom = new detail::epoch_domain();
                 dom->mark_drain_started();
-                per_shard_ebr_domains_[i] = std::move(dom);
+                per_shard_ebr_domains_[i] = dom;
             }
-            mm_.shard(i).set_ebr_domain(per_shard_ebr_domains_[i].get());
+            mm_.shard(i).set_ebr_domain(per_shard_ebr_domains_[i]);
         }
         per_shard_ebr_enabled_ = true;
         return true;
@@ -6055,9 +6173,34 @@ public:
         std::string out;
         out.reserve(4096);
         auto append_str = [&](std::string_view s) { out.append(s); };
+        // fix.01: minimal JSON string escaping. Every value emitted today is a
+        // fixed enum spelling, but this is a public API and the moment any
+        // caller-controlled text (a cache name, a rendered key) reaches it,
+        // an unescaped quote or backslash produces malformed JSON — or, in a
+        // consumer that trusts the structure, injection.
+        auto append_json_escaped = [&](std::string_view s) {
+            for (char c : s) {
+                switch (c) {
+                    case '"':  out.append("\\\""); break;
+                    case '\\': out.append("\\\\"); break;
+                    case '\n': out.append("\\n");  break;
+                    case '\r': out.append("\\r");  break;
+                    case '\t': out.append("\\t");  break;
+                    default:
+                        if (static_cast<unsigned char>(c) < 0x20u) {
+                            char esc[8];
+                            std::snprintf(esc, sizeof(esc), "\\u%04x",
+                                static_cast<unsigned>(static_cast<unsigned char>(c)));
+                            out.append(esc);
+                        } else {
+                            out.push_back(c);
+                        }
+                }
+            }
+        };
         auto append_kv_str_field = [&](std::string_view k, std::string_view v) {
             out.append("\""); out.append(k); out.append("\": \"");
-            out.append(v); out.append("\", ");
+            append_json_escaped(v); out.append("\", ");
         };
         auto append_kv_u_field = [&](std::string_view k, std::uint64_t v) {
             out.append("\""); out.append(k); out.append("\": ");
@@ -6419,6 +6562,10 @@ public:
     }
 
     bool contains(const Key& key) const {
+        // P1-34 (fix.01): a shut-down cache reports nothing — consistent with
+        // get()/try_get() rejecting reads after shutdown (previously contains()
+        // still answered, contradicting fast_get()'s documented contract).
+        if (is_shutdown()) return false;
         // T14.1: Compact path.
         if constexpr (Trait::is_compact) {
             return compact().contains(key);
@@ -6437,6 +6584,8 @@ public:
     /// under the hash table's bucket lock, eliminating the need for a
     /// stripe-level read lock.
     read_handle<const Value> peek(const Key& key) const {
+        // P1-34 (fix.01): reject reads after shutdown (see contains()).
+        if (is_shutdown()) return {};
         // T14.1: Compact path — compact_cache::peek() returns
         // std::optional<std::reference_wrapper<const Value>>. Wrap the
         // pointer in a non-pinning read_handle.
@@ -8433,31 +8582,37 @@ private:
     static void emit_histogram_lines(std::string& out,
                                      std::string_view name,
                                      const detail::latency_histogram& hist) {
-        auto append_bucket = [&](std::size_t idx, std::string_view le_str) {
+        // fix.01 P1-41: write CUMULATIVE counts. Prometheus' `le` semantics
+        // require `_bucket{le="X"}` to hold "observations <= X", monotonically
+        // non-decreasing, with the +Inf bucket equal to `_count`. The previous
+        // version emitted each bucket's raw count, so `histogram_quantile()`
+        // produced nonsense from a series that violated the exposition
+        // contract (the code even claimed the opposite in its own comment).
+        auto append_bucket = [&](std::uint64_t cumulative, std::string_view le_str) {
             out.append(name);
             out.append("_bucket{le=\"");
             out.append(le_str);
             out.append("\"} ");
-            out.append(std::to_string(hist.bucket(idx)));
+            out.append(std::to_string(cumulative));
             out.push_back('\n');
         };
 
-        // buckets 0..bucket_count-2: le = bucket_upper_bound(i)
-        // (exclusive upper bound; Prometheus histograms are cumulative
-        // and use le="<upper bound>" semantics).
+        // buckets 0..bucket_count-2: le = bucket_upper_bound(i), cumulative.
         char buf[32];
         constexpr std::size_t last = detail::latency_histogram::bucket_count - 1;
+        std::uint64_t running = 0;
         for (std::size_t i = 0; i < last; ++i) {
             std::uint64_t le = detail::latency_histogram::bucket_upper_bound(i);
             // Skip buckets with zero width (cannot happen with the log-linear
             // layout, but guard anyway for safety).
             if (le == 0) continue;
+            running += hist.bucket(i);
             std::snprintf(buf, sizeof(buf), "%llu",
                           static_cast<unsigned long long>(le));
-            append_bucket(i, buf);
+            append_bucket(running, buf);
         }
-        // overflow bucket: le="+Inf"
-        append_bucket(last, "+Inf");
+        // overflow bucket: le="+Inf" — must equal _count.
+        append_bucket(hist.count(), "+Inf");
 
         // Use the true accumulated sum (atomic uint64, fetch_add on every
         // record()). This replaces the previous (min+max)/2 * count
@@ -9593,17 +9748,32 @@ private:
                         // the per-shard write lock (not the stripe lock) —
                         // the stripe lock does not protect the MM data
                         // structures and would race with concurrent set().
+                        // fix.01 P1-18/P1-19: record whether this shard still
+                        // has expired work after the batch. With round-robin +
+                        // a batch budget, the reaping rate is capped at
+                        // batch_size per shard per cycle; if arrivals outpace
+                        // it, expired items accumulate while
+                        // `ttl_cleanup_backlog` — the very metric meant to
+                        // expose that — sat permanently at zero. A shard whose
+                        // batch filled is recorded as backlog=1, so the
+                        // cross-shard sum reads as "shards with pending
+                        // expiry", which is the actionable signal.
+                        std::size_t evicted = 0;
                         if constexpr (has_per_shard_lock_v<mm_type>) {
                             auto lock = mm_.try_acquire_shard_write_lock(i);
                             if (!lock.owns_lock()) continue;
-                            total += mm_.shard(i).evict_expired_n(batch_size);
+                            evicted = mm_.shard(i).evict_expired_n(batch_size);
                         } else {
                             auto stripe = i % striped_mutex_.size();
                             auto lock = striped_mutex_.try_make_unique_lock(stripe);
                             if (!lock.owns_lock()) continue;
                             // Evict at most batch_size expired items from this shard.
-                            total += mm_.shard(i).evict_expired_n(batch_size);
+                            evicted = mm_.shard(i).evict_expired_n(batch_size);
                         }
+                        total += evicted;
+                        mm_.shard(i).stats().ttl_cleanup_backlog.store(
+                            evicted >= batch_size ? std::size_t{1} : std::size_t{0},
+                            std::memory_order_relaxed);
                     } else {
                         // Legacy behavior: blocking lock, evict all expired.
                         // T3.4 bugfix (P1-7): per-shard write lock for sharded_mm_lru.
@@ -9614,6 +9784,9 @@ private:
                             auto lock = striped_mutex_.make_unique_lock(i % striped_mutex_.size());
                             total += mm_.shard(i).evict_expired();
                         }
+                        // No batch budget => every expired item was removed.
+                        mm_.shard(i).stats().ttl_cleanup_backlog.store(
+                            0, std::memory_order_relaxed);
                     }
                 }
             } else if constexpr (requires { mm_.evict_expired(); }) {
@@ -9950,19 +10123,33 @@ public:
     /// For non-striped thread-safe policies, acquires the global write lock.
     /// For single-threaded policies, returns a noop_lock.
     auto acquire_write_lock_for_key(const Key& key) const {
-        // P2-3 (T3.4): Prefer per-shard lock when the MM provides one
-        // (e.g. sharded_mm_lru). This decouples num_shards from
-        // num_stripes and removes the historical constraint that
-        // shard_idx == stripe_idx.
+        // fix.01 P1-43: hash once, then measure the acquisition. The branches
+        // below used to each recompute Hash{}(key); the wait histogram needs
+        // the hash too, so computing it up front removes a redundant hash AND
+        // makes the per-shard attribution exact.
+        //
+        // Why the histogram matters: `write_lock_wait_count` was already
+        // incremented on the slow path, but `write_lock_wait_latency` was
+        // declared, exported as `lru_cache_write_lock_wait_ns`, and never
+        // recorded anywhere — a count with no distribution, on the one
+        // contention signal an operator most wants percentiles for. The timer
+        // covers acquisition only (it is constructed before the lock and
+        // destroyed as the function returns), and is gated on
+        // latency_tracking_enabled exactly like the get/set timers.
+        const auto hash = Hash{}(key);
         if constexpr (has_per_shard_lock_v<mm_type>) {
-            auto hash = Hash{}(key);
-            auto shard = mm_.shard_for_hash(hash);
-            return mm_.acquire_shard_write_lock(shard);
+            auto& st = mm_.shard(mm_.shard_for_hash(hash)).stats();
+            detail::scope_latency_timer lock_timer(st.write_lock_wait_latency,
+                st.latency_tracking_enabled.load(std::memory_order_relaxed));
+            return mm_.acquire_shard_write_lock(mm_.shard_for_hash(hash));
         } else if constexpr (is_striped) {
-            auto hash = Hash{}(key);
-            auto stripe = striped_mutex_.stripe_for(hash);
-            return striped_mutex_.make_unique_lock(stripe);
+            auto& st = mm_.shard(0).stats();
+            detail::scope_latency_timer lock_timer(st.write_lock_wait_latency,
+                st.latency_tracking_enabled.load(std::memory_order_relaxed));
+            return striped_mutex_.make_unique_lock(striped_mutex_.stripe_for(hash));
         } else if constexpr (is_thread_safe) {
+            detail::scope_latency_timer lock_timer(mm_.stats().write_lock_wait_latency,
+                mm_.stats().latency_tracking_enabled.load(std::memory_order_relaxed));
             return typename lock_policy::write_lock_type(mutex_);
         } else {
             return noop_lock{};
@@ -9974,15 +10161,22 @@ public:
     /// For non-striped thread-safe policies, acquires the global read lock.
     /// For single-threaded policies, returns a noop_lock.
     auto acquire_read_lock_for_key(const Key& key) const {
+        // fix.01 P1-43: hash once + record the read-lock wait — see
+        // acquire_write_lock_for_key() for the rationale.
+        const auto hash = Hash{}(key);
         if constexpr (has_per_shard_lock_v<mm_type>) {
-            auto hash = Hash{}(key);
-            auto shard = mm_.shard_for_hash(hash);
-            return mm_.acquire_shard_read_lock(shard);
+            auto& st = mm_.shard(mm_.shard_for_hash(hash)).stats();
+            detail::scope_latency_timer lock_timer(st.read_lock_wait_latency,
+                st.latency_tracking_enabled.load(std::memory_order_relaxed));
+            return mm_.acquire_shard_read_lock(mm_.shard_for_hash(hash));
         } else if constexpr (is_striped) {
-            auto hash = Hash{}(key);
-            auto stripe = striped_mutex_.stripe_for(hash);
-            return striped_mutex_.make_shared_lock(stripe);
+            auto& st = mm_.shard(0).stats();
+            detail::scope_latency_timer lock_timer(st.read_lock_wait_latency,
+                st.latency_tracking_enabled.load(std::memory_order_relaxed));
+            return striped_mutex_.make_shared_lock(striped_mutex_.stripe_for(hash));
         } else if constexpr (is_thread_safe) {
+            detail::scope_latency_timer lock_timer(mm_.stats().read_lock_wait_latency,
+                mm_.stats().latency_tracking_enabled.load(std::memory_order_relaxed));
             return typename lock_policy::read_lock_type(mutex_);
         } else {
             return noop_lock{};
@@ -10210,7 +10404,8 @@ private:
     // destructor calls flush(), which retires remaining items to the shard's
     // EBR domain) and the domains LAST (their destructor reclaims whatever
     // was retired during mm_ teardown).
-    std::vector<std::unique_ptr<detail::epoch_domain>> per_shard_ebr_domains_;
+    // fix.01 P1-9: raw, process-lifetime pointers — see rebuild_per_shard_ebr_domains().
+    std::vector<detail::epoch_domain*> per_shard_ebr_domains_;
     bool per_shard_ebr_enabled_ = false;
 
     mm_type mm_;

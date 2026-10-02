@@ -1877,7 +1877,19 @@ public:
                         if (!need_retry) {
                             // ---- Overflow chain traversal (raw pointer, no hazptr) ----
                             Value curr = chunk.embed_head.load(std::memory_order_acquire);
+                            // fix.01 P1-13: bound the raw-pointer walk. A
+                            // concurrent blocking rehash rewrites these chain
+                            // pointers in place, and this path only re-checks
+                            // the seqlock after the walk finishes — so a
+                            // transient cycle would spin here forever. The
+                            // chain-mode traversals already cap at
+                            // kMaxWalkSteps; this one did not.
+                            int walk_steps = 0;
                             while (curr) {
+                                if (++walk_steps > kMaxWalkSteps) {
+                                    return find_and_pin_with_hash(
+                                        key, h, std::forward<PinFn>(pin_fn));
+                                }
                                 if (equal_(curr->key, key)) {
                                     if (pin_fn(curr)) {
                                         return curr;
@@ -2238,7 +2250,13 @@ public:
                         if (!need_retry) {
                             // Overflow chain traversal (raw pointer, no hazptr)
                             Value curr = chunk.embed_head.load(std::memory_order_acquire);
+                            // fix.01 P1-13: bounded walk — see the sibling site
+                            // in the EBR variant above.
+                            int walk_steps = 0;
                             while (curr) {
+                                if (++walk_steps > kMaxWalkSteps) {
+                                    return find_and_pin(key, std::forward<PinFn>(pin_fn));
+                                }
                                 if (equal_(curr->key, key)) {
                                     if (pin_fn(curr)) {
                                         return curr;
@@ -2710,6 +2728,24 @@ public:
             return exclusive_bucket_lock(buckets_[idx].spin);
         }
     }
+
+    // fix.01 P1-3: a re-check of the bucket index under the bucket lock was
+    // attempted here and is NOT enabled.
+    //
+    // The window is real: a concurrent BLOCKING rehash takes every bucket lock,
+    // swaps buckets_/bucket_mask_, and releases them, so a caller that computed
+    // `idx = bucket_for_hash(h)` before the swap can end up holding the lock
+    // for an index the new table no longer maps `h` to — the write then lands
+    // where no reader probes and the key is silently lost.
+    //
+    // Both forms of the fix were tried and both HANG the forced-rehash stress
+    // test (production_cache with expected_items = 1 plus the 1 ms rehash
+    // balancer, i.e. a rehash completing between essentially every unlock and
+    // re-lock): the unbounded retry livelocks immediately, and a retry bounded
+    // to 4 attempts still hung 2 of 5 runs of a standalone reproduction. A
+    // narrow stale-index window is strictly better than an intermittent hang,
+    // so the original single-check form is kept until the interaction is
+    // understood (needs Linux + TSan; not reproducible with MinGW's tooling).
 
     shared_bucket_lock lock_bucket_shared(const Key& key) {
         const size_type h = hash_(key);
@@ -4403,6 +4439,17 @@ public:
                 // Incremental rehash: allocate new array, set state, don't block
                 auto new_buckets = std::make_unique<bucket_type[]>(new_bucket_count);
 
+                // fix.01 P1-5: NOTE — adding a second seqlock increment here
+                // (to restore even parity, matching rehash_begin_f14()) is
+                // deliberately NOT done: with it, the lock-free read path
+                // becomes active again under incremental rehash and a
+                // 16-thread read-heavy soak hangs. The parity asymmetry is
+                // real (this begin increments once while rehash_finish()
+                // increments twice, leaving the seqlock odd), but the
+                // lock-free path it un-gates needs the missing walk bound
+                // (P1-13) validated first. Leaving it as-is keeps readers on
+                // the safe shared-lock fallback.
+
                 rehash_new_buckets_owner_ = std::move(new_buckets);
                 rehash_new_buckets_.store(rehash_new_buckets_owner_.get(), std::memory_order_release);
                 rehash_new_bucket_count_.store(new_bucket_count, std::memory_order_release);
@@ -4632,7 +4679,13 @@ public:
             return *this;
         }
 
-        bool is_active() const noexcept { return active_; }
+        /// fix.01 P1-8: true only if the thread is genuinely registered in a
+        /// slot. A guard whose enter_critical() could not acquire a slot (all
+        /// slots busy) reports false, so callers can fall back to the locked
+        /// path instead of traversing raw pointers unprotected.
+        bool is_active() const noexcept {
+            return active_ && domain_ && domain_->current_thread_has_slot();
+        }
 
     private:
         detail::epoch_domain* domain_;
@@ -5996,6 +6049,14 @@ public:
     using key_equal = KeyEqual;
     using value_type = Value;
     using segment_type = concurrent_hash_table<Key, Value, Hash, KeyEqual, EmbeddedChain, ProbingStyle>;
+
+    // fix.01 P1-6: `cached_per_segment_lf_` below is a fixed 64-entry array
+    // (kMaxCachedSegments) sized for the default NumSegments. The refresh loop
+    // writes `num_segments_` entries, so NumSegments > 64 wrote past the end
+    // of the array. Refuse it at compile time instead of corrupting memory.
+    static_assert(NumSegments <= 64,
+        "segmented_concurrent_hash_table supports at most 64 segments "
+        "(the per-segment diagnostics cache is a fixed 64-entry array)");
 
     // R2: Expose EmbeddedChain setting for compile-time verification.
     static constexpr bool uses_embedded_chain = EmbeddedChain;

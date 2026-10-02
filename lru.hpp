@@ -616,6 +616,142 @@ template <typename Key, typename Value,
 using striped_unified_compact_cache = unified_cache<compact_unified_sharded_lru_trait<striped_thread_safe_policy<>>, Key, Value, Hash, KeyEqual>;
 
 // ============================================================================
+// fix.01 §5.A / P1-38: one configuration object for the common knobs
+// ============================================================================
+//
+// The library exposes ~20 per-subsystem config structs and ~50 runtime setters
+// — everything is configurable, but there was no single object to build,
+// validate, print or hand around, so "the cache is configurable" was true in
+// the small and false in the large. `lru::config` aggregates the settings a
+// deployment actually touches, and `apply_config()` pushes them onto a cache.
+//
+// It is deliberately additive: the per-subsystem structs (mm_lru_config,
+// slab_allocator::config, tls_ring_config, …) remain the way to reach anything
+// not covered here, and each field below is applied only when the target cache
+// actually supports it (every call sits behind a `requires` guard, so this
+// works on compact_cache and the specialised wrappers too).
+
+/// Aggregate configuration for the knobs every deployment sets.
+struct config {
+    // --- capacity / memory ---
+    std::size_t max_size = unlimited;
+    std::size_t max_memory = unlimited;              ///< unlimited = no memory cap
+    double memory_soft_watermark = 0.85;             ///< start aggressive eviction
+    double memory_critical_watermark = 0.95;         ///< reject insertions
+
+    // --- concurrency ---
+    std::size_t num_stripes = 64;
+    std::size_t num_shards = 64;
+    bool incremental_rehash = true;
+    bool defer_promotion = true;
+    bool ebr = false;                                ///< EBR reclaim (LRU variants only)
+    detail::fairness_mode fairness = detail::fairness_mode::writer_fair;
+
+    // --- TTL ---
+    std::chrono::milliseconds ttl_cleaner_interval{1000};  ///< 0 = don't start one
+    bool ttl_cleaner_round_robin = true;
+    std::size_t ttl_evict_batch_size = 0;            ///< 0 = evict all expired per lock
+    bool ttl_jitter_enabled = true;
+    double ttl_jitter_pct = 0.10;
+
+    // --- observability / callbacks ---
+    bool async_callbacks = false;
+    bool latency_tracking = false;                   ///< off by default (~+68% per op)
+
+    /// Reject impossible combinations loudly instead of behaving strangely.
+    void validate() const {
+        auto frac_ok = [](double f) { return f >= 0.0 && f <= 1.0; };
+        if (!frac_ok(memory_soft_watermark) || !frac_ok(memory_critical_watermark)) {
+            throw std::invalid_argument("lru::config: memory watermarks must be in [0, 1]");
+        }
+        if (memory_soft_watermark > memory_critical_watermark) {
+            throw std::invalid_argument(
+                "lru::config: memory_soft_watermark must be <= memory_critical_watermark");
+        }
+        if (ttl_jitter_pct < 0.0) {
+            throw std::invalid_argument("lru::config: ttl_jitter_pct must be non-negative");
+        }
+        if (num_stripes == 0 || num_shards == 0) {
+            throw std::invalid_argument("lru::config: num_stripes / num_shards must be > 0");
+        }
+    }
+
+    /// One-line snapshot for logs and diagnostics_text().
+    std::string to_string() const {
+        std::string s;
+        s += "config{max_size=";
+        s += (max_size == unlimited) ? "unlimited" : std::to_string(max_size);
+        s += " max_memory=";
+        s += (max_memory == unlimited) ? "unlimited" : std::to_string(max_memory);
+        s += " watermarks=" + std::to_string(memory_soft_watermark) + "/" +
+             std::to_string(memory_critical_watermark);
+        s += " stripes=" + std::to_string(num_stripes);
+        s += " shards=" + std::to_string(num_shards);
+        s += " fairness=" + std::string(detail::fairness_mode_to_string(fairness));
+        s += " defer_promotion=" + std::string(defer_promotion ? "1" : "0");
+        s += " incremental_rehash=" + std::string(incremental_rehash ? "1" : "0");
+        s += " ebr=" + std::string(ebr ? "1" : "0");
+        s += " ttl_cleaner_ms=" + std::to_string(ttl_cleaner_interval.count());
+        s += " ttl_batch=" + std::to_string(ttl_evict_batch_size);
+        s += " ttl_jitter=" + std::to_string(ttl_jitter_pct);
+        s += " async_callbacks=" + std::string(async_callbacks ? "1" : "0");
+        s += " latency_tracking=" + std::string(latency_tracking ? "1" : "0");
+        s += "}";
+        return s;
+    }
+};
+
+/// Push a `lru::config` onto an existing cache.
+///
+/// Call after construction (the cache's own constructor still owns capacity
+/// sizing). Every step is guarded, so passing a cache that does not implement
+/// a knob is a no-op for that knob rather than a compile error.
+template <typename Cache>
+void apply_config(Cache& c, const config& cfg) {
+    cfg.validate();
+
+    if (cfg.max_size != unlimited) c.max_size(cfg.max_size);
+    if constexpr (requires { c.max_memory(cfg.max_memory); }) {
+        if (cfg.max_memory != unlimited) c.max_memory(cfg.max_memory);
+    }
+    if constexpr (requires { c.set_defer_promotion(true); }) {
+        c.set_defer_promotion(cfg.defer_promotion);
+    }
+    if constexpr (requires { c.set_incremental_rehash(true); }) {
+        c.set_incremental_rehash(cfg.incremental_rehash);
+    }
+    if constexpr (requires { c.set_fairness_mode(cfg.fairness); }) {
+        c.set_fairness_mode(cfg.fairness);
+    }
+    if constexpr (requires { c.set_memory_watermarks(0.0, 0.0); }) {
+        c.set_memory_watermarks(cfg.memory_soft_watermark, cfg.memory_critical_watermark);
+    }
+    if constexpr (requires { c.set_ttl_jitter_enabled(true); }) {
+        c.set_ttl_jitter_enabled(cfg.ttl_jitter_enabled);
+        c.set_ttl_jitter_pct(cfg.ttl_jitter_pct);
+    }
+    if constexpr (requires { c.set_ttl_cleaner_round_robin(true); }) {
+        c.set_ttl_cleaner_round_robin(cfg.ttl_cleaner_round_robin);
+    }
+    if constexpr (requires { c.set_async_callbacks(true); }) {
+        c.set_async_callbacks(cfg.async_callbacks);
+    }
+    if constexpr (requires { c.set_latency_tracking(true); }) {
+        c.set_latency_tracking(cfg.latency_tracking);
+    }
+    if constexpr (requires { c.set_ebr_domain(&detail::epoch_domain::default_domain()); }) {
+        if (cfg.ebr) {
+            // Guarded no-op for strategies that do not support EBR.
+            c.set_ebr_domain(&detail::epoch_domain::default_domain());
+        }
+    }
+    if constexpr (requires { c.start_ttl_cleaner(std::chrono::milliseconds{1}); }) {
+        if (cfg.ttl_cleaner_interval.count() > 0) {
+            c.start_ttl_cleaner(cfg.ttl_cleaner_interval);
+        }
+    }
+}
+
 // Out-of-line definitions for unified_cache::save() / load()
 // Must appear after serialization.hpp is included so that the
 // free functions serialize() / deserialize() are visible.
@@ -677,7 +813,13 @@ auto collect_snapshot(const MM& mm) {
         const auto& c = mm.config();
         snap.config.lru_refresh_time = mm.refresh_time();
         snap.config.lru_refresh_ratio = c.lru_refresh_ratio;
-        snap.config.cms_error_rate = c.cms_error_rate;
+        // P1-25: serialized_mm_config carries the CacheLib CMS sizing trio
+        // (window_multiplier / error_threshold / hash_count), not the removed
+        // `cms_error_rate`. Without these three the restored sketch would have
+        // a dimension that disagrees with the restored counters.
+        snap.config.cms_window_multiplier = static_cast<uint32_t>(c.cms_window_multiplier);
+        snap.config.cms_error_threshold = c.cms_error_threshold;
+        snap.config.cms_hash_count = static_cast<uint32_t>(c.cms_hash_count);
         snap.config.try_lock_update = c.try_lock_update;
         auto cms_words = static_cast<uint32_t>(mm.sketch().serialized_state_words());
         snap.cms_state.resize(cms_words);
@@ -686,7 +828,9 @@ auto collect_snapshot(const MM& mm) {
         const auto& c = mm.config();
         snap.config.lru_refresh_time = mm.refresh_time();
         snap.config.lru_refresh_ratio = c.lru_refresh_ratio;
-        snap.config.cms_error_rate = c.cms_error_rate;
+        snap.config.cms_window_multiplier = static_cast<uint32_t>(c.cms_window_multiplier);
+        snap.config.cms_error_threshold = c.cms_error_threshold;
+        snap.config.cms_hash_count = static_cast<uint32_t>(c.cms_hash_count);
         snap.config.try_lock_update = c.try_lock_update;
         auto cms_words = static_cast<uint32_t>(mm.sketch().serialized_state_words());
         snap.cms_state.resize(cms_words);

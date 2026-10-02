@@ -117,6 +117,10 @@ public:
         : live_cache_(std::make_shared<cache_type>(capacity)) {}
 
     ~warm_cache_manager() {
+        // fix.01 P1-24: stop the cache callbacks first. They now own the
+        // shared delta state (so they cannot dangle), but they must not keep
+        // recording deltas for a manager that is being destroyed.
+        delta_state_->enabled.store(false, std::memory_order_release);
         stop_incremental_snapshot();
         // Joins the load thread if one is running (cancel_load_locked does
         // that), so the thread is reaped before this object is destroyed.
@@ -154,6 +158,15 @@ public:
                     return;
                 }
                 auto size = file.tellg();
+                // fix.01: tellg() returns -1 on failure; casting that to
+                // size_t would request an enormous allocation. load_from_file()
+                // already guarded this, the load thread did not.
+                if (size < 0) {
+                    state_.store(load_state::failed, std::memory_order_release);
+                    set_load_error("cannot determine size of file: " + path);
+                    load_cv_.notify_all();
+                    return;
+                }
                 file.seekg(0);
                 std::vector<uint8_t> data(static_cast<std::size_t>(size));
                 file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size));
@@ -342,27 +355,33 @@ public:
         if (delta_callbacks_attached_.exchange(true)) {
             return;  // already attached
         }
-        delta_tracking_enabled_.store(true, std::memory_order_release);
+        delta_state_->enabled.store(true, std::memory_order_release);
+        // fix.01 P1-24: capture the shared delta state BY VALUE, not `this`.
+        // The callback_manager cannot unregister, so these callbacks outlive
+        // this manager whenever the caller keeps the cache (get_cache() hands
+        // out the shared_ptr). Capturing `this` made every later write a
+        // use-after-free once the manager was gone.
+        auto state = delta_state_;
         // Hook on_insert: record the new value for this key (new insertion).
-        cache->on_insert([this](const key_type& key, const mapped_type& value) {
-            if (!delta_tracking_enabled_.load(std::memory_order_relaxed)) return;
-            auto& s = delta_shards_[delta_shard_for(key)];
+        cache->on_insert([state](const key_type& key, const mapped_type& value) {
+            if (!state->enabled.load(std::memory_order_relaxed)) return;
+            auto& s = state->shards[std::hash<key_type>{}(key) & (kDeltaShards - 1)];
             std::lock_guard lock(s.mtx);
             s.map[key] = value;
         });
         // O7: Hook on_update: record the updated value for this key
         // (existing key whose value changed). This replaces the previous
         // behavior of firing on_insert for updates.
-        cache->on_update([this](const key_type& key, const mapped_type& value) {
-            if (!delta_tracking_enabled_.load(std::memory_order_relaxed)) return;
-            auto& s = delta_shards_[delta_shard_for(key)];
+        cache->on_update([state](const key_type& key, const mapped_type& value) {
+            if (!state->enabled.load(std::memory_order_relaxed)) return;
+            auto& s = state->shards[std::hash<key_type>{}(key) & (kDeltaShards - 1)];
             std::lock_guard lock(s.mtx);
             s.map[key] = value;
         });
         // Hook on_evict: record a tombstone for this key.
-        cache->on_evict([this](const key_type& key, const mapped_type& /*value*/) {
-            if (!delta_tracking_enabled_.load(std::memory_order_relaxed)) return;
-            auto& s = delta_shards_[delta_shard_for(key)];
+        cache->on_evict([state](const key_type& key, const mapped_type& /*value*/) {
+            if (!state->enabled.load(std::memory_order_relaxed)) return;
+            auto& s = state->shards[std::hash<key_type>{}(key) & (kDeltaShards - 1)];
             std::lock_guard lock(s.mtx);
             s.map[key] = std::nullopt;
         });
@@ -374,9 +393,9 @@ public:
     /// support removal), but become no-ops because
     /// `delta_tracking_enabled_` is false.
     void disable_delta_tracking() {
-        delta_tracking_enabled_.store(false, std::memory_order_release);
+        delta_state_->enabled.store(false, std::memory_order_release);
         delta_callbacks_attached_.store(false, std::memory_order_release);
-        for (auto& s : delta_shards_) {
+        for (auto& s : delta_state_->shards) {
             std::lock_guard lock(s.mtx);
             s.map.clear();
         }
@@ -395,7 +414,7 @@ public:
     /// tracking is enabled (G9). Callers may also invoke it manually
     /// after any operation that replaces the live cache.
     void reattach_delta_callbacks() {
-        if (!delta_tracking_enabled_.load(std::memory_order_acquire)) {
+        if (!delta_state_->enabled.load(std::memory_order_acquire)) {
             return;  // delta tracking not enabled, nothing to reattach
         }
         delta_callbacks_attached_.store(false, std::memory_order_release);
@@ -404,7 +423,7 @@ public:
 
     /// Whether delta tracking is currently enabled.
     bool delta_tracking_enabled() const noexcept {
-        return delta_tracking_enabled_.load(std::memory_order_acquire);
+        return delta_state_->enabled.load(std::memory_order_acquire);
     }
 
     /// Number of pending delta entries (unique mutated keys since the
@@ -412,7 +431,7 @@ public:
     /// delta grows too large.
     std::size_t pending_delta_count() const {
         std::size_t total = 0;
-        for (auto& s : delta_shards_) {
+        for (auto& s : delta_state_->shards) {
             std::lock_guard lock(s.mtx);
             total += s.map.size();
         }
@@ -513,7 +532,7 @@ public:
         // Snapshot the delta map (swap with empty under each shard lock).
         ankerl::unordered_dense::map<key_type, std::optional<mapped_type>>
             local_delta;
-        for (auto& s : delta_shards_) {
+        for (auto& s : delta_state_->shards) {
             std::lock_guard lock(s.mtx);
             for (auto& [k, v] : s.map) {
                 local_delta[std::move(k)] = std::move(v);
@@ -587,6 +606,7 @@ public:
                 std::ifstream full_file(full_path, std::ios::binary | std::ios::ate);
                 if (!full_file.is_open()) return false;
                 auto size = full_file.tellg();
+                if (size < 0) return false;  // fix.01: never size a vector from -1
                 full_file.seekg(0);
                 std::vector<uint8_t> full_data(static_cast<std::size_t>(size));
                 full_file.read(reinterpret_cast<char*>(full_data.data()),
@@ -605,6 +625,7 @@ public:
                 std::ifstream delta_file(delta_path, std::ios::binary | std::ios::ate);
                 if (!delta_file.is_open()) return true;  // delta unreadable, use full
                 auto size = delta_file.tellg();
+                if (size < 0) return true;  // fix.01: unreadable delta → use full snapshot
                 delta_file.seekg(0);
                 delta_data.resize(static_cast<std::size_t>(size));
                 delta_file.read(reinterpret_cast<char*>(delta_data.data()),
@@ -715,7 +736,7 @@ private:
     std::size_t snapshot_tick_count_ = 0;
 
     // Delta tracking state (P2-G, T-G6: sharded for low contention)
-    // T-G6: delta_map_ is sharded into 16 stripes, each with its own mutex
+    // T-G6: the delta map is sharded into 16 stripes, each with its own mutex
     // and map. The on_insert / on_update / on_evict callbacks (hot path
     // under high write concurrency) pick a shard by hash(key) % 16 and
     // lock only that shard. size() and swap() iterate all shards.
@@ -724,13 +745,28 @@ private:
         mutable std::mutex mtx;
         ankerl::unordered_dense::map<key_type, std::optional<mapped_type>> map;
     };
-    std::array<delta_shard, kDeltaShards> delta_shards_;
+
+    /// fix.01 P1-24: the delta state lives in a heap object shared with the
+    /// cache callbacks instead of in this manager.
+    ///
+    /// The callbacks registered by enable_delta_tracking() capture a raw
+    /// `this`, but the cache cannot outlive... rather, this manager does not
+    /// bound the cache's lifetime: get_cache() hands the shared_ptr to the
+    /// caller and the callback_manager has no way to unregister. So destroying
+    /// the manager while the cache is still in use left the callbacks reading
+    /// freed memory on the next write. Holding the state behind a shared_ptr
+    /// that the callbacks own keeps it alive exactly as long as something can
+    /// still call it.
+    struct delta_state {
+        std::atomic<bool> enabled{false};
+        std::array<delta_shard, kDeltaShards> shards;
+    };
+    std::shared_ptr<delta_state> delta_state_{std::make_shared<delta_state>()};
 
     std::size_t delta_shard_for(const key_type& key) const noexcept {
         return std::hash<key_type>{}(key) & (kDeltaShards - 1);
     }
 
-    std::atomic<bool> delta_tracking_enabled_{false};
     std::atomic<bool> delta_callbacks_attached_{false};
 };
 
@@ -759,6 +795,7 @@ std::shared_ptr<CacheType> load_cache_from_file(
         if (!file.is_open()) return nullptr;
 
         auto size = file.tellg();
+        if (size < 0) return nullptr;  // fix.01: never size a vector from -1
         file.seekg(0);
         std::vector<uint8_t> data(static_cast<std::size_t>(size));
         file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size));
