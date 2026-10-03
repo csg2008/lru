@@ -143,7 +143,7 @@ TEST(TieredCacheTest, InflightCountIsZeroAtRest) {
 }
 
 // ============================================================================
-// P1-2: Thundering herd prevention
+// Thundering herd prevention
 // ============================================================================
 
 TEST(TieredCacheThunderingHerdTest, HundredConcurrentSameKeyMissInvokesBackendOnce) {
@@ -170,7 +170,7 @@ TEST(TieredCacheThunderingHerdTest, HundredConcurrentSameKeyMissInvokesBackendOn
     std::atomic<bool> go{false};
 
     for (int i = 0; i < kThreads; ++i) {
-        // P0-3: `i` is not referenced inside the lambda, so it must not be
+        // `i` is not referenced inside the lambda, so it must not be
         // captured (-Wunused-lambda-capture).
         threads.emplace_back([&]() {
             ready.fetch_add(1, std::memory_order_acq_rel);
@@ -344,11 +344,11 @@ TEST(TieredCacheThunderingHerdTest, SecondWaveBecomesFreshLeader) {
 }
 
 // ============================================================================
-// P1-5: memory_storage_backend striped locking
+// memory_storage_backend striped locking
 // ============================================================================
 
 TEST(TieredCacheStripedInflightTest, ManyDistinctKeysFetchedConcurrently) {
-    // O4: Verify the striped inflight_mutex allows concurrent fetches on
+    // Verify the striped inflight_mutex allows concurrent fetches on
     // DIFFERENT keys to proceed in parallel (no global serialization).
     // With 32 threads fetching 32 distinct keys (each backend.get taking
     // 30ms), a single global mutex would serialize all fetches → ~960ms
@@ -409,7 +409,7 @@ TEST(TieredCacheStripedInflightTest, ManyDistinctKeysFetchedConcurrently) {
 }
 
 TEST(TieredCacheStripedInflightTest, InflightCountCorrectAfterConcurrentOps) {
-    // O4: Verify inflight_count() returns 0 after concurrent operations
+    // Verify inflight_count() returns 0 after concurrent operations
     // complete. The lock_all-based snapshot must not deadlock or return
     // stale non-zero values due to stripes being held by in-flight ops.
     counting_backend backend;
@@ -451,7 +451,7 @@ TEST(TieredCacheStripedInflightTest, InflightCountCorrectAfterConcurrentOps) {
 }
 
 // ============================================================================
-// P1-5: memory_storage_backend striped locking
+// memory_storage_backend striped locking
 // ============================================================================
 
 TEST(MemoryStorageBackendTest, BasicGetPutRemoveContainsSize) {
@@ -577,7 +577,7 @@ TEST(MemoryStorageBackendConcurrencyTest, SixtyFourThreadsNoDeadlockOrCorruption
     go.store(true, std::memory_order_release);
 
     // Wait for writers to finish, then stop the readers.
-    // P0-3: iterate with iterators instead of an int index into the vector, so
+    // iterate with iterators instead of an int index into the vector, so
     // no signed/unsigned conversion is needed for threads[i].
     const auto readers_begin = threads.begin() + kWriters;
     for (auto it = threads.begin(); it != readers_begin; ++it) it->join();
@@ -662,7 +662,7 @@ TEST(MemoryStorageBackendConcurrencyTest, StripedOutperformsSingleMutexUnderCont
         << "striped backend took too long: " << elapsed_ms << "ms";
 }
 
-// P2-F: clear() must NOT hold a global write_all lock — concurrent
+// clear() must NOT hold a global write_all lock — concurrent
 // operations on other stripes should make progress while clear() runs.
 // We verify this by having a background thread hammer a non-cleared
 // stripe while the main thread clears the backend. If clear() used the
@@ -713,7 +713,7 @@ TEST(MemoryStorageBackendConcurrencyTest, ClearDoesNotBlockOtherStripes) {
     EXPECT_TRUE(clear_done.load());
 }
 
-// P2-F: clear() must produce an empty backend (functional correctness).
+// clear() must produce an empty backend (functional correctness).
 TEST(MemoryStorageBackendTest, ClearWithPerStripeLockingDrainsAll) {
     memory_storage_backend<int, std::string> backend{16};
     for (int i = 0; i < 1'000; ++i) backend.put(i, "v");
@@ -729,7 +729,7 @@ TEST(MemoryStorageBackendTest, ClearWithPerStripeLockingDrainsAll) {
 }
 
 // ============================================================================
-// O5: Backend Circuit Breaker
+// Backend Circuit Breaker
 // ============================================================================
 //
 // Verifies the circuit breaker state machine: CLOSED → OPEN on repeated

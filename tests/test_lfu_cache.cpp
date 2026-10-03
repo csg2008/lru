@@ -1,7 +1,8 @@
 // Unified LRU Cache - LFU (TinyLFU) Cache unit tests
-// 与 unified_cache 架构对齐：使用 lru::lfu_cache<K,V> 别名（TinyLFU 策略）。
-// mm_tiny_lfu 不直接提供 frequency()/min_frequency()/max_frequency()/pop_lfu()，
-// 频率估计通过 c.mm().sketch().estimate(key) 访问，队列大小通过 tiny_size()/main_size() 访问。
+// Aligned with the unified_cache architecture: use the lru::lfu_cache<K,V> alias
+// (TinyLFU). mm_tiny_lfu does not expose frequency()/min_frequency()/
+// max_frequency()/pop_lfu(); frequency estimates come from
+// c.mm().sketch().estimate(key) and queue sizes from tiny_size()/main_size().
 
 #include <gtest/gtest.h>
 #include <string>
@@ -44,7 +45,7 @@ TEST_F(LfuCacheCrudTest, EmptyCache) {
 }
 
 TEST_F(LfuCacheCrudTest, PeekDoesNotPromote) {
-    // peek 不改变频率和队列，返回 read_handle<const V>
+    // peek does not change frequency or queue placement; returns read_handle<const V>.
     auto result = c.peek(1);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 'a');
@@ -57,7 +58,7 @@ TEST_F(LfuCacheCrudTest, AddNewKey) {
 
 TEST_F(LfuCacheCrudTest, AddExistingKeyDoesNotChangeValue) {
     EXPECT_FALSE(c.add(1, 'z'));
-    EXPECT_EQ(*c.get(1), 'a'); // 值不变
+    EXPECT_EQ(*c.get(1), 'a'); // value unchanged
 }
 
 TEST_F(LfuCacheCrudTest, ReplaceExisting) {
@@ -95,39 +96,39 @@ TEST(LfuEvictionTest, EvictsOnCapacityOverflow) {
     c.set(2, "two");
     c.set(3, "three");
 
-    // 插入新元素触发淘汰
+    // Inserting a new element triggers eviction.
     c.set(4, "four");
 
-    // TinyLFU 的频率准入可能导致 size <= max_size（窗口队列晋升时会淘汰）
+    // TinyLFU's frequency admission can leave size <= max_size (a window promotion evicts).
     EXPECT_LE(c.size(), 3u);
-    // 新插入的元素应存在
+    // The newly inserted element must be present.
     EXPECT_TRUE(c.contains(4));
-    // 应触发了淘汰
+    // An eviction must have happened.
     auto stats = c.stats_snapshot();
     EXPECT_GE(stats.evictions.value.load(), 1u);
 }
 
 TEST(LfuEvictionTest, FrequencyAwareAdmission) {
-    // TinyLFU 的核心特性：频率高的元素更可能被保留
+    // TinyLFU's core property: frequently used elements are more likely to survive.
     lfu_cache<int, std::string> c(4);
     c.set(1, "one");
     c.set(2, "two");
     c.set(3, "three");
     c.set(4, "four");
 
-    // 频繁访问 2 和 4，提高其频率估计
+    // Access 2 and 4 repeatedly to raise their frequency estimates.
     for (int i = 0; i < 5; ++i) {
         c.get(2);
         c.get(4);
     }
 
-    // 插入新元素，触发淘汰决策
+    // Insert a new element to trigger an admission decision.
     c.set(5, "five");
     c.set(6, "six");
 
-    // size 不超过 max_size
+    // size must not exceed max_size.
     EXPECT_LE(c.size(), 4u);
-    // 频率高的 2 和 4 中至少一个应被保留
+    // At least one of the high-frequency keys (2 and 4) must survive.
     int hot_retained = 0;
     if (c.contains(2)) ++hot_retained;
     if (c.contains(4)) ++hot_retained;
@@ -139,10 +140,10 @@ TEST(LfuEvictionTest, ResizeDown) {
     for (int i = 0; i < 5; ++i) {
         c.set(i, std::to_string(i));
     }
-    // TinyLFU 的窗口队列晋升可能导致 size <= max_size
+    // A TinyLFU window promotion can leave size <= max_size.
     EXPECT_LE(c.size(), 5u);
 
-    c.max_size(2); // 缩容触发淘汰
+    c.max_size(2); // shrinking triggers eviction
     EXPECT_LE(c.size(), 2u);
 }
 
@@ -168,7 +169,7 @@ TEST(LfuCacheStatsTest, InsertionAndEvictionTracking) {
     lfu_cache<int, int> c(2);
     c.set(1, 1);
     c.set(2, 2);
-    c.set(3, 3); // 触发淘汰
+    c.set(3, 3); // triggers eviction
 
     auto stats = c.stats_snapshot();
     EXPECT_EQ(stats.insertions.value.load(), 3u);
@@ -181,7 +182,7 @@ TEST(LfuCacheStatsTest, InsertionAndEvictionTracking) {
 
 TEST(LfuCacheCallbackTest, HitCallback) {
     lfu_cache<int, int> c;
-    c.set_defer_promotion(false);  // 显式启用即时提升，使 hit 回调同步触发
+    c.set_defer_promotion(false);  // enable immediate promotion so the hit callback fires synchronously
     int hit_key = 0;
     int hit_value = 0;
 
@@ -222,13 +223,13 @@ TEST(LfuCacheCallbackTest, EvictCallback) {
 
     c.set(1, 100);
     c.set(2, 200);
-    c.set(3, 300); // 触发淘汰
+    c.set(3, 300); // triggers eviction
 
-    // A8: 频率感知淘汰——当频率相等时（newcomer_wins_on_tie=true），淘汰 Main tail。
-    // 插入 1,2 后：Tiny={2}, Main={1}（1 被晋升到 Main）。
-    // 插入 3 时触发 evict，比较 Tiny tail(2) 与 Main tail(1) 频率（均为 1），
-    // 1>=1 → admit=true → evict_from_main → evict key=1。
-    // 对齐 CacheLib MMTinyLFU.h:488-500。
+    // Frequency-aware eviction: on a frequency tie (newcomer_wins_on_tie == true)
+    // the Main tail is evicted. After inserting 1 and 2: Tiny={2}, Main={1}.
+    // Inserting 3 evicts, comparing the Tiny tail (2) with the Main tail (1),
+    // both frequency 1: 1>=1 -> admit -> evict_from_main -> evict key 1.
+    // Mirrors CacheLib MMTinyLFU.h:488-500.
     EXPECT_EQ(evict_key, 1);
     EXPECT_EQ(evict_value, 100);
 }
@@ -258,46 +259,46 @@ TEST(LfuCacheCapacityTest, MaxMemoryEviction) {
     c.set_key_size_calculator([](const std::string& s) { return s.size(); });
     c.set_value_size_calculator([](const std::string& s) { return s.size(); });
 
-    c.set("a", "1");     // 小
-    c.set("bb", "22");   // 中
-    c.set("ccc", "333"); // 大 - 应触发淘汰
+    c.set("a", "1");     // small
+    c.set("bb", "22");   // medium
+    c.set("ccc", "333"); // large - should trigger eviction
 
     EXPECT_LE(c.current_memory(), 500u);
 }
 
 // ============================================================================
-// TinyLFU-specific API Tests（通过 c.mm() 访问）
+// TinyLFU-specific API tests (reached through c.mm()).
 // ============================================================================
 
 TEST(LfuCacheTinyLfuApiTest, TinyAndMainQueueSizes) {
-    // TinyLFU 使用两个队列：Tiny（窗口）+ Main（频率准入）
+    // TinyLFU uses two queues: Tiny (window) and Main (frequency admission).
     lfu_cache<int, int> c(10);
     c.set(1, 10);
     c.set(2, 20);
     c.set(3, 30);
 
-    // 新元素进入 Tiny 队列
+    // A new element starts in the Tiny queue.
     auto& mm = c.mm();
     EXPECT_EQ(mm.tiny_size() + mm.main_size(), 3u);
 }
 
 TEST(LfuCacheTinyLfuApiTest, SketchFrequencyEstimation) {
-    // CountMinSketch 提供频率估计
+    // CountMinSketch provides the frequency estimate.
     lfu_cache<int, int> c(100);
     c.set(1, 100);
 
-    // 多次访问 key=1
+    // Access key 1 several times.
     for (int i = 0; i < 5; ++i) {
         c.get(1);
     }
 
-    // sketch 应记录 key=1 的访问频率
+    // The sketch must have recorded the accesses to key 1.
     auto freq = c.mm().sketch().estimate(1);
     EXPECT_GT(freq, 0u);
 }
 
 TEST(LfuCacheTinyLfuApiTest, PopByKey) {
-    // pop() 通过 MM 层访问
+    // pop() goes through the MM layer.
     lfu_cache<int, std::string> c;
     c.set(1, "one");
     c.set(2, "two");
@@ -316,7 +317,7 @@ TEST(LfuCacheTinyLfuApiTest, PopNonExistentKey) {
 }
 
 TEST(LfuCacheTinyLfuApiTest, PopLru) {
-    // pop_lru() 通过 MM 层访问（先尝试 Tiny tail，再尝试 Main tail）
+    // pop_lru() goes through the MM layer (Tiny tail first, then Main tail).
     lfu_cache<int, std::string> c;
     c.set(1, "one");
     c.set(2, "two");
@@ -341,7 +342,7 @@ TEST(LfuCacheTinyLfuApiTest, PopDoesNotTriggerEvictCallback) {
 
     c.set(1, 100);
     c.set(2, 200);
-    c.mm().pop(1); // 显式移除，非淘汰
+    c.mm().pop(1); // explicit removal, not an eviction
 
     EXPECT_EQ(evict_count, 0);
 }
@@ -351,45 +352,45 @@ TEST(LfuCacheTinyLfuApiTest, PopDoesNotTriggerEvictCallback) {
 // ============================================================================
 
 TEST(LfuCacheAdmissionTest, MassInsertionTriggersEviction) {
-    // 插入大量元素后验证淘汰行为
+    // Verify eviction behaviour after inserting many elements.
     lfu_cache<int, int> c(50);
 
     for (int i = 0; i < 100; ++i) {
         c.set(i, i * 10);
     }
 
-    // TinyLFU 的窗口队列晋升可能导致 size <= max_size
+    // A TinyLFU window promotion can leave size <= max_size.
     EXPECT_LE(c.size(), 50u);
 
     auto stats = c.stats_snapshot();
     EXPECT_EQ(stats.insertions.value.load(), 100u);
-    // 至少 50 次淘汰（at_capacity 检查 + maybe_promote 淘汰）
+    // At least 50 evictions (at_capacity check plus maybe_promote eviction).
     EXPECT_GE(stats.evictions.value.load(), 50u);
 }
 
 TEST(LfuCacheAdmissionTest, HotKeysRetainedBetter) {
-    // 验证频繁访问的 key 在淘汰决策中更可能被保留
+    // Frequently accessed keys must be more likely to survive eviction.
     lfu_cache<int, int> c(10);
 
-    // 插入 10 个元素（TinyLFU 晋升机制会使部分元素被淘汰）
+    // Insert 10 elements (TinyLFU promotion evicts some of them).
     for (int i = 0; i < 10; ++i) {
         c.set(i, i);
     }
 
-    // 频繁访问缓存中存在的 key，提升其频率估计
+    // Access keys that exist to raise their frequency estimates.
     for (int round = 0; round < 10; ++round) {
         for (int i = 0; i < 10; ++i) {
-            c.get(i); // 命中的 key 会提升频率，未命中的不影响
+            c.get(i); // a hit raises the frequency; a miss changes nothing
         }
     }
 
-    // 插入新元素触发淘汰决策
+    // Insert a new element to trigger an admission decision.
     for (int i = 10; i < 20; ++i) {
         c.set(i, i);
     }
 
-    // size 不超过 max_size
+    // size must not exceed max_size.
     EXPECT_LE(c.size(), 10u);
-    // 缓存应仍有元素
+    // The cache must still hold elements.
     EXPECT_GT(c.size(), 0u);
 }

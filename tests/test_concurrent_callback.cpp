@@ -184,7 +184,7 @@ TEST(ConcurrentCallback, AsyncCallbackToggleUnderLoad) {
 }
 
 // ============================================================================
-// TC-O6: CallbackErrorHookAndCounter
+// CallbackErrorHookAndCounter
 // Verifies the on_callback_error hook fires and callback_error_count()
 // increments when a registered callback throws — both in sync and async
 // dispatch modes.

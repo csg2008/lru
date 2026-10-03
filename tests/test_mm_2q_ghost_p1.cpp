@@ -41,7 +41,7 @@ using namespace std::chrono_literals;
 namespace {
 
 // ============================================================================
-// P1-31: item-level TTL is a capability of EVERY eviction strategy
+// item-level TTL is a capability of EVERY eviction strategy
 // ============================================================================
 
 /// A deadline comfortably in the past, expressed the way the library stores
@@ -58,7 +58,7 @@ std::uint64_t future_deadline_ns(std::chrono::nanoseconds ahead) {
     return now_ns + static_cast<std::uint64_t>(ahead.count());
 }
 
-/// P1-31: the raw MM contract. `set_with_expiry()` records an item-level
+/// the raw MM contract. `set_with_expiry()` records an item-level
 /// deadline, `ttl_remaining_ns()` reports it, and `evict_expired()` removes it
 /// once it has passed.
 ///
@@ -117,7 +117,7 @@ TEST(MmP1Ttl, P1_31_ItemLevelTtlContractWTinyLfu) {
     expect_item_level_ttl_contract<mm_wtiny_lfu<int, int>>();
 }
 
-/// P1-31: the TTL sweep must be O(expired) rather than O(cache). Inserting a
+/// the TTL sweep must be O(expired) rather than O(cache). Inserting a
 /// large number of never-expiring items and then sweeping must not reap any of
 /// them; the index is what makes that true (a full scan would also return 0,
 /// but the batched variant below pins the budget semantics).
@@ -131,7 +131,7 @@ TEST(MmP1Ttl, P1_31_NoTtlItemsAreNeverSwept) {
     EXPECT_EQ(mm.size(), 500u);
 }
 
-/// P1-31: the batched sweep honours its budget, so the background cleaner can
+/// the batched sweep honours its budget, so the background cleaner can
 /// bound the time it holds the write lock.
 TEST(MmP1Ttl, P1_31_BatchedSweepHonoursTheBudget) {
     mm_wtiny_lfu<int, int> mm(4096);
@@ -152,7 +152,7 @@ TEST(MmP1Ttl, P1_31_BatchedSweepHonoursTheBudget) {
     EXPECT_EQ(total, 50u) << "P1-31: bounded sweeps must eventually drain";
 }
 
-/// P1-31: expiry-aware removal must be distinguishable from capacity eviction.
+/// expiry-aware removal must be distinguishable from capacity eviction.
 /// The library reports the two through different callbacks (O7): sweeping an
 /// expired item must fire `on_expire`, never `on_evict`.
 ///
@@ -179,7 +179,7 @@ TEST(MmP1Ttl, P1_31_SweepFiresOnExpireNotOnEvict) {
         << "P1-31/O7: a TTL expiry must NOT be reported as capacity eviction";
 }
 
-/// P1-31: the deleted fallback used to live behind the `ttl_entry<V>` value
+/// the deleted fallback used to live behind the `ttl_entry<V>` value
 /// type. A `unified_cache` storing `ttl_entry<V>` must now be swept through the
 /// MM's item-level index, so a value-layer cache still reclaims expired entries
 /// via the same single sweep path.
@@ -225,7 +225,7 @@ TEST(MmP1Ttl, P1_31_TtlCachePublishesExpiryToTheItemLevelIndex) {
 }
 
 // ============================================================================
-// P1-28: the 2Q A1out ghost queue
+// the 2Q A1out ghost queue
 // ============================================================================
 
 /// Configure a 2Q MM so the ghost is exerciseable at test scale.
@@ -243,7 +243,7 @@ mm_2q_config ghost_test_config() {
     return cfg;
 }
 
-/// P1-28: an item evicted before it ever earned a second reference is
+/// an item evicted before it ever earned a second reference is
 /// remembered, and re-inserting that key admits it to the protected (Warm)
 /// queue instead of the window (Hot).
 ///
@@ -354,7 +354,7 @@ TEST(MmP1TwoQGhost, P1_28_GhostHitAdmitsToWarmInsteadOfHot) {
     EXPECT_EQ(ctrl.ghost_capacity(), 0u);
 }
 
-/// P1-28: the ghost is bounded (it is bookkeeping, not a second cache) and
+/// the ghost is bounded (it is bookkeeping, not a second cache) and
 /// clearing the cache clears it.
 TEST(MmP1TwoQGhost, P1_28_GhostIsBoundedAndClearedByFlush) {
     using mm_t = mm_2q<int, int>;
@@ -378,7 +378,7 @@ TEST(MmP1TwoQGhost, P1_28_GhostIsBoundedAndClearedByFlush) {
     EXPECT_LE(mm.ghost_size(), mm.ghost_capacity());
 }
 
-/// P1-28: the ghost is admission bookkeeping — it must never be counted as
+/// the ghost is admission bookkeeping — it must never be counted as
 /// cached data. `size()`, `current_memory()` and iteration describe residents
 /// only, otherwise a cache at its ceiling would evict real values to make room
 /// for key-only ghost entries.
@@ -418,7 +418,7 @@ TEST(MmP1TwoQGhost, P1_28_GhostIsInvisibleToSizeMemoryAndIteration) {
         << "P1-28: the most recently inserted key must be resident in Hot";
 }
 
-/// P1-28: an item that already earned its second reference must never be fed
+/// an item that already earned its second reference must never be fed
 /// back into A1out. A key that is promoted Cold→Warm is a genuine second
 /// reference, so "evicted before promotion" does not apply to it, and
 /// re-referencing it later must NOT be rewarded as if it were new.
@@ -506,7 +506,7 @@ TEST(MmP1TwoQGhost, P1_28_PromotedItemCarriesTheSecondReferenceMark) {
     static_cast<void>(saw_promoted_evicted);
 }
 
-/// P1-28: the feature is switchable, and disabling it must reproduce the
+/// the feature is switchable, and disabling it must reproduce the
 /// pre-change placement exactly (every insert lands in Hot).
 TEST(MmP1TwoQGhost, P1_28_GhostCanBeDisabled) {
     using mm_t = mm_2q<int, int>;
@@ -545,7 +545,7 @@ TEST(MmP1TwoQGhost, P1_28_GhostCanBeDisabled) {
         << "P1-28: the re-insert must not shrink the Hot window";
 }
 
-/// P1-28: the explicit capacity override must be honoured verbatim.
+/// the explicit capacity override must be honoured verbatim.
 TEST(MmP1TwoQGhost, P1_28_ExplicitCapacityOverrideIsHonoured) {
     using mm_t = mm_2q<int, int>;
     auto cfg = ghost_test_config();
@@ -563,7 +563,7 @@ TEST(MmP1TwoQGhost, P1_28_ExplicitCapacityOverrideIsHonoured) {
         << "P1-28: the explicit bound must be enforced";
 }
 
-/// P1-28: invalid ghost configuration is rejected at validation time rather
+/// invalid ghost configuration is rejected at validation time rather
 /// than silently disabling the bound.
 TEST(MmP1TwoQGhost, P1_28_InvalidGhostRatioIsRejected) {
     mm_2q_config cfg;

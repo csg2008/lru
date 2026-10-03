@@ -47,11 +47,16 @@
 #define LRU_SERIALIZATION_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <optional>
 #include <span>
@@ -60,6 +65,15 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#if defined(_WIN32)
+    #include <io.h>       // _commit, _fileno
+#else
+    #include <fcntl.h>    // open, O_RDONLY
+    #include <unistd.h>   // fsync, fileno
+#endif
+
+#include "core.hpp"
+#include "mm.hpp"
 
 #include "core.hpp"
 #include "mm.hpp"
@@ -362,12 +376,12 @@ inline serialization_header_info inspect_serialization_header(std::span<const ui
     return info;
 }
 
-/// 依赖型 always_false（用于 if constexpr 的 else 分支中的 static_assert）。
+/// Dependent always_false, for static_assert in the else branch of if constexpr.
 template <typename T> inline constexpr bool always_false_v = false;
 
 namespace detail {
 
-// ---- Serde 声明（实现在后面）----
+// ---- Serde declarations (implementations follow) ----
 
 void serde_write(binary_writer& w, const std::string& s);
 std::string serde_read(binary_reader& r, const std::string*);
@@ -390,7 +404,7 @@ void serde_write(binary_writer& w, const std::optional<T>& opt);
 template <typename T>
 std::optional<T> serde_read(binary_reader& r, const std::optional<T>*);
 
-// ---- 平凡可复制回退 ----
+// ---- Trivially-copyable fallback ----
 template <typename T>
 std::enable_if_t<std::is_trivially_copyable_v<T>>
 serde_write(binary_writer& w, const T& value) {
@@ -410,7 +424,7 @@ serde_read(binary_reader& r, const T*) {
 
 } // namespace detail
 
-/// 序列化定制点（自由函数转发器）。
+/// Serialisation customisation point (free-function forwarder).
 template <typename T>
 struct serde {
     static void serialize(detail::binary_writer& w, const T& value) {
@@ -421,7 +435,7 @@ struct serde {
     }
 };
 
-// ---- 自由函数实现 ----
+// ---- Free-function implementations ----
 
 namespace detail {
 
@@ -514,7 +528,7 @@ struct serialized_mm_config {
     double warm_ratio = 0.4;
     bool rebalance_on_record_access = true;
 
-    // P1-25 (fix.01 方案 A): TinyLFU / W-TinyLFU CountMinSketch sizing, in the
+    // TinyLFU / W-TinyLFU CountMinSketch sizing, in the
     // CacheLib parameterisation (numCounters = next_pow2(e * capacity *
     // window_multiplier / error_threshold), hash_count rows). Replaces the
     // (error_rate, confidence) pair, which produced 42 counters independent of
@@ -591,17 +605,17 @@ struct serialized_item {
 // Serialized List State (NEW in v2 — faithful restore)
 // ============================================================================
 
-/// S0: 链表状态，用于 faithful restore（保存/恢复插入点信息和 tail 段）。
+/// List state for a faithful restore: the insertion point and the tail segment.
 struct serialized_list_state {
-    /// 插入点位置（从 MRU head = 0 计）。max() = 未设置（spec=0）。
+    /// Insertion-point position, counting from the MRU head = 0. max() = unset.
     uint32_t insertion_point_pos = std::numeric_limits<uint32_t>::max();
-    /// tail 段大小（仅 spec>0 时有效）。
+    /// Tail-segment size (only meaningful when spec > 0).
     uint32_t tail_size = 0;
 
     void write(detail::binary_writer& w) const {
         w.write(insertion_point_pos);
         w.write(tail_size);
-        // 12 字节预留（结构对齐）
+        // 12 reserved bytes, keeping the struct aligned.
         uint32_t reserved[3] = {0, 0, 0};
         w.write(reserved[0]);
         w.write(reserved[1]);
@@ -611,7 +625,7 @@ struct serialized_list_state {
     void read(detail::binary_reader& r) {
         insertion_point_pos = r.read<uint32_t>();
         tail_size = r.read<uint32_t>();
-        // 跳过 12 字节预留
+        // Skip the 12 reserved bytes.
         r.read<uint32_t>();
         r.read<uint32_t>();
         r.read<uint32_t>();
@@ -633,7 +647,7 @@ struct serialized_list_state {
 // ============================================================================
 
 // ============================================================================
-// 通用 serialize / deserialize 实现模板（消除 ~300 行重复代码）
+// Generic serialize / deserialize template, replacing ~300 duplicated lines.
 // ============================================================================
 
 namespace detail {
@@ -650,7 +664,7 @@ using lru::serialization_feature;
 using lru::has_feature;
 // kListStateSize is unused; kept for reference in serialized_list_state docs
 
-/// 通用序列化实现：header + config + extra_state + items
+/// Generic serialisation: header + config + extra_state + items.
 /// v5 header adds feature_flags before checksum.
 /// Checksum covers everything after the checksum field (config + extra + items).
 template <typename MM, typename WriteConfigFn, typename WriteExtraFn>
@@ -884,12 +898,12 @@ parsed_deserialization_data<Key, Value> parse_serialized_data(
 } // namespace detail
 
 // ============================================================================
-// Serde — 序列化定制点（自由函数重载，彻底排除一切模板元问题）
+// Serde - customisation through free-function overloads, which sidesteps every
 // ============================================================================
 
-// 所有已知类型的序列化实现通过重载自由函数完成。
-// 对未知的平凡可复制类型用 enable_if 匹配。
-// 用户可通过特化 serde<T> 覆盖默认行为。
+// template-metaprogramming pitfall. Every known type is serialised by an overload;
+// unknown trivially-copyable types match an enable_if fallback, and users can
+// override the default by specialising serde<T>.
 
 /// Serialize an enhanced LRU cache.
 template <typename Key, typename Value, typename Hash, typename KeyEqual>
@@ -1122,7 +1136,7 @@ std::vector<uint8_t> serialize(const mm_tiny_lfu<Key, Value, Hash, KeyEqual>& ca
             const auto& c = cache.config();
             cfg.lru_refresh_time = cache.refresh_time();
             cfg.lru_refresh_ratio = c.lru_refresh_ratio;
-            // P1-25: the serialized config stores 32-bit values; the MM config
+            // the serialized config stores 32-bit values; the MM config
             // uses size_t. Convert explicitly (the values are small parameters,
             // never near 2^32).
             cfg.cms_window_multiplier = static_cast<uint32_t>(c.cms_window_multiplier);
@@ -1131,7 +1145,7 @@ std::vector<uint8_t> serialize(const mm_tiny_lfu<Key, Value, Hash, KeyEqual>& ca
             cfg.try_lock_update = c.try_lock_update;
         },
         [&](detail::binary_writer& w) {
-            // S3: 序列化 CountMinSketch 状态
+            // Serialise the CountMinSketch state.
             uint32_t cms_words = static_cast<uint32_t>(cache.sketch().serialized_state_words());
             w.write(cms_words);
             std::vector<uint32_t> cms_buf(cms_words);
@@ -1168,7 +1182,7 @@ std::vector<uint8_t> serialize(const mm_wtiny_lfu<Key, Value, Hash, KeyEqual>& c
             const auto& c = cache.config();
             cfg.lru_refresh_time = cache.refresh_time();
             cfg.lru_refresh_ratio = c.lru_refresh_ratio;
-            // P1-25: the serialized config stores 32-bit values; the MM config
+            // the serialized config stores 32-bit values; the MM config
             // uses size_t. Convert explicitly (the values are small parameters,
             // never near 2^32).
             cfg.cms_window_multiplier = static_cast<uint32_t>(c.cms_window_multiplier);
@@ -1177,7 +1191,7 @@ std::vector<uint8_t> serialize(const mm_wtiny_lfu<Key, Value, Hash, KeyEqual>& c
             cfg.try_lock_update = c.try_lock_update;
         },
         [&](detail::binary_writer& w) {
-            // S3: 序列化 CountMinSketch 状态
+            // Serialise the CountMinSketch state.
             uint32_t cms_words = static_cast<uint32_t>(cache.sketch().serialized_state_words());
             w.write(cms_words);
             std::vector<uint32_t> cms_buf(cms_words);
@@ -1211,13 +1225,21 @@ void deserialize(mm_wtiny_lfu<Key, Value, Hash, KeyEqual>& cache,
 ///     - magic        (4 bytes)  kSerializationMagic
 ///     - version      (4 bytes)  kSerializationVersion
 ///     - num_shards   (4 bytes)
-///     - header_size  (4 bytes)  total header bytes
+///     - mm_type      (4 bytes)  mm_type_id::sharded_lru
+///     - header_size  (4 bytes)  total header bytes (== kV5HeaderSize)
 ///     - flags        (4 bytes)
 ///     - feature_flags(8 bytes)  serialization_feature bitmask
-///     - checksum     (4 bytes)  CRC32 of payload (everything after checksum)
+///     - checksum     (4 bytes)  CRC32 of payload (everything after the header)
 ///   For each shard:
 ///     - shard_data_length (4 bytes)
 ///     - shard_data (variable, the serialized mm_lru for that shard)
+///
+/// The mm_type field is what makes the header kV5HeaderSize (36) bytes long.
+/// It was missing here while `header_size` was still written as kV5HeaderSize,
+/// so the writer hashed [32, end) and the reader hashed [36, end): every
+/// round-trip through this pair failed its own checksum. This layout is now
+/// byte-identical to unified_cache::save()/load() for sharded caches, so the
+/// two paths produce interchangeable files.
 template <typename Key, typename Value, typename Hash, typename KeyEqual>
 std::vector<uint8_t> serialize(const sharded_mm_lru<Key, Value, Hash, KeyEqual>& cache) {
     // Serialize each shard individually, then concatenate
@@ -1239,6 +1261,7 @@ std::vector<uint8_t> serialize(const sharded_mm_lru<Key, Value, Hash, KeyEqual>&
     w.write(kSerializationMagic);
     w.write(kSerializationVersion);
     w.write(static_cast<uint32_t>(cache.num_shards()));
+    w.write(static_cast<uint32_t>(detail::mm_type_id::sharded_lru));
     w.write(kV5HeaderSize);
     w.write(static_cast<uint32_t>(0)); // flags
     w.write(static_cast<uint64_t>(0)); // feature_flags
@@ -1276,6 +1299,12 @@ void deserialize(sharded_mm_lru<Key, Value, Hash, KeyEqual>& cache,
     }
 
     auto num_shards = r.read<uint32_t>();
+    auto mm_type = r.read<uint32_t>();
+    if (mm_type != static_cast<uint32_t>(detail::mm_type_id::sharded_lru)) {
+        throw std::runtime_error(
+            "sharded_mm_lru deserialize: payload was not produced by the "
+            "sharded LRU serializer (mm_type mismatch)");
+    }
     auto header_size = r.read<uint32_t>();
     if (header_size < kV5HeaderSize || header_size > data.size()) {
         throw std::runtime_error("sharded_mm_lru deserialize: invalid header_size");
@@ -1319,32 +1348,79 @@ void deserialize(sharded_mm_lru<Key, Value, Hash, KeyEqual>& cache,
 // ============================================================================
 // Convenience — file I/O helpers
 // ============================================================================
+//
+// The standard headers these helpers need (<atomic>, <chrono>, <cstdio>,
+// <filesystem>, <fstream>, and the POSIX/Windows file APIs) are included at the
+// top of this file, at global scope. They used to be included here instead,
+// which put them *inside* `namespace lru` — undefined behaviour, and it broke
+// standalone compilation of this header (libc++'s <filesystem> then resolved
+// `chrono` against the enclosing namespace).
 
-#ifdef LRU_SERIALIZATION_FILE_IO
+/// Per-process counter making temporary save file names unique.
+inline std::atomic<std::uint64_t>& save_temp_counter() noexcept {
+    static std::atomic<std::uint64_t> counter{0};
+    return counter;
+}
 
-#include <cstdio>
-#include <filesystem>
-#include <fstream>
+/// A token that distinguishes this process from any other writing to the same
+/// directory, without depending on `getpid` (MinGW only declares `_getpid`
+/// when `_CRT_USE_WINAPI_FAMILY_DESKTOP_APP` is defined). The steady-clock
+/// value at first use plus the address of a function-local static (ASLR
+/// entropy) is enough: temp names only have to be unique among writers racing
+/// the same destination, and even a collision still leaves the final rename
+/// atomic.
+inline const std::string& save_process_token() noexcept {
+    static const std::string token = [] {
+        static const int anchor = 0;
+        const auto ticks =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        return std::to_string(ticks) + "-" +
+               std::to_string(reinterpret_cast<std::uintptr_t>(&anchor));
+    }();
+    return token;
+}
+
+/// Build a unique sibling temp path for `path`.
+///
+/// A fixed `<path>.tmp` name meant two concurrent save_to_file() calls (or two
+/// processes snapshotting the same cache) opened the same temp file,
+/// interleaved their writes, and then published the mixture under the
+/// destination name.
+inline std::string unique_temp_path(const std::string& path) {
+    const std::uint64_t seq =
+        save_temp_counter().fetch_add(1, std::memory_order_relaxed);
+    return path + ".tmp." + save_process_token() + "-" + std::to_string(seq);
+}
+
+/// Make a preceding rename() into `path` durable.
+///
+/// rename() only orders the directory entry; without an fsync of the parent
+/// directory a power loss can leave the old name in place (and the temp file
+/// behind). Windows has no CRT directory-fsync, so this is a POSIX-only step
+/// and Windows relies on the file-level flush alone.
+inline void sync_parent_directory(const std::string& path) noexcept {
 #if defined(_WIN32)
-    #include <io.h>       // _commit, _fileno
+    (void)path;
 #else
-    #include <unistd.h>   // fsync, fileno
+    const std::filesystem::path parent =
+        std::filesystem::path(path).parent_path();
+    const std::string dir = parent.empty() ? std::string(".") : parent.string();
+    const int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd < 0) return;  // best effort — not every filesystem permits this
+    ::fsync(fd);
+    ::close(fd);
 #endif
+}
 
 /// Save serialized data to a file ATOMICALLY.
 ///
-/// fix.01 P1-31: this used to write straight into the destination, so an
-/// interrupted write (crash, power loss, or a reader racing the save) left a
-/// truncated cache file behind. It now writes a sibling temp file, forces it
-/// to disk, and only then renames it over the destination — the same
-/// crash-safe pattern the warm_cache snapshots use.
-///
-/// The explicit flush-to-disk is not redundant with rename(): rename only
-/// orders the directory entry, not the file's data blocks, so without it a
-/// power loss can leave the new name pointing at blocks that were never
-/// written.
+/// Writes a uniquely named sibling temp file, forces it to disk, renames it
+/// over the destination, then (POSIX) forces the parent directory. The
+/// explicit flush-to-disk is not redundant with rename(): rename only orders
+/// the directory entry, not the file's data blocks, so without it a power loss
+/// can leave the new name pointing at blocks that were never written.
 inline void save_to_file(const std::vector<uint8_t>& data, const std::string& path) {
-    const std::string tmp = path + ".tmp";
+    const std::string tmp = unique_temp_path(path);
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) {
         throw std::runtime_error("save_to_file: cannot open " + tmp);
@@ -1372,6 +1448,7 @@ inline void save_to_file(const std::vector<uint8_t>& data, const std::string& pa
         throw std::runtime_error("save_to_file: cannot rename " + tmp + " -> " +
                                  path + ": " + ec.message());
     }
+    sync_parent_directory(path);
 }
 
 /// Load serialized data from a file.
@@ -1390,7 +1467,6 @@ inline std::vector<uint8_t> load_from_file(const std::string& path) {
     return data;
 }
 
-#endif // LRU_SERIALIZATION_FILE_IO
 
 } // namespace lru
 

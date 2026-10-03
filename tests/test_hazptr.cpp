@@ -51,7 +51,7 @@ TEST(HazptrDomain, DynamicSlotExpansion) {
 TEST(HazptrDomain, ProtectAndCheck) {
     auto& domain = detail::hazptr_domain::default_domain();
     int value = 42;
-    // P0-3: use the explicit-domain constructor so `domain` is exercised
+    // use the explicit-domain constructor so `domain` is exercised
     // rather than being an unused local.
     detail::hazptr_holder holder(domain);
     holder.protect(&value);
@@ -98,7 +98,7 @@ TEST(HazptrDomain, HolderMoveSemantics) {
 }
 
 // ============================================================================
-// T-O1: hazptr slot exhaustion hard cap / fallback
+// hazptr slot exhaustion hard cap / fallback
 // ============================================================================
 
 TEST(HazptrDomain, SyncFallbackCounterStartsAtZero) {
@@ -108,7 +108,7 @@ TEST(HazptrDomain, SyncFallbackCounterStartsAtZero) {
 }
 
 TEST(HazptrDomain, SlotExhaustionThrowsAfterHardCap) {
-    // T-O1 / P0-3: When all 8192 slots are exhausted and the spin budget +
+    // When all 8192 slots are exhausted and the spin budget +
     // sync-reclaim fallback budget are both exceeded, acquire_slot() must
     // return `npos` (sentinel) instead of hanging forever or throwing.
     //
@@ -378,7 +378,7 @@ TEST(HazptrEviction, EvictionUsesRetire) {
 
     // Verify that the cache state is consistent after eviction.
     // The key 1 (LRU) should have been evicted to make room for 4.
-    // P0-3: first_key is the item the protected iterator pointed at; rbegin()
+    // first_key is the item the protected iterator pointed at; rbegin()
     // must start at the LRU tail, which is the item the next insert evicts.
     EXPECT_EQ(first_key, 1) << "rbegin() must start at the LRU tail";
     EXPECT_FALSE(c.peek(1).has_value());

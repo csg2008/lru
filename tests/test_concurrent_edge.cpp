@@ -2,12 +2,12 @@
 // Concurrent edge-case tests for cross-thread invariants.
 //
 // Covers spec gaps G1, G2, G3, G8, G13, G16 (P0):
-//   G1:  shutdown() holds active read_handle across threads
-//   G2:  cas() atomicity under concurrency
-//   G3:  try_get_or_fetch thundering-herd
-//   G8:  pinned_skip_count increments on concurrent evict
-//   G13: bulk_get handle survives eviction
-//   G16: read_handle cross-thread transfer (producer/consumer)
+//   shutdown() holds active read_handle across threads
+//   cas() atomicity under concurrency
+//   try_get_or_fetch thundering-herd
+//   pinned_skip_count increments on concurrent evict
+//   bulk_get handle survives eviction
+//   read_handle cross-thread transfer (producer/consumer)
 
 #include <gtest/gtest.h>
 
@@ -27,7 +27,7 @@ using namespace lru;
 using namespace std::chrono_literals;
 
 // ============================================================================
-// TC-G1: shutdown() holds active read_handle across threads
+// shutdown() holds active read_handle across threads
 // ============================================================================
 TEST(ConcurrentEdge, ShutdownHoldsActiveHandleAcrossThreads) {
     safe_cache<std::string, std::string> c(1024);
@@ -68,7 +68,7 @@ TEST(ConcurrentEdge, ShutdownHoldsActiveHandleAcrossThreads) {
 }
 
 // ============================================================================
-// TC-G2: cas() atomicity under concurrency
+// cas() atomicity under concurrency
 // Multiple threads concurrently perform cas() on a single shared key.
 // Exactly one CAS must succeed per "round" (the rest must fail and observe
 // the updated value on retry). The final value must equal the number of
@@ -149,7 +149,7 @@ TEST(ConcurrentEdge, CasAtomicityUnderConcurrency) {
 }
 
 // ============================================================================
-// TC-G3: try_get_or_fetch thundering-herd
+// try_get_or_fetch thundering-herd
 // Many threads concurrently call try_get_or_fetch on a missing key.
 // The provider should be invoked a bounded number of times (no thundering
 // herd). All threads must observe the same cached value.
@@ -195,7 +195,7 @@ TEST(ConcurrentEdge, TryGetOrFetchThunderingHerd) {
     // in the current try_get_or_fetch implementation), but the number should
     // be bounded. A reasonable upper bound is the number of threads; an
     // unbounded count would indicate a true thundering herd.
-    // P0-3: invocations is signed (atomic<int>), kThreads is std::size_t — the
+    // invocations is signed (atomic<int>), kThreads is std::size_t — the
     // comparison converts explicitly at this one boundary.
     int invocations = provider_invocations.load();
     EXPECT_LE(invocations, static_cast<int>(kThreads))
@@ -204,7 +204,7 @@ TEST(ConcurrentEdge, TryGetOrFetchThunderingHerd) {
 }
 
 // ============================================================================
-// T-M1: singleflight / cache stampede protection
+// singleflight / cache stampede protection
 // ============================================================================
 //
 // The next group of tests verifies the singleflight coalescing introduced in
@@ -220,7 +220,7 @@ TEST(ConcurrentEdge, TryGetOrFetchThunderingHerd) {
 // DisabledDoesNotCoalesce test below.
 
 // ---------------------------------------------------------------------------
-// T-M1-A: get_or_fetch with singleflight enabled coalesces concurrent misses
+// get_or_fetch with singleflight enabled coalesces concurrent misses
 // on the same key into exactly one provider invocation.
 // ---------------------------------------------------------------------------
 TEST(ConcurrentEdge, GetOrFetchSingleflightCoalescesMisses) {
@@ -275,7 +275,7 @@ TEST(ConcurrentEdge, GetOrFetchSingleflightCoalescesMisses) {
 }
 
 // ---------------------------------------------------------------------------
-// T-M1-B: try_get_or_fetch with singleflight enabled coalesces concurrent
+// try_get_or_fetch with singleflight enabled coalesces concurrent
 // misses on the same key into exactly one provider invocation.
 // ---------------------------------------------------------------------------
 TEST(ConcurrentEdge, TryGetOrFetchSingleflightCoalescesMisses) {
@@ -318,7 +318,7 @@ TEST(ConcurrentEdge, TryGetOrFetchSingleflightCoalescesMisses) {
 }
 
 // ---------------------------------------------------------------------------
-// T-M1-C: When singleflight is disabled (default), concurrent misses on the
+// When singleflight is disabled (default), concurrent misses on the
 // same key each invoke the provider independently. This is the control test
 // for T-M1-A — it verifies that the coalescing in T-M1-A is actually due to
 // the singleflight mechanism, not some other serialization.
@@ -359,7 +359,7 @@ TEST(ConcurrentEdge, SingleflightDisabledDoesNotCoalesce) {
 }
 
 // ---------------------------------------------------------------------------
-// T-M1-D: provider exceptions are propagated to all followers.
+// provider exceptions are propagated to all followers.
 // The leader's exception_ptr is captured and rethrown by each follower's
 // wait_and_get() call. This test verifies the exception type and message
 // survive the cross-thread propagation.
@@ -412,7 +412,7 @@ TEST(ConcurrentEdge, SingleflightPropagatesProviderException) {
 }
 
 // ---------------------------------------------------------------------------
-// T-M1-E: distinct keys are NOT coalesced — each key gets its own
+// distinct keys are NOT coalesced — each key gets its own
 // singleflight cycle. This guards against an over-coalescing bug where
 // the tracker accidentally merges unrelated keys.
 // ---------------------------------------------------------------------------
@@ -439,7 +439,7 @@ TEST(ConcurrentEdge, SingleflightDistinctKeysAreNotCoalesced) {
                 while (!go.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
-                // P0-3: k is std::size_t (vector/count index type) while the
+                // k is std::size_t (vector/count index type) while the
                 // cache key type is int, so convert at this boundary.
                 (void)c.get_or_fetch(static_cast<int>(k), provider);
             });
@@ -449,7 +449,7 @@ TEST(ConcurrentEdge, SingleflightDistinctKeysAreNotCoalesced) {
     for (auto& th : threads) th.join();
 
     // Each distinct key must invoke the provider exactly once.
-    // P0-3: provider_invocations is atomic<int> while kKeys is std::size_t.
+    // provider_invocations is atomic<int> while kKeys is std::size_t.
     EXPECT_EQ(provider_invocations.load(), static_cast<int>(kKeys))
         << "singleflight over-coalesced distinct keys";
     // Followers across all keys: kKeys * (kThreadsPerKey - 1).
@@ -457,7 +457,7 @@ TEST(ConcurrentEdge, SingleflightDistinctKeysAreNotCoalesced) {
 }
 
 // ---------------------------------------------------------------------------
-// T-M1-F: Second wave of misses on the same key starts a NEW singleflight
+// Second wave of misses on the same key starts a NEW singleflight
 // cycle after the first completes. Verifies that the in-flight entry is
 // removed on completion (no permanent coalescing of unrelated calls).
 // ---------------------------------------------------------------------------
@@ -516,7 +516,7 @@ TEST(ConcurrentEdge, SingleflightSecondWaveStartsNewCycle) {
 }
 
 // ---------------------------------------------------------------------------
-// T-M1-G: stampede_coalesced_count is exported via stats_snapshot() and
+// stampede_coalesced_count is exported via stats_snapshot() and
 // prometheus_text() so operators can monitor coalescing effectiveness.
 // ---------------------------------------------------------------------------
 TEST(ConcurrentEdge, SingleflightMetricExportedViaStatsAndPrometheus) {
@@ -558,9 +558,9 @@ TEST(ConcurrentEdge, SingleflightMetricExportedViaStatsAndPrometheus) {
 }
 
 // ---------------------------------------------------------------------------
-// T-M1-H: TTL expiry stampede — when a hot key expires, concurrent
+// TTL expiry stampede — when a hot key expires, concurrent
 // get_or_fetch calls must not trigger a thundering herd of provider calls.
-// This is the canonical motivation for singleflight (M-1 in spec.md).
+// This is the canonical motivation for singleflight.
 // ---------------------------------------------------------------------------
 TEST(ConcurrentEdge, SingleflightCoalescesTtlExpiryStampede) {
     safe_cache<int, std::string> c(64);
@@ -607,7 +607,7 @@ TEST(ConcurrentEdge, SingleflightCoalescesTtlExpiryStampede) {
 }
 
 // ---------------------------------------------------------------------------
-// T-M1-I: singleflight works correctly with production_cache (segmented +
+// singleflight works correctly with production_cache (segmented +
 // striped). Verifies the integration is sound under the recommended
 // production alias, not just safe_cache.
 // ---------------------------------------------------------------------------
@@ -650,7 +650,7 @@ TEST(ConcurrentEdge, SingleflightWorksWithProductionCache) {
 }
 
 // ============================================================================
-// TC-G8: pinned_skip_count increments when evictor encounters a pinned item
+// pinned_skip_count increments when evictor encounters a pinned item
 // ============================================================================
 TEST(ConcurrentEdge, PinnedSkipCountIncrementsOnConcurrentEvict) {
     safe_cache<int, std::string> c(8);
@@ -681,7 +681,7 @@ TEST(ConcurrentEdge, PinnedSkipCountIncrementsOnConcurrentEvict) {
 }
 
 // ============================================================================
-// TC-G13: bulk_get handle survives eviction
+// bulk_get handle survives eviction
 // bulk_get returns handles that pin the items; subsequent evictions must
 // not invalidate the handles.
 // ============================================================================
@@ -691,7 +691,7 @@ TEST(ConcurrentEdge, BulkGetHandleSurvivesEviction) {
 
     // Pre-populate.
     for (std::size_t i = 0; i < kKeys; ++i) {
-        // P0-3: i is std::size_t, the cache key type is int.
+        // i is std::size_t, the cache key type is int.
         c.set(static_cast<int>(i), "v" + std::to_string(i));
     }
 
@@ -732,7 +732,7 @@ TEST(ConcurrentEdge, BulkGetHandleSurvivesEviction) {
 }
 
 // ============================================================================
-// TC-G16: read_handle cross-thread transfer (producer/consumer)
+// read_handle cross-thread transfer (producer/consumer)
 // A producer thread acquires a read_handle and transfers it to a consumer
 // thread via move semantics. The consumer must be able to dereference the
 // handle and the active_handle_count must remain consistent.

@@ -1,4 +1,4 @@
-// P1-31 (fix.01 方案 A): strategy-agnostic TTL expiry index.
+// strategy-agnostic TTL expiry index.
 //
 // Why this exists
 // ---------------
@@ -177,7 +177,7 @@ namespace lru::detail {
 /// CRTP mixin giving an eviction strategy a complete, O(log n), item-level TTL
 /// facility.
 ///
-/// P1-31 (fix.01 方案 A): before this, item-level TTL existed only in `mm_lru`.
+/// before this, item-level TTL existed only in `mm_lru`.
 /// The other strategies could obtain TTL solely from the value-layer
 /// `ttl_entry<V>` wrapper, which the cache layer had to sweep by walking the
 /// ENTIRE cache under a read lock. A strategy now derives from this mixin and

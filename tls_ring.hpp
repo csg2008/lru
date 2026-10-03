@@ -132,7 +132,7 @@ struct process_lifetime : Container {
 /// @tparam Value  Cache value type
 /// @tparam N      Ring size per event type (must be power of 2, default 256)
 ///
-/// T10.1: Default raised from 64 to 256 to reduce the frequency of
+/// Default raised from 64 to 256 to reduce the frequency of
 /// deferred-promotion drops under read-heavy workloads. With N=64 a
 /// single thread doing 1M ops/s fills the ring in ~64us, forcing the
 /// drain worker to run at >15K Hz just to keep up. With N=256 the
@@ -176,7 +176,7 @@ public:
         Value value;
     };
 
-    /// O7: Update event — fired when set() overwrites an existing key's
+    /// Update event — fired when set() overwrites an existing key's
     /// value (not a fresh insert). Same payload as insert_event but
     /// distinct kind so users can audit write-amplification separately
     /// from new inserts.
@@ -185,7 +185,7 @@ public:
         Value value;
     };
 
-    /// O7: Expire event — fired when an item is evicted due to TTL
+    /// Expire event — fired when an item is evicted due to TTL
     /// expiry (not capacity eviction). Same payload as evict_event but
     /// distinct kind so users can monitor TTL effectiveness and tune
     /// refresh windows separately from capacity pressure.
@@ -194,7 +194,7 @@ public:
         Value value;
     };
 
-    /// O7: Reject event — fired when an insert is rejected by the
+    /// Reject event — fired when an insert is rejected by the
     /// overflow policy (cache full, OOM, or admission denial). Carries
     /// the would-be key + value so callers can route rejected items to
     /// a fallback store or trigger back-pressure signalling.
@@ -364,7 +364,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // O7: New event collect methods — update / expire / reject.
+    // New event collect methods — update / expire / reject.
     // These mirror the insert/evict pattern. Each event kind keeps its
     // own sub-ring so dispatch can stay branch-free per kind.
     // --------------------------------------------------------------------
@@ -503,7 +503,7 @@ public:
             }
         }
 
-        // O7: Drain updates
+        // Drain updates
         {
             auto count = rd.update_head - rd.update_tail;
             if (count > 0) {
@@ -516,7 +516,7 @@ public:
             }
         }
 
-        // O7: Drain expires
+        // Drain expires
         {
             auto count = rd.expire_head - rd.expire_tail;
             if (count > 0) {
@@ -529,7 +529,7 @@ public:
             }
         }
 
-        // O7: Drain rejects
+        // Drain rejects
         {
             auto count = rd.reject_head - rd.reject_tail;
             if (count > 0) {
@@ -646,15 +646,15 @@ private:
         std::array<evict_event, kRingSize> evicts{};
         std::size_t evict_head{0}, evict_tail{0};
 
-        // O7: Update events — same payload as inserts but distinct kind
+        // Update events — same payload as inserts but distinct kind
         std::array<update_event, kRingSize> updates{};
         std::size_t update_head{0}, update_tail{0};
 
-        // O7: Expire events — TTL expiry, distinct from capacity evict
+        // Expire events — TTL expiry, distinct from capacity evict
         std::array<expire_event, kRingSize> expires{};
         std::size_t expire_head{0}, expire_tail{0};
 
-        // O7: Reject events — insert rejected (overflow / OOM / admission)
+        // Reject events — insert rejected (overflow / OOM / admission)
         std::array<reject_event, kRingSize> rejects{};
         std::size_t reject_head{0}, reject_tail{0};
     };
@@ -697,16 +697,18 @@ private:
     // Global registry for cross-thread drain support
     struct instance_registry_entry {
         uint64_t instance_id;
-        /// 裸指针在这里是安全的：注册发生在构造函数、注销发生在析构函数，
-        /// 因此条目不会比实例活得更久（区别于线程 ring 注册表 —— 那里的注销
-        /// 依赖独立的 sentinel，所以那里必须用 weak_ptr）。
+        /// A raw pointer is safe here: registration happens in the constructor and
+        /// deregistration in the destructor, so the entry can never outlive the
+        /// instance. (Unlike the thread-ring registry, whose deregistration relies
+        /// on a separate sentinel and therefore has to use weak_ptr.)
         tls_callback_ring* instance_ptr;
     };
 
     static inline std::mutex registry_mutex_;
-    /// 进程生命周期存储（见 detail::process_lifetime）：本容器运行期才首次
-    /// 触及，会在使用它的全局缓存之前析构；而缓存的析构函数正要拿它来注销，
-    /// 退出期的 flush_all_registered() 也要遍历它 —— 容器先死即 UB。
+    /// Process-lifetime storage (see detail::process_lifetime). This container is
+    /// first touched at runtime, so it is destroyed before the global caches that
+    /// use it -- yet a cache's destructor needs it to deregister, and the
+    /// exit-time flush_all_registered() walks it. Dying first would be UB.
     static inline detail::process_lifetime<std::vector<instance_registry_entry>>
         registry_;
 };
@@ -733,7 +735,7 @@ private:
 /// @tparam Hash   Hash function for Key
 /// @tparam N      Ring size (must be power of 2, default 256)
 ///
-/// T10.1: Default raised from 64 to 256 (see tls_callback_ring docs).
+/// Default raised from 64 to 256 (see tls_callback_ring docs).
 template <typename Key, typename Hash = std::hash<Key>, std::size_t N = 256>
 class tls_event_ring {
     static_assert(N > 0, "Ring size must be positive");
@@ -787,7 +789,7 @@ public:
                     [this](const auto& e) { return e.instance_ptr == this; }),
                 registry_.end());
         }
-        // P2-3: Remove all per-thread ring_data entries for this instance
+        // Remove all per-thread ring_data entries for this instance
         // from the cross-thread registry. This prevents drain_all_threads()
         // from observing a dangling ring_ptr after this instance is destroyed.
         // The ring_data objects themselves are owned by each thread's
@@ -951,7 +953,7 @@ public:
     /// ensuring the calling thread's pending events are processed.
     /// Typically called during cache destruction to minimize event loss.
     ///
-    /// T20.3: Also drains the global backup buffer (events from exited
+    /// Also drains the global backup buffer (events from exited
     /// threads) and returns them via the returned drain_result. Callers
     /// that want to process those events should consume the returned
     /// result; callers that only care about the side-effect (clearing
@@ -992,14 +994,14 @@ public:
         return result;
     }
 
-    /// P2-3: Drain ALL threads' TLS data for this instance.
+    /// Drain ALL threads' TLS data for this instance.
     ///
     /// Walks the global per-thread ring registry and drains every thread's
     /// ring_data for this instance. This ensures that `top_keys()` and
     /// `generate_report()` reflect events recorded on all threads, not just
     /// the calling thread.
     ///
-    /// T20.3: Also drains the global backup buffer first, so events pushed
+    /// Also drains the global backup buffer first, so events pushed
     /// there by dying threads (via `thread_exit_sentinel`) are retrieved
     /// alongside live threads' data. The pattern mirrors
     /// `tls_access_ring::drain_all_threads()`.
@@ -1016,7 +1018,7 @@ public:
     ///         registry order (backup first).
     drain_result drain_all_threads() {
         drain_result result;
-        // T20.3: Drain the global backup buffer first (events from exited
+        // Drain the global backup buffer first (events from exited
         // threads). This ensures dying-thread events are surfaced before
         // any newly-recorded events on live threads, preserving temporal
         // order to the extent possible.
@@ -1024,8 +1026,8 @@ public:
         if (!backup.entries.empty()) {
             result.entries = std::move(backup.entries);
         }
-        // 持有 shared_ptr：弱引用取到即保证 ring_data 在本轮遍历期间存活
-        // （裸指针版本在线程退出后会悬空）。
+    // Hold shared_ptr: a successful weak_ptr lock guarantees ring_data stays alive
+    // for this whole traversal; the raw-pointer version dangled after thread exit.
         std::vector<std::shared_ptr<ring_data>> rings_to_drain;
         {
             std::lock_guard<std::mutex> lock(thread_ring_registry_mutex_);
@@ -1058,7 +1060,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // T20: Global backup buffer — collects events from exited threads
+    // Global backup buffer — collects events from exited threads
     // --------------------------------------------------------------------
     //
     // When a thread exits, its thread_exit_sentinel drains the remaining
@@ -1147,8 +1149,9 @@ private:
     };
 
     struct thread_data {
-        // shared_ptr：跨线程注册表通过 weak_ptr 观察它，因此本线程退出（TLS
-        // 析构）后，其它线程的 lock() 会失败而不是拿到悬空指针。
+    // shared_ptr: the cross-thread registry observes it through a weak_ptr, so once
+    // this thread exits (TLS destruction) another thread's lock() fails instead of
+    // returning a dangling pointer.
         ankerl::unordered_dense::map<uint64_t, std::shared_ptr<ring_data>> rings;
     };
 
@@ -1173,9 +1176,9 @@ private:
         auto it = td.rings.find(instance_id_);
         if (it == td.rings.end()) {
             auto [insert_it, _] = td.rings.emplace(instance_id_, std::make_shared<ring_data>());
-            // P2-3: Register this thread's ring in the cross-thread registry
-            // so drain_all_threads() can find and drain it. 存 weak_ptr：
-            // 线程退出后 lock() 会失败，不会留下悬空指针。
+            // Register this thread's ring in the cross-thread registry
+    // so drain_all_threads() can find and drain it. weak_ptr, not a raw pointer:
+    // after the thread exits, lock() fails and leaves nothing dangling.
             {
                 std::lock_guard<std::mutex> lock(thread_ring_registry_mutex_);
                 thread_ring_registry_.push_back(thread_ring_registry_entry{
@@ -1196,7 +1199,7 @@ private:
     }
 
     static uint64_t now_ms() {
-        // R6: Use steady_clock instead of system_clock for monotonic
+        // Use steady_clock instead of system_clock for monotonic
         // timestamps. system_clock is subject to NTP adjustments and can
         // jump backwards, causing negative TTL values in event_tracker.
         // steady_clock is monotonically increasing — correct for all
@@ -1212,19 +1215,20 @@ private:
     // Global registry for cross-thread drain support (instance-level)
     struct instance_registry_entry {
         uint64_t instance_id;
-        /// 裸指针在这里是安全的：注册在构造函数、注销在析构函数，条目不会比
-        /// 实例活得更久（区别于 thread_ring_registry_ —— 那里的注销依赖独立的
-        /// sentinel，所以那里必须用 weak_ptr）。
+    /// A raw pointer is safe here: registration happens in the constructor and
+    /// deregistration in the destructor, so the entry can never outlive the
+    /// instance. (Unlike thread_ring_registry_, whose deregistration relies on a
+    /// separate sentinel and therefore has to use weak_ptr.)
         tls_event_ring* instance_ptr;
     };
 
     static inline std::mutex registry_mutex_;
-    /// 进程生命周期存储（见 detail::process_lifetime）：同 tls_callback_ring。
+    /// Process-lifetime storage (see detail::process_lifetime); same as tls_callback_ring.
     static inline detail::process_lifetime<std::vector<instance_registry_entry>>
         registry_;
 
     // --------------------------------------------------------------------
-    // P2-3: Per-thread ring registry — tracks every (instance, thread) pair
+    // Per-thread ring registry — tracks every (instance, thread) pair
     // so drain_all_threads() can find and drain every thread's ring_data
     // for a given instance.
     // --------------------------------------------------------------------
@@ -1232,20 +1236,23 @@ private:
     struct thread_ring_registry_entry {
         uint64_t instance_id;
         std::thread::id tid;
-        /// 弱引用而非裸指针：ring_data 由线程的 thread_data 拥有，其它线程只能
-        /// 通过弱引用观察它。lock() 失败即表示该线程已退出并回收，跳过即可；
-        /// 裸指针在那种情况下已悬空，而 drain_all_threads() 会解引用它。
+    /// weak_ptr rather than a raw pointer: ring_data is owned by the thread's
+    /// thread_data and other threads can only observe it through a weak reference.
+    /// A failed lock() means that thread has exited and reclaimed its ring, so skip
+    /// it -- a raw pointer would already be dangling and drain_all_threads() would
+    /// dereference it.
         std::weak_ptr<ring_data> ring;
     };
 
     static inline std::mutex thread_ring_registry_mutex_;
-    /// 进程生命周期存储（见 detail::process_lifetime）：本容器运行期才首次
-    /// 触及，会在使用它的全局缓存之前析构，而那正是要遍历它的时刻。
+    /// Process-lifetime storage (see detail::process_lifetime). This container is
+    /// first touched at runtime and is destroyed before the global caches that use
+    /// it -- which is exactly when they need to walk it.
     static inline detail::process_lifetime<std::vector<thread_ring_registry_entry>>
         thread_ring_registry_;
 
     // --------------------------------------------------------------------
-    // T20: Global backup buffer storage — one per (Key, Hash, N) template
+    // Global backup buffer storage — one per (Key, Hash, N) template
     // instantiation. Shared by all instances of this tls_event_ring
     // specialization. Mutex-protected; push/drain are safe from any thread.
     // --------------------------------------------------------------------
@@ -1278,7 +1285,7 @@ private:
     /// get_ring(), destroyed before the thread's `thread_data` (ensuring
     /// the registry doesn't hold a dangling pointer to destroyed ring_data).
     ///
-    /// T20.2: Before unregistering, the sentinel drains the current thread's
+    /// Before unregistering, the sentinel drains the current thread's
     /// ring_data for every registered instance and pushes the events into
     /// the corresponding instance's global backup buffer. This prevents
     /// event loss when a thread exits before the next drain cycle (e.g.
@@ -1286,12 +1293,12 @@ private:
     struct thread_exit_sentinel {
         ~thread_exit_sentinel() {
             const auto tid = std::this_thread::get_id();
-            // T20.2: Collect (instance_id, ring_ptr) pairs for this thread
+            // Collect (instance_id, ring_ptr) pairs for this thread
             // BEFORE removing them from the registry. We need to hold the
             // lock during both the snapshot and the erase to prevent
             // drain_all_threads() from observing a half-removed state.
-            // 持有 shared_ptr：离开注册表锁之后仍要访问这些 ring_data，
-            // 弱引用取到即保证它们在 flush 期间存活。
+    // Hold shared_ptr: these ring_data are still accessed after the registry lock
+    // is released, and a successful weak_ptr lock keeps them alive for the flush.
             std::vector<std::pair<uint64_t, std::shared_ptr<ring_data>>> to_flush;
             {
                 std::lock_guard<std::mutex> lock(thread_ring_registry_mutex_);
@@ -1309,7 +1316,7 @@ private:
                                    }),
                     thread_ring_registry_.end());
             }
-            // T20.2: Drain each ring_data and push events into the backup.
+            // Drain each ring_data and push events into the backup.
             // We do this OUTSIDE the registry mutex to minimize its hold
             // time and avoid potential deadlock with drain_all_threads()
             // (which takes the same mutex then reads ring_data). The
@@ -1335,7 +1342,7 @@ private:
                 // does not double-count them (best-effort; the ring_data
                 // is about to be destroyed anyway).
                 rd->tail.store(head, std::memory_order_relaxed);
-                // T20.2: Push into the backup buffer. We must find the
+                // Push into the backup buffer. We must find the
                 // instance whose backup buffer to use. The backup is
                 // per-instance (per template specialization), so we look
                 // up the instance pointer from the instance registry.
@@ -1426,14 +1433,14 @@ struct access_ring_drain_result {
     std::size_t size() const noexcept { return keys.size(); }
 };
 
-/// T10.1: Default raised from 64 to 256 (see tls_callback_ring docs).
+/// Default raised from 64 to 256 (see tls_callback_ring docs).
 ///
-/// T-D1 (P2-1): Runtime-configurable capacity. The compile-time template
+/// Runtime-configurable capacity. The compile-time template
 /// parameter `N` is now the *upper bound* on the ring capacity. The
 /// effective capacity is read from `runtime_capacity_` (a static atomic,
 /// default N) on each thread's first `record_access()` call and cached
 /// in `per_thread_cap_` (a per-thread atomic). This matches the spec's
-/// "thread_local 首次访问时动态分配" intent: each thread's ring uses
+    /// The "thread_local, allocated on first touch" intent: each thread's ring uses
 /// the capacity that was configured at the time of its first access.
 ///
 ///   - `set_tls_ring_capacity(cap)` — global API, affects new threads only
@@ -1455,7 +1462,7 @@ public:
     static constexpr std::size_t kRingSize = N;
 
     // --------------------------------------------------------------------
-    // T-D2 (P2-2): Per-cache config struct
+    // Per-cache config struct
     // --------------------------------------------------------------------
     //
     // Historically `full_policy_`, `auto_drain_threshold_`, and the flush
@@ -1530,7 +1537,7 @@ public:
     };
 
     // --------------------------------------------------------------------
-    // T-D2 (P2-2): Active config management
+    // Active config management
     // --------------------------------------------------------------------
     //
     // The active config is a thread_local pointer — each thread can have
@@ -1593,19 +1600,19 @@ public:
     /// (see `set_full_policy`). The default (`kSilentDrop`) preserves the
     /// historical wrap-around semantics.
     ///
-    /// T-D1 (P2-1): On first access, snapshots the global
+    /// On first access, snapshots the global
     /// `runtime_capacity_` into this thread's `per_thread_cap_`. The
     /// snapshot is used as the effective ring capacity and mask for all
     /// subsequent accesses until `reset()` clears it.
     void record_access(const Key& key) {
-        // T-D1: Snapshot the runtime capacity on first access (or after
-        // reset). This matches the spec's "thread_local 首次访问时动态
-        // 分配" intent: each thread uses the capacity configured at the
+        // Snapshot the runtime capacity on first access (or after
+    // reset). This matches the spec's "thread_local, allocated on first touch"
+    // intent: each thread uses the capacity configured at the
         // time of its first access.
         const std::size_t cap = effective_capacity();
         const std::size_t mask = cap - 1;
 
-        // P1-4 (T3.3): Update heartbeat timestamp so the background
+        // Update heartbeat timestamp so the background
         // drain worker can detect dormant threads. Use release
         // semantics so that a cross-thread reader observing this
         // timestamp via acquire also observes all prior writes to
@@ -1629,7 +1636,7 @@ public:
         // (see drain_all_threads()), service it now on our own thread to
         // keep thread_local mutations on their owning thread.
         if (needs_flush_.load(std::memory_order_acquire)) {
-            // T7.1: Clear the flag BEFORE draining so a concurrent
+            // Clear the flag BEFORE draining so a concurrent
             // drain_all_threads_sync() that just set the flag again
             // observes a consistent state (we'll service that next time).
             needs_flush_.store(false, std::memory_order_release);
@@ -1637,7 +1644,7 @@ public:
             if (!drained.keys.empty()) {
                 push_to_backup(std::move(drained.keys));
             }
-            // T7.1: Decrement the pending-drain counter so that
+            // Decrement the pending-drain counter so that
             // drain_all_threads_sync() can detect completion.
             if (pending_drain_count_.load(std::memory_order_relaxed) > 0) {
                 pending_drain_count_.fetch_sub(1, std::memory_order_release);
@@ -1646,7 +1653,7 @@ public:
 
         std::size_t pos = head_.load(std::memory_order_relaxed);
         buf_[pos & mask] = key;
-        // G15: release (not relaxed) so the buf_[pos & mask] write above
+        // release (not relaxed) so the buf_[pos & mask] write above
         // is visible to cross-thread readers (force_flush_dormant_threads)
         // that acquire-load head_. last_activity_ns_ release above does NOT
         // cover this buf_[] write (it runs before this write in source
@@ -1658,7 +1665,7 @@ public:
         // thread loads of head_ below stay relaxed - they do not cross threads.
         head_.store(pos + 1, std::memory_order_release);
 
-        // T-P2-4: Maintain the cross-thread backlog aggregate for
+        // Maintain the cross-thread backlog aggregate for
         // diagnostics without contending on the shared atomic. Increment
         // a pure thread-local counter (zero cache-line contention) and,
         // every `kBacklogFlushBatch` increments, batch-flush the accumulated
@@ -1678,17 +1685,17 @@ public:
             apply_overflow_policy();
         }
 
-        // T10.2: Auto-drain when the ring fills past the configured
+        // Auto-drain when the ring fills past the configured
         // threshold. This caps the worst-case drain latency without
         // requiring a background worker. Default threshold is N (i.e.
         // only auto-drain on overflow, which is already handled by
         // apply_overflow_policy above); set it lower (e.g. N/2) for
         // smoother drain behavior under burst traffic.
         //
-        // T-D1: threshold is clamped to per_thread_cap_ so auto-drain
+        // threshold is clamped to per_thread_cap_ so auto-drain
         // triggers no later than ring-full (which is handled above).
         //
-        // T-D2 (P2-2): Prefer the per-cache active config's threshold
+        // Prefer the per-cache active config's threshold
         // when set (via `set_active_config()` / `active_config_scope`).
         // This allows two cache instances in the same process to use
         // different drain thresholds without falling back to the
@@ -1701,7 +1708,7 @@ public:
         const std::size_t threshold = threshold_raw > cap ? cap : threshold_raw;
         if (threshold < cap &&
             (head_.load(std::memory_order_relaxed) - tail_.load(std::memory_order_relaxed)) >= threshold) {
-            // T10.3: count this auto-drain for the flush_per_sec metric.
+            // count this auto-drain for the flush_per_sec metric.
             tls_ring_flush_count_.fetch_add(1, std::memory_order_relaxed);
             auto drained = drain();
             if (!drained.keys.empty()) {
@@ -1733,7 +1740,7 @@ public:
         return full_policy_.load(std::memory_order_relaxed);
     }
 
-    /// T10.2: Set the auto-drain threshold for this `<Key, N>` specialization.
+    /// Set the auto-drain threshold for this `<Key, N>` specialization.
     /// When the ring's occupancy reaches `threshold`, the next `record_access()`
     /// call will synchronously drain the ring into the global backup buffer.
     ///
@@ -1752,12 +1759,12 @@ public:
         auto_drain_threshold_.store(threshold, std::memory_order_relaxed);
     }
 
-    /// T10.2: Query the current auto-drain threshold.
+    /// Query the current auto-drain threshold.
     static std::size_t tls_drain_threshold() noexcept {
         return auto_drain_threshold_.load(std::memory_order_relaxed);
     }
 
-    /// T10.2: Runtime configuration of the effective ring capacity.
+    /// Runtime configuration of the effective ring capacity.
     ///
     /// The physical ring size `N` is a compile-time template parameter
     /// (default 256, see T10.1). At runtime, callers can shrink the
@@ -1774,7 +1781,7 @@ public:
     /// compile-time `N` parameter. It does NOT change `sizeof(tls_ring)`
     /// — the physical storage is fixed at compile time.
     ///
-    /// T-D1 (P2-1): For true physical-capacity changes (mask used for
+    /// For true physical-capacity changes (mask used for
     /// indexing), use `set_tls_ring_capacity()` instead. The two APIs
     /// are complementary: `set_tls_ring_size` controls auto-drain
     /// frequency; `set_tls_ring_capacity` controls the actual ring size.
@@ -1782,7 +1789,7 @@ public:
         set_tls_drain_threshold(effective_size);
     }
 
-    /// T-D1 (P2-1): Set the runtime ring capacity for NEW thread_local
+    /// Set the runtime ring capacity for NEW thread_local
     /// rings. Existing threads keep their snapshot until their ring is
     /// reset (e.g., via `reset()` followed by a new `record_access()`).
     ///
@@ -1821,7 +1828,7 @@ public:
             if (cap > kRingSize) cap = kRingSize;
         }
         runtime_capacity_.store(cap, std::memory_order_relaxed);
-        // T-D1: also clamp auto_drain_threshold_ to the new capacity.
+        // also clamp auto_drain_threshold_ to the new capacity.
         // Existing threads' per_thread_cap_ is unaffected (snapshot
         // semantics), but the global auto-drain threshold should not
         // exceed the new global capacity.
@@ -1831,7 +1838,7 @@ public:
         }
     }
 
-    /// T-D1 (P2-1): Query the configured runtime capacity (the value
+    /// Query the configured runtime capacity (the value
     /// that will be snapshot by new threads on first access). Existing
     /// threads may have a different capacity if `set_tls_ring_capacity`
     /// was called after their first access.
@@ -1839,14 +1846,14 @@ public:
         return runtime_capacity_.load(std::memory_order_relaxed);
     }
 
-    /// T10.3: Returns the global total of auto-drain invocations across
+    /// Returns the global total of auto-drain invocations across
     /// all threads for this `<Key, N>` specialization. Monotonic counter
     /// that only resets when `drain_flush_count()` is called.
     static std::size_t tls_ring_flush_count() noexcept {
         return tls_ring_flush_count_.load(std::memory_order_relaxed);
     }
 
-    /// T10.3: Atomically read and reset the flush counter. Intended for
+    /// Atomically read and reset the flush counter. Intended for
     /// periodic stats aggregation (e.g. computing flushes/sec).
     static std::size_t drain_flush_count() noexcept {
         return tls_ring_flush_count_.exchange(0, std::memory_order_acq_rel);
@@ -1883,7 +1890,7 @@ public:
     /// Drain all buffered entries, returning them in FIFO order.
     /// Resets the ring to empty state.
     ///
-    /// T-D1 (P2-1): Uses `per_thread_cap_` for the count clamp and mask.
+    /// Uses `per_thread_cap_` for the count clamp and mask.
     /// If `per_thread_cap_` is 0 (first call before any record_access),
     /// falls back to `runtime_capacity_` then `kRingSize`.
     drain_result drain() {
@@ -1896,7 +1903,7 @@ public:
             return drain_result{};
         }
         if (count > cap) {
-            // P2-A: Clamp path. Entries beyond `cap` are silently dropped
+            // Clamp path. Entries beyond `cap` are silently dropped
             // because the ring was overflowed by record_access() without
             // an intervening apply_overflow_policy() call (e.g. head was
             // advanced by record_access but the overflow policy path was
@@ -1921,7 +1928,7 @@ public:
 
         tail_.store(head, std::memory_order_relaxed);
 
-        // T-P2-4: Maintain the cross-thread backlog aggregate. Drain is
+        // Maintain the cross-thread backlog aggregate. Drain is
         // per-thread and far less frequent than `record_access()`, so we
         // can afford a relaxed atomic subtract here. First flush this
         // thread's pending TLS counter to the shared atomic so the
@@ -1966,7 +1973,7 @@ public:
 
     /// Whether the ring is ≥ 75% full (heuristic for early flush).
     ///
-    /// T-D1 (P2-1): Uses `per_thread_cap_` instead of compile-time `kRingSize`.
+    /// Uses `per_thread_cap_` instead of compile-time `kRingSize`.
     bool should_flush() const noexcept {
         const std::size_t cap = effective_capacity();
         return size() >= cap * 3 / 4;
@@ -1974,7 +1981,7 @@ public:
 
     /// Discard all entries without returning them.
     ///
-    /// T-D1 (P2-1): Also clears `per_thread_cap_` so the next
+    /// Also clears `per_thread_cap_` so the next
     /// `record_access()` re-snapshots the global `runtime_capacity_`.
     /// This allows runtime capacity changes to take effect on existing
     /// threads after an explicit `reset()`.
@@ -2059,11 +2066,12 @@ public:
                 // Set the flush request flag. The owning thread will
                 // service it on its next record_access() call, draining
                 // its ring into the backup buffer.
-                // T7.1: Only increment pending_drain_count_ when we
+                // Only increment pending_drain_count_ when we
                 // transition the flag from false to true. This prevents
                 // double-counting when drain_all_threads() is called
                 // repeatedly while a previous request is still pending.
-                // 弱引用取到才操作；取不到说明该线程的 ring 已销毁。
+    // Operate only if the weak reference resolves; failure means the thread's ring
+    // has already been destroyed.
                 auto target = entry.ring.lock();
                 if (!target) continue;
                 bool expected = false;
@@ -2077,7 +2085,7 @@ public:
         return drain_result{std::move(all_keys)};
     }
 
-    /// T7.2: Synchronous version of `drain_all_threads()`.
+    /// Synchronous version of `drain_all_threads()`.
     ///
     /// Issues a flush request to every other thread (exactly like
     /// `drain_all_threads()`) and then blocks until either:
@@ -2128,14 +2136,14 @@ public:
         return true;
     }
 
-    /// T7.1: Returns the current number of pending cross-thread drain
+    /// Returns the current number of pending cross-thread drain
     /// requests (i.e., threads that have been asked to flush their TLS
     /// ring into the backup buffer but have not yet done so).
     static std::size_t pending_drain_count() noexcept {
         return pending_drain_count_.load(std::memory_order_acquire);
     }
 
-    /// P1-4 (T3.3): Force-flush dormant threads' TLS rings.
+    /// Force-flush dormant threads' TLS rings.
     ///
     /// Scans all registered threads and identifies those whose
     /// `last_activity_ns_` is older than `idle_threshold` (i.e., the
@@ -2188,7 +2196,8 @@ public:
                 // via the normal path.
                 if (entry.tid == std::this_thread::get_id()) continue;
 
-                // 弱引用取到才操作；取不到说明该线程的 ring 已销毁。
+    // Operate only if the weak reference resolves; failure means the thread's ring
+    // has already been destroyed.
                 auto ring = entry.ring.lock();
                 if (!ring) continue;
                 const std::uint64_t last_activity =
@@ -2220,7 +2229,7 @@ public:
                 std::size_t head1 = ring->head_.load(std::memory_order_acquire);
                 std::size_t count = head1 - tail1;
                 if (count == 0) continue;
-                // T-D1 (P2-1): Use the target thread's per-thread capacity
+                // Use the target thread's per-thread capacity
                 // (snapshotted at its first record_access). If the thread
                 // has not yet snapshotted (per_thread_cap_ == 0), fall back
                 // to the global runtime_capacity_, then to kRingSize.
@@ -2236,7 +2245,7 @@ public:
                 }
                 std::size_t dropped = 0;
                 if (count > target_cap) {
-                    // P2-A: Cross-thread clamp path. Same situation as
+                    // Cross-thread clamp path. Same situation as
                     // drain(): the dormant thread overflowed its ring
                     // without an intervening apply_overflow_policy()
                     // adjustment, so count exceeds the physical capacity.
@@ -2247,7 +2256,7 @@ public:
                     // thread will not double-count because it is dormant
                     // (no further record_access / drain calls).
                     //
-                    // C-4: Defer total_dropped_.fetch_add until AFTER
+                    // Defer total_dropped_.fetch_add until AFTER
                     // seqlock validation passes. Computing `dropped` here
                     // is safe (count can no longer wrap thanks to the
                     // tail-first load order above), but charging it to
@@ -2278,7 +2287,7 @@ public:
                 // Seqlock validation: re-read head_/tail_. If they
                 // changed, the thread woke up and wrote to buf_[] —
                 // abort this drain to avoid using inconsistent data.
-                // C-4: same tail-first ordering as the initial snapshot.
+                // same tail-first ordering as the initial snapshot.
                 std::size_t tail2 = ring->tail_.load(std::memory_order_acquire);
                 std::size_t head2 = ring->head_.load(std::memory_order_acquire);
                 if (head1 != head2 || tail1 != tail2) {
@@ -2286,7 +2295,7 @@ public:
                     // owning thread will drain itself on its next
                     // record_access() call (or via needs_flush_ flag).
                     //
-                    // C-4: We also skip the total_dropped_.fetch_add
+                    // We also skip the total_dropped_.fetch_add
                     // below for the overflow case — the dropped
                     // accounting is only meaningful for snapshots that
                     // pass validation. Aborted snapshots might have
@@ -2311,7 +2320,7 @@ public:
                     continue;
                 }
 
-                // C-4: Now that the CAS succeeded (the snapshot was
+                // Now that the CAS succeeded (the snapshot was
                 // consistent and we've claimed the entries), account
                 // any overflow drops. This is the ONLY place we charge
                 // total_dropped_ for the cross-thread path — deferred
@@ -2358,7 +2367,7 @@ public:
         return total_dropped_.load(std::memory_order_relaxed);
     }
 
-    /// T-P2-4: Cross-thread aggregate of the live backlog (pending
+    /// Cross-thread aggregate of the live backlog (pending
     /// un-drained access entries) across all threads. The hot path
     /// (`record_access()`) updates a thread-local counter and only
     /// batch-flushes to `total_backlog_` every `kBacklogFlushBatch`
@@ -2381,7 +2390,7 @@ public:
     /// Called automatically by the thread-local sentinel when a thread exits.
     /// Safe to call from any thread; uses a mutex for exclusive access.
     ///
-    /// P1-B: Sets `has_backup_keys_` to true under the lock so that
+    /// Sets `has_backup_keys_` to true under the lock so that
     /// `has_backup_keys()` can fast-path on a single atomic load without
     /// acquiring the mutex on the common (empty) path.
     static void push_to_backup(std::vector<Key>&& keys) {
@@ -2402,7 +2411,7 @@ public:
     /// Should be called by drain_access_ring() before draining the TLS ring
     /// so that orphaned keys from exited threads get promoted.
     ///
-    /// P1-B: Clears `has_backup_keys_` under the lock so subsequent
+    /// Clears `has_backup_keys_` under the lock so subsequent
     /// fast-path checks skip the mutex. New pushes after unlock will
     /// re-set the flag.
     static drain_result drain_backup() {
@@ -2422,7 +2431,7 @@ public:
 
     /// Whether the global backup buffer has any keys.
     ///
-    /// P1-B: Fast-path on a single atomic load. When the flag is false
+    /// Fast-path on a single atomic load. When the flag is false
     /// (the common case — no thread has exited with pending promotions),
     /// this avoids the mutex acquisition entirely. When the flag is true,
     /// falls back to a mutex-protected check (the flag may be stale if
@@ -2495,7 +2504,7 @@ private:
     alignas(64) std::atomic<std::size_t> head_{0};  // write position (monotonically increasing)
     alignas(64) std::atomic<std::size_t> tail_{0};  // oldest unread position
 
-    /// T-D1 (P2-1): Per-thread snapshot of the global `runtime_capacity_`,
+    /// Per-thread snapshot of the global `runtime_capacity_`,
     /// taken on first `record_access()` (or after `reset()`). Used as the
     /// effective ring capacity for this thread's mask and overflow checks.
     ///
@@ -2510,7 +2519,7 @@ private:
     /// in `effective_capacity()` uses release ordering).
     alignas(64) std::atomic<std::size_t> per_thread_cap_{0};
 
-    /// T-D1 (P2-1): Helper that returns the effective capacity for the
+    /// Helper that returns the effective capacity for the
     /// calling thread. On first call (or after `reset()`), snapshots the
     /// global `runtime_capacity_` into `per_thread_cap_` and returns it.
     /// Subsequent calls return the cached snapshot.
@@ -2533,7 +2542,7 @@ private:
         return cap;
     }
 
-    /// T-D1 (P2-1): const-overload of effective_capacity() for use in
+    /// const-overload of effective_capacity() for use in
     /// const member functions (should_flush, drain). Uses relaxed load
     /// because const methods are read-only; if per_thread_cap_ is 0
     /// (not yet snapshotted), the call site should be a record_access()
@@ -2556,7 +2565,7 @@ private:
     /// reads/writes are safe because the flag is atomic.
     std::atomic<bool> needs_flush_{false};
 
-    /// P1-4 (T3.3): Heartbeat timestamp — last time this thread called
+    /// Heartbeat timestamp — last time this thread called
     /// record_access(). Updated with release semantics so that a
     /// cross-thread reader can use acquire semantics to establish a
     /// happens-before relationship with the owning thread's writes to
@@ -2586,7 +2595,7 @@ private:
     /// atomically drained via `drain_dropped_count()`.
     static inline std::atomic<std::size_t> total_dropped_{0};
 
-    /// T-P2-4: Global aggregate of the live backlog (pending un-drained
+    /// Global aggregate of the live backlog (pending un-drained
     /// access entries) across all threads for this `<Key, N>` specialization.
     /// Now updated only by periodic batch-flushes from each thread's
     /// `tls_pending_backlog_` (every `kBacklogFlushBatch` increments in
@@ -2598,7 +2607,7 @@ private:
     /// `record_access()` cache-line contention of the previous design.
     alignas(64) static inline std::atomic<std::size_t> total_backlog_{0};
 
-    /// T-P2-4: Per-thread (thread-local) pending backlog counter. The hot
+    /// Per-thread (thread-local) pending backlog counter. The hot
     /// path (`record_access()`) increments this pure-TLS counter instead of
     /// contending on the shared `total_backlog_` atomic, eliminating
     /// cache-line contention under high read concurrency. Every
@@ -2612,7 +2621,7 @@ private:
     /// become visible only on their next batch flush (bounded staleness).
     static inline thread_local std::size_t tls_pending_backlog_{0};
 
-    /// T-P2-4: Number of `record_access()` increments accumulated in
+    /// Number of `record_access()` increments accumulated in
     /// `tls_pending_backlog_` before a batch flush to the shared
     /// `total_backlog_` atomic. A power of two so the modulo is a cheap
     /// bitmask. 64 keeps the per-thread footprint tiny while bounding the
@@ -2628,7 +2637,7 @@ private:
     std::uint32_t heartbeat_skip_{0};
     static constexpr std::uint32_t kHeartbeatInterval = 64;
 
-    /// T7.1: Global counter tracking the number of pending cross-thread
+    /// Global counter tracking the number of pending cross-thread
     /// drain requests. Incremented in `drain_all_threads()` when we
     /// transition a thread's `needs_flush_` flag from false to true;
     /// decremented in `record_access()` when the owning thread services
@@ -2639,7 +2648,7 @@ private:
     /// per-thread `needs_flush_` flags written by other threads.
     alignas(64) static inline std::atomic<std::size_t> pending_drain_count_{0};
 
-    /// T10.2: Auto-drain threshold. When the ring's occupancy reaches
+    /// Auto-drain threshold. When the ring's occupancy reaches
     /// this value, the next `record_access()` synchronously drains.
     /// Default is kRingSize / 2 (R6: lowered from kRingSize to enable
     /// proactive draining before overflow, bounding worst-case drain
@@ -2647,7 +2656,7 @@ private:
     /// latency further; set to kRingSize to disable auto-drain.
     static inline std::atomic<std::size_t> auto_drain_threshold_{kRingSize / 2};
 
-    /// T-D1 (P2-1): Global runtime ring capacity. Read by new threads
+    /// Global runtime ring capacity. Read by new threads
     /// on their first `record_access()` (via `effective_capacity()`) and
     /// cached in `per_thread_cap_`. Changes only affect threads whose
     /// `per_thread_cap_` is 0 (i.e., never accessed or post-`reset()`).
@@ -2663,7 +2672,7 @@ private:
     /// (`set_tls_ring_capacity()`).
     alignas(64) static inline std::atomic<std::size_t> runtime_capacity_{kRingSize};
 
-    /// T-D2 (P2-2): Thread-local pointer to the active per-cache config.
+    /// Thread-local pointer to the active per-cache config.
     /// Set via `set_active_config()` (typically through `active_config_scope`
     /// RAII guard). When null, `record_access()` and `apply_overflow_policy()`
     /// fall back to the static defaults (`full_policy_`, `auto_drain_threshold_`,
@@ -2681,13 +2690,13 @@ private:
     /// instance per `<Key, N>` specialization.
     inline static thread_local tls_ring_config* active_config_ = nullptr;
 
-    /// T10.3: Global counter of auto-drain invocations. Read via
+    /// Global counter of auto-drain invocations. Read via
     /// `tls_ring_flush_count()` and atomically drained via
     /// `drain_flush_count()`. Accumulated into the
     /// `lru_cache_tls_ring_flush_total` Prometheus counter.
     alignas(64) static inline std::atomic<std::size_t> tls_ring_flush_count_{0};
 
-    /// P1-B: Fast-path flag for `has_backup_keys()`. Set to true under
+    /// Fast-path flag for `has_backup_keys()`. Set to true under
     /// the backup buffer mutex in `push_to_backup()`, cleared under the
     /// same mutex in `drain_backup()`. Read with acquire ordering by
     /// `has_backup_keys()` to skip the mutex on the common empty path.
@@ -2701,7 +2710,7 @@ private:
     /// Current overflow policy (atomic for cross-thread reads). Per
     /// `<Key, N>` specialization, shared across all threads.
     ///
-    /// P1-5: Default changed from `kSilentDrop` to `kFlushOnFull` so that
+    /// Default changed from `kSilentDrop` to `kFlushOnFull` so that
     /// production workloads don't silently drop access traces (which would
     /// degrade LRU accuracy under burst traffic). Falls back to silent-drop
     /// if the flush callback fails to drain the ring.
@@ -2719,11 +2728,11 @@ private:
     /// Apply the configured overflow policy. Called from `record_access()`
     /// when the ring has overflowed (`head_ - tail_ > cap`).
     ///
-    /// T-D1 (P2-1): Uses `effective_capacity()` instead of compile-time
+    /// Uses `effective_capacity()` instead of compile-time
     /// `kRingSize` for the tail reset. This ensures overflow handling
     /// respects the runtime-configured capacity.
     ///
-    /// T-D2 (P2-2): Prefers the per-cache active config's `full_policy`
+    /// Prefers the per-cache active config's `full_policy`
     /// and `flush_callback` when set (via `set_active_config()` /
     /// `active_config_scope`). This allows two cache instances to use
     /// different overflow policies (e.g. one kSilentDrop, one kFlushOnFull
@@ -2744,7 +2753,7 @@ private:
                 tail_.store(head_.load(std::memory_order_relaxed) - cap, std::memory_order_relaxed);
                 break;
             case tls_ring_full_policy::kFlushOnFull: {
-                // T-D2: prefer the per-cache flush_callback from the active
+                // prefer the per-cache flush_callback from the active
                 // config; fall back to the static default when no config
                 // is set.
                 if (cfg) {
@@ -2779,13 +2788,13 @@ private:
     // ----------------------------------------------------------------
 
     /// Shared backup storage protected by a mutex.
-    /// T7.5: Pre-reserves capacity to avoid heap allocations on the
+    /// Pre-reserves capacity to avoid heap allocations on the
     /// thread-exit path (which runs in the sentinel destructor and
     /// should be wait-free in the common case). The default reserve
     /// covers ~16 thread exits × ring size N each without growing.
     struct backup_storage {
         backup_storage() {
-            // T7.5: reserve upfront for the common case. The vector
+            // reserve upfront for the common case. The vector
             // still grows on demand if more threads exit than expected.
             keys.reserve(16 * kRingSize);
         }
@@ -2810,19 +2819,21 @@ private:
 
     struct ring_registry_entry {
         std::thread::id tid;
-        /// 弱引用而非裸指针：ring 是本线程的 thread_local 对象，其它线程只能
-        /// 通过弱引用观察它。lock() 失败即表示该线程的 ring 已销毁，跳过即可。
-        ///
-        /// 原先是 `tls_access_ring* ring_ptr`：线程 TLS 销毁后该指针悬空，而
-        /// drain_all_threads() 会解引用 `ring_ptr->needs_flush_` —— 这正是
-        /// "全部测试通过后进程退出 139" 的元凶（只在高压使用下偶发，gdb 下
-        /// 因析构顺序不同通常不复现）。
+    /// weak_ptr rather than a raw pointer: the ring is this thread's thread_local
+    /// object, and other threads can only observe it through a weak reference. A
+    /// failed lock() means the ring is gone, so skip it. The previous version held a
+    /// raw `tls_access_ring* ring_ptr`, which dangled once the thread's TLS was
+    /// destroyed -- and drain_all_threads() dereferenced `ring_ptr->needs_flush_`.
+    /// That was the cause of the "all tests pass, then the process exits with 139"
+    /// crashes: rare, and usually absent under gdb because the destruction order
+    /// differs there.
         std::weak_ptr<tls_access_ring> ring;
     };
 
     static inline std::mutex ring_registry_mutex_;
-    /// 进程生命周期存储（见 detail::process_lifetime）：本容器在运行期才首次
-    /// 触及，会在使用它的全局缓存之前析构，而那正是要遍历它的时刻。
+    /// Process-lifetime storage (see detail::process_lifetime). This container is
+    /// first touched at runtime and is destroyed before the global caches that use
+    /// it -- which is exactly when they need to walk it.
     static inline detail::process_lifetime<std::vector<ring_registry_entry>>
         ring_registry_;
 
@@ -2845,7 +2856,7 @@ private:
             // a new sentinel recursively. Instead, reach into the
             // thread_local ring directly via get_tl_ring().
             auto& ring = get_tl_ring();
-            // T7.1: If another thread is currently blocked in
+            // If another thread is currently blocked in
             // drain_all_threads_sync() waiting on pending_drain_count_,
             // service the flush request here so it doesn't time out
             // waiting for a thread that's about to exit.
@@ -2879,9 +2890,10 @@ private:
     /// Both instance() and thread_exit_sentinel use this to ensure
     /// they reference the same ring object.
     ///
-    /// 堆分配 + shared_ptr 持有：跨线程注册表存的是它的 weak_ptr，因此其它线程
-    /// 永远只会观察到"存活或已失效"，不会拿到悬空指针（裸指针在线程 TLS 销毁
-    /// 后即悬空，而 drain 路径会解引用它）。
+    /// Heap-allocated and held by shared_ptr: the cross-thread registry stores a
+    /// weak_ptr to it, so other threads only ever observe "alive" or "expired" and
+    /// never a dangling pointer. (A raw pointer dangles as soon as the thread's TLS
+    /// is destroyed, and the drain path dereferences it.)
     static std::shared_ptr<tls_access_ring>& get_tl_ring_sp() {
         thread_local std::shared_ptr<tls_access_ring> ring =
             std::make_shared<tls_access_ring>();
@@ -3155,13 +3167,13 @@ private:
     // Global registry for cross-thread drain support
     struct instance_registry_entry {
         uint64_t instance_id;
-        /// 裸指针在这里是安全的：注册在构造函数、注销在析构函数，条目不会比
-        /// 实例活得更久。
+    /// A raw pointer is safe here: registration happens in the constructor and
+    /// deregistration in the destructor, so the entry can never outlive the instance.
         tls_active_item_ring* instance_ptr;
     };
 
     static inline std::mutex registry_mutex_;
-    /// 进程生命周期存储（见 detail::process_lifetime）：同 tls_callback_ring。
+    /// Process-lifetime storage (see detail::process_lifetime); same as tls_callback_ring.
     static inline detail::process_lifetime<std::vector<instance_registry_entry>>
         registry_;
 };

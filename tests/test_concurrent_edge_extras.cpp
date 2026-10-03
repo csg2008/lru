@@ -4,9 +4,9 @@
 // Covers spec gaps G9, G11, G14, G15 (P2):
 //   G9a: TTL cleaner stop concurrent with sweep (no deadlock)
 //   G9b: TTL cleaner does not hold global lock (no stall)
-//   G11: striped lock hash distribution
-//   G14: lock order checking toggle (LRU_DEBUG_LOCK_ORDER)
-//   G15: defer_promotion toggle under load (no lost promotions)
+//   striped lock hash distribution
+//   lock order checking toggle (LRU_DEBUG_LOCK_ORDER)
+//   defer_promotion toggle under load (no lost promotions)
 
 #include <gtest/gtest.h>
 
@@ -118,7 +118,7 @@ TEST(ConcurrentEdgeExtras, TtlCleanerNoGlobalStall) {
 }
 
 // ============================================================================
-// TC-G11: Striped lock hash distribution
+// Striped lock hash distribution
 // Insert many keys and verify they distribute roughly evenly across stripes.
 // ============================================================================
 TEST(ConcurrentEdgeExtras, StripedLockHashDistribution) {
@@ -147,7 +147,7 @@ TEST(ConcurrentEdgeExtras, StripedLockHashDistribution) {
         if (max_size > 0) {
             // Imbalance < 50% — for 5000 keys across 16 shards, ~312 per shard.
             // 50% is generous; hash distribution should be much tighter.
-            // P0-3: both operands of the division must be double, otherwise the
+            // both operands of the division must be double, otherwise the
             // size_t operand is converted implicitly (-Wimplicit-int-float-conversion).
             double expected =
                 static_cast<double>(kKeys) / static_cast<double>(info.num_shards);
@@ -163,7 +163,7 @@ TEST(ConcurrentEdgeExtras, StripedLockHashDistribution) {
 }
 
 // ============================================================================
-// TC-G14: Lock order checking toggle (LRU_DEBUG_LOCK_ORDER)
+// Lock order checking toggle (LRU_DEBUG_LOCK_ORDER)
 // Verify the API exists and does not crash whether or not the macro is
 // defined. When LRU_DEBUG_LOCK_ORDER is not defined, the API is a no-op.
 // ============================================================================
@@ -186,7 +186,7 @@ TEST(ConcurrentEdgeExtras, LockOrderCheckingToggle) {
 }
 
 // ============================================================================
-// TC-G15: defer_promotion toggle under load
+// defer_promotion toggle under load
 // Toggle set_defer_promotion(false) while N readers are active. All
 // previously-recorded accesses should still be promoted (no lost updates).
 // ============================================================================

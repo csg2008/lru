@@ -1,4 +1,4 @@
-// T17: Reclaim monitoring metrics tests.
+// Reclaim monitoring metrics tests.
 //
 // Validates that hazptr/EBR deferred-reclamation counters are surfaced
 // consistently across three observability surfaces:
@@ -220,7 +220,7 @@ TEST(ReclaimMetricsTest, ConcurrentChurnDoesNotCorruptCounters) {
 }
 
 // ============================================================================
-// L-1: hazptr slot-exhaustion / hard-cap fallback observability
+// hazptr slot-exhaustion / hard-cap fallback observability
 // ============================================================================
 //
 // Validates that the L-1 hard-cap fallback path (acquire_slot throws
@@ -236,7 +236,7 @@ TEST(ReclaimMetricsTest, ConcurrentChurnDoesNotCorruptCounters) {
 // would manifest as random std::runtime_error leaks from get() paths.
 
 TEST(ReclaimMetricsTest, HazptrSlotMetricsExposedViaCacheAPI) {
-    // L-1: Cache must forward hazptr_domain counters through its own API
+    // Cache must forward hazptr_domain counters through its own API
     // so callers don't need to reach into detail::hazptr_domain.
     lru::cache<int, std::string> c{256};
     // Counters are cumulative across the global hazptr domain; on a fresh
@@ -255,7 +255,7 @@ TEST(ReclaimMetricsTest, HazptrSlotMetricsExposedViaCacheAPI) {
 }
 
 TEST(ReclaimMetricsTest, DiagnosticsReportsHazptrSlotFields) {
-    // L-1: diagnostics_info must carry the three hazptr slot-exhaustion
+    // diagnostics_info must carry the three hazptr slot-exhaustion
     // fields, and diagnostics_text() must surface them so operators
     // reading an ad-hoc dump can spot an imminent hard-cap throw.
     lru::cache<int, std::string> c{256};
@@ -272,7 +272,7 @@ TEST(ReclaimMetricsTest, DiagnosticsReportsHazptrSlotFields) {
 }
 
 TEST(ReclaimMetricsTest, PrometheusExportsHazptrSlotMetrics) {
-    // L-1: prometheus_text() must export the three hazptr slot-exhaustion
+    // prometheus_text() must export the three hazptr slot-exhaustion
     // metrics so Prometheus/Grafana can alert on sustained sync-fallback
     // growth before acquire_slot() starts throwing.
     lru::cache<int, std::string> c{256};
@@ -287,7 +287,7 @@ TEST(ReclaimMetricsTest, PrometheusExportsHazptrSlotMetrics) {
 }
 
 TEST(ReclaimMetricsTest, HazptrSlotMetricsAgreeAcrossSurfaces) {
-    // L-1: All three observability surfaces must agree on the same
+    // All three observability surfaces must agree on the same
     // underlying counter value (within atomic-read drift).
     lru::safe_cache<int, std::string> c{512};
     for (int i = 0; i < 64; ++i) c.set(i, std::to_string(i));

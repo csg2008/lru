@@ -28,7 +28,7 @@ namespace lru {
 
 /// A cache entry with an optional expiration time.
 ///
-/// P2-5: The `expired` lazy-invalidaton flag has been removed. It was
+/// The `expired` lazy-invalidaton flag has been removed. It was
 /// previously stored as a `std::atomic<bool>` inside the entry and
 /// modified via `const_cast` from `peek()` / `contains()` / `get()`,
 /// which broke const-correctness. Expiry is now determined purely by
@@ -85,7 +85,7 @@ struct ttl_entry {
         return clock::now() + apply_jitter(dur, jitter_pct);
     }
 
-    /// P2-5: Pure read-only check — is this entry expired at `now`?
+    /// Pure read-only check — is this entry expired at `now`?
     /// Does not modify any state (no more lazy `expired` flag).
     bool is_expired_at(time_point now) const noexcept {
         return expiry.has_value() && now >= *expiry;
@@ -103,16 +103,18 @@ struct ttl_entry {
 /// @tparam Value    The value type.
 /// @tparam Duration The duration type for TTL (default std::chrono::seconds).
 /// @tparam Cache    The underlying cache type (default: single-threaded LRU).
-///                  可以传入 safe_cache/striped_cache 等线程安全类型。
-///                  TTL 层使用 striped_mutex<distributed_shared_mutex> 实现按 key hash
-///                  分段的共享/排他锁，不同 key 的操作可并发执行，读操作可共享并发。
+///                  May be a thread-safe type such as safe_cache / striped_cache.
+///                  The TTL layer stripes its locks by key hash with
+///                  striped_mutex<distributed_shared_mutex>, so different keys proceed
 /// @tparam Hash     The hash function type for mapping keys to mutex stripes.
 ///
 /// Lock Hierarchy (MUST be followed to prevent deadlock):
 ///
 ///   Level 1: ttl_cache::mutex_           (striped_mutex<distributed_shared_mutex>, per-key or global)
 ///   Level 2: unified_cache::mutex_       (distributed_shared_mutex, shared/exclusive)
-///   Level 3: mm_lru::update_mutex_       (std::mutex, exclusive only, try_lock)
+///   Level 3: mm_lru::update_mutex_       (detail::shared_spinlock; shared on
+///                                         the promotion path, exclusive on the
+///                                         eviction path, try_lock only)
 ///
 ///   All code paths MUST acquire locks in this order (1→2→3).
 ///   Never acquire a lower-level lock while holding a higher-level one.
@@ -144,7 +146,7 @@ public:
     using entry_cache_type = Cache;
     using hash_type = Hash;
 
-    /// 底层缓存是否线程安全——当为 true 时跳过 ttl_cache 自身独立的 mutex。
+    /// Whether the underlying cache is thread-safe. When true, ttl_cache skips
     static constexpr bool is_thread_safe = entry_cache_type::is_thread_safe;
 
     // --------------------------------------------------------------------
@@ -168,29 +170,33 @@ public:
     // Core API
     // --------------------------------------------------------------------
 
-    // TTL 层使用 striped_mutex<std::mutex> 实现按 key hash 分段的排他锁。
-    // 不同 key 的操作可并发执行，同一 key 的操作互斥保证原子性。
+    // The TTL layer uses striped_mutex<distributed_shared_mutex>: per-key
+    // stripes, so operations on different keys run concurrently. Within a
+    // stripe reads share the lock and writes take it exclusively, which is
+    // what makes the peek-then-promote recheck in get() safe. It is
+    // distributed_shared_mutex rather than std::shared_mutex because MinGW's
+    // pthread_rwlock_t returns EINVAL under mixed high-contention load.
 
-    /// 获取指定 key 对应 stripe 的独占写锁
+    /// Exclusive write lock for the stripe owning `key`.
     auto acquire_ttl_write_lock(const Key& key) const {
         auto hash = Hash{}(key);
         auto stripe = mutex_.stripe_for(hash);
         return mutex_.make_unique_lock(stripe);
     }
 
-    /// 获取指定 key 对应 stripe 的共享读锁
+    /// Shared read lock for the stripe owning `key`.
     auto acquire_ttl_read_lock(const Key& key) const {
         auto hash = Hash{}(key);
         auto stripe = mutex_.stripe_for(hash);
         return mutex_.make_shared_lock(stripe);
     }
 
-    /// 获取全局写锁（用于 clear_expired、flush 等全局操作）
+    /// Global write lock, for whole-cache operations such as clear_expired / flush.
     auto acquire_ttl_global_write_lock() const {
         return detail::striped_mutex_write_all_guard(mutex_);
     }
 
-    /// 获取全局读锁（用于 size、empty 等全局查询）
+    /// Global read lock, for whole-cache queries such as size / empty.
     auto acquire_ttl_global_read_lock() const {
         return detail::striped_mutex_read_all_guard(mutex_);
     }
@@ -200,7 +206,7 @@ public:
     /// - flush() is called to clear all data
     /// - The cache cannot be restarted
     ///
-    /// P1-A: The dedicated `ttl_reaper` class and its `register_reaper_stop`
+    /// The dedicated `ttl_reaper` class and its `register_reaper_stop`
     /// registration mechanism have been removed. Callers that need
     /// background TTL cleanup should use a `detail::periodic_worker` (or
     /// `unified_cache::start_ttl_cleaner()` when using a `unified_cache`
@@ -220,6 +226,95 @@ public:
         return stopped_.load(std::memory_order_acquire);
     }
 
+    // --------------------------------------------------------------------
+    // TTL jitter
+    // --------------------------------------------------------------------
+    //
+    // Applied once, where the expiry time_point is computed, so the value
+    // layer and the item-level TTL index always receive the SAME deadline
+    // (see insert_locked). Without jitter, keys inserted with a shared TTL
+    // (bulk prewarm, scheduled refresh) expire together and stampede the
+    // origin. unified_cache::set_with_ttl has always jittered; this class did
+    // not, so the two TTL entry points behaved differently.
+
+    /// Enable/disable +/- jitter on every TTL this cache assigns.
+    void set_ttl_jitter_enabled(bool enabled) noexcept {
+        jitter_enabled_.store(enabled, std::memory_order_relaxed);
+    }
+
+    bool ttl_jitter_enabled() const noexcept {
+        return jitter_enabled_.load(std::memory_order_relaxed);
+    }
+
+    /// Set the jitter fraction. With 0.10 the effective TTL is uniform in
+    /// [ttl * 0.9, ttl * 1.1]. Must be non-negative.
+    void set_ttl_jitter_pct(double pct) {
+        if (pct < 0.0) {
+            throw std::invalid_argument("ttl_cache: jitter pct must be non-negative");
+        }
+        jitter_pct_ = pct;
+    }
+
+    double ttl_jitter_pct() const noexcept { return jitter_pct_; }
+
+    // --------------------------------------------------------------------
+    // Max TTL and background cleaner
+    // --------------------------------------------------------------------
+
+    /// Cap every TTL this cache assigns; 0 disables the cap.
+    ///
+    /// A longer request is clamped rather than rejected, and counted in
+    /// ttl_clamped_count(), so a stray `set_with_ttl(k, v, 100y)` cannot pin an
+    /// entry effectively forever with no trace.
+    void set_max_ttl(std::chrono::nanoseconds max_ttl) noexcept {
+        max_ttl_ns_.store(
+            max_ttl.count() > 0 ? static_cast<std::uint64_t>(max_ttl.count()) : 0,
+            std::memory_order_relaxed);
+    }
+
+    /// The configured TTL cap (0 = none).
+    std::chrono::nanoseconds max_ttl() const noexcept {
+        return std::chrono::nanoseconds(max_ttl_ns_.load(std::memory_order_relaxed));
+    }
+
+    /// Number of TTLs that set_max_ttl() clamped.
+    std::size_t ttl_clamped_count() const noexcept {
+        return ttl_clamped_.load(std::memory_order_relaxed);
+    }
+
+    /// Start a background cleaner that removes expired entries every
+    /// `interval`. Forwarded to the underlying cache's round-robin cleaner,
+    /// which locks one shard at a time; a no-op for cache types without one.
+    template <typename Rep, typename Period>
+    void start_ttl_cleaner(std::chrono::duration<Rep, Period> interval) {
+        if constexpr (requires { cache_.start_ttl_cleaner(interval); }) {
+            cache_.start_ttl_cleaner(interval);
+        }
+    }
+
+    /// Stop the background cleaner (no-op if none was started).
+    void stop_ttl_cleaner() {
+        if constexpr (requires { cache_.stop_ttl_cleaner(); }) {
+            cache_.stop_ttl_cleaner();
+        }
+    }
+
+    /// Maximum number of expired entries the cleaner reaps per lock
+    /// acquisition (0 = drain everything under one lock).
+    void set_ttl_evict_batch_size(std::size_t batch) {
+        if constexpr (requires { cache_.set_ttl_evict_batch_size(std::size_t{1}); }) {
+            cache_.set_ttl_evict_batch_size(batch);
+        }
+    }
+
+    /// Whether the cleaner advances one shard per cycle (round-robin) instead
+    /// of sweeping all shards each cycle.
+    void set_ttl_cleaner_round_robin(bool round_robin) {
+        if constexpr (requires { cache_.set_ttl_cleaner_round_robin(true); }) {
+            cache_.set_ttl_cleaner_round_robin(round_robin);
+        }
+    }
+
     /// Insert a key-value pair with the default TTL.
     template <typename V>
     void set(const Key& key, V&& value) {
@@ -227,7 +322,7 @@ public:
         if (stopped_.load(std::memory_order_acquire)) return;
         insert_locked(key, std::forward<V>(value),
                       default_ttl_ != std::chrono::nanoseconds::zero()
-                          ? std::optional<time_point>(clock::now() + default_ttl_)
+                          ? std::optional<time_point>(deadline_for(default_ttl_))
                           : std::nullopt);
     }
 
@@ -239,7 +334,7 @@ public:
         if (stopped_.load(std::memory_order_acquire)) return;
         insert_locked(key, std::forward<V>(value),
                       ttl > std::chrono::duration<Rep, Period>::zero()
-                          ? std::optional<time_point>(clock::now() + ttl)
+                          ? std::optional<time_point>(deadline_for(ttl))
                           : std::nullopt);
     }
 
@@ -250,7 +345,7 @@ public:
         if (stopped_.load(std::memory_order_acquire)) return;
         insert_locked(key, std::forward<V>(value),
                       ttl > std::chrono::duration<Rep, Period>::zero()
-                          ? std::optional<time_point>(clock::now() + ttl)
+                          ? std::optional<time_point>(deadline_for(ttl))
                           : std::nullopt);
     }
 
@@ -273,11 +368,11 @@ public:
     /// Get a value by key. Returns std::nullopt if the key is not found
     /// or if the entry has expired (also removes expired entries).
     ///
-    /// 先用读锁+peek 检查是否过期，避免对已过期条目触发 hit 统计和 LRU 提升；
-    /// 未过期时再用 get 触发提升。若已过期，释放读锁后获取写锁，并在写锁下
-    /// 重新检查过期状态后删除条目（避免与并发 set 竞争误删新条目）。
+    /// Check expiry under a read lock with peek() first, so an expired entry does
+    /// not bump hit statistics or promote the LRU; only a live entry goes through
+    /// get(). If it has expired, drop the read lock, take the write lock, re-check
     ///
-    /// P2-5: No more const_cast — expiry is checked read-only via
+    /// No more const_cast — expiry is checked read-only via
     /// `ttl_entry::is_expired_at()`. The lazy `expired` flag has been
     /// removed from `ttl_entry`, so `peek()` (which returns a const
     /// reference) no longer needs to mutate any state.
@@ -297,7 +392,7 @@ public:
             if (!peek_result) return std::nullopt;
             const auto& peek_entry = *peek_result;
             expired = peek_entry.is_expired_at(clock::now());
-        }  // peek_result 析构，释放引用计数
+        }  // peek_result destructor releases the refcount.
 
         if (expired) {
             // G1 fix: lazy deletion. Release the read lock before acquiring
@@ -315,7 +410,7 @@ public:
                 if (recheck && recheck->is_expired_at(clock::now())) {
                     still_expired = true;
                 }
-            }  // recheck 析构，释放引用计数
+            }  // recheck destructor releases the refcount.
             if (still_expired) {
                 // Delete may fail (entry already removed by another thread);
                 // the result is intentionally ignored.
@@ -332,7 +427,7 @@ public:
 
     /// Peek at a value without affecting LRU order.
     ///
-    /// P2-5: Now `const` — no longer modifies any state. The previous
+    /// Now `const` — no longer modifies any state. The previous
     /// implementation used `const_cast` to lazily mark entries as
     /// expired; that flag has been removed and expiry is checked purely
     /// by comparing `expiry` against `clock::now()`.
@@ -348,7 +443,7 @@ public:
         return entry.value;
     }
 
-    /// P2-5: Now `const` — no longer modifies any state.
+    /// Now `const` — no longer modifies any state.
     bool contains(const Key& key) const {
         auto rlock = acquire_ttl_read_lock(key);
         if (stopped_.load(std::memory_order_acquire)) return false;
@@ -376,11 +471,19 @@ public:
     }
 
     /// Remove all expired entries. Returns the number removed.
-    /// Uses per-key write locks for deletion so that unrelated keys remain
-    /// accessible during cleanup. No global TTL lock is held during deletion.
+    ///
+    /// Prefers the underlying cache's item-level TTL index
+    /// (unified_cache::evict_expired_now), which sweeps each shard's ordered
+    /// expiry heap in O(log n). The per-key scan fallback visits every entry,
+    /// so on a large cache it is orders of magnitude slower — it is kept only
+    /// for cache types that have no item-level index.
     size_type clear_expired() {
         if (stopped_.load(std::memory_order_acquire)) return 0;
-        return clear_expired_locked();
+        if constexpr (requires { cache_.evict_expired_now(); }) {
+            return static_cast<size_type>(cache_.evict_expired_now());
+        } else {
+            return clear_expired_locked();
+        }
     }
 
     /// Get remaining TTL for a key. Returns std::nullopt if not found, no TTL, or expired.
@@ -469,7 +572,7 @@ public:
     // --------------------------------------------------------------------
 
     ~ttl_cache() {
-        // P1-A: No reaper stop callback — callers are responsible for
+        // No reaper stop callback — callers are responsible for
         // joining any background TTL cleaner thread before the cache is
         // destroyed (the cache itself no longer owns a reaper).
     }
@@ -526,7 +629,7 @@ private:
     /// Internal insert helper (caller must hold mutex_ and must have checked
     /// `stopped_`).
     ///
-    /// P1-31 (fix.01): the expiry is now published to BOTH layers.
+    /// the expiry is now published to BOTH layers.
     ///
     /// Before this change the TTL was written only into the value-layer
     /// `ttl_entry`, while the item's own `expiry_ns` stayed 0. The cache layer
@@ -544,6 +647,23 @@ private:
     /// `time_point` is computed and converted, and `set_with_absolute_expiry`
     /// applies no jitter of its own (unlike `set_with_ttl`, which would have
     /// randomized only the item-level copy).
+    /// Deadline for a TTL: now + ttl, with jitter applied when enabled.
+    /// The single place jitter is applied, so both TTL layers agree.
+    template <typename Rep, typename Period>
+    time_point deadline_for(std::chrono::duration<Rep, Period> ttl) const {
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ttl);
+        const auto cap = max_ttl_ns_.load(std::memory_order_relaxed);
+        if (cap != 0 && ns.count() > 0 &&
+            static_cast<std::uint64_t>(ns.count()) > cap) {
+            ttl_clamped_.fetch_add(1, std::memory_order_relaxed);
+            ns = std::chrono::nanoseconds(cap);
+        }
+        if (jitter_enabled_.load(std::memory_order_relaxed) && jitter_pct_ > 0.0) {
+            return entry_type::from_now_with_jitter(ns, jitter_pct_);
+        }
+        return clock::now() + ns;
+    }
+
     template <typename V>
     void insert_locked(const Key& key, V&& value,
                        std::optional<time_point> expiry) {
@@ -624,7 +744,7 @@ private:
     /// Collects expired keys under mm read lock, then deletes each key
     /// under its per-stripe write lock to avoid blocking unrelated stripes.
     ///
-    /// P2-5: No more `expired` lazy flag — just check `is_expired_at()`.
+    /// No more `expired` lazy flag — just check `is_expired_at()`.
     size_type clear_expired_locked() {
         std::vector<key_type> expired_keys;
         {
@@ -638,7 +758,7 @@ private:
         }
         size_type count = 0;
         for (const auto& key : expired_keys) {
-            // 逐 key 获取对应 stripe 的写锁删除
+            // Delete key by key, taking each key's stripe write lock.
             auto wlock = acquire_ttl_write_lock(key);
             // fix.01 P1-16: re-validate expiry under the write lock.
             //
@@ -677,21 +797,32 @@ private:
     /// and `default_ttl()` still report in `duration_type`, which is also the
     /// unit the rest of this class computes expiry in.
     std::chrono::nanoseconds default_ttl_{0};
+    /// TTL jitter, applied in deadline_for(). Defaults match unified_cache:
+    /// on, +/-10%.  jitter_pct_ is a plain double: set_ttl_jitter_pct is a
+    /// configuration entry point, not a hot path.
+    std::atomic<bool> jitter_enabled_{true};
+    double jitter_pct_ = 0.10;
+    /// Hard cap on any assigned TTL, in nanoseconds (0 = no cap).
+    std::atomic<std::uint64_t> max_ttl_ns_{0};
+    /// mutable: deadline_for() is const (it is called from const read paths)
+    /// but the clamp counter is logically-const statistics.
+    mutable std::atomic<std::size_t> ttl_clamped_{0};
     size_type max_size_ = unlimited;
     /// Once stopped_, all mutating operations become no-ops and get/peek/contains return early.
     std::atomic<bool> stopped_{false};
-    // TTL 层使用 striped_mutex<distributed_shared_mutex> 实现按 key hash 分段的锁，
-    // 不同 key 的操作可并发执行，同一 key 的读-读并发、读写互斥保证原子性。
-    // 使用 distributed_shared_mutex 代替 std::shared_mutex，因为 MinGW winpthreads
-    // 的 pthread_rwlock_t 在多个 rwlock 对象高争用混合共享/排他锁时
-    // 会出现 EINVAL 错误。distributed_shared_mutex 基于 CAS + WaitOnAddress/futex
-    // 实现，完全绕开了 pthread_rwlock_t 的 bug。
+    // The TTL layer stripes its locks by key hash with
+    // striped_mutex<distributed_shared_mutex>: different keys proceed concurrently,
+    // and within a key reads share while a write excludes them. It is
+    // distributed_shared_mutex rather than std::shared_mutex because MinGW's
+    // pthread_rwlock_t returns EINVAL when many rwlock objects mix shared and
+    // exclusive acquisitions under contention; it is built on CAS + WaitOnAddress.
     //
-    // 锁获取顺序（Lock Hierarchy, MUST be followed to prevent deadlock）:
+    // Lock hierarchy. MUST be followed in order to prevent deadlock:
     //   Level 1: ttl_cache::mutex_        (striped_mutex<distributed_shared_mutex>, per-key or global)
     //   Level 2: unified_cache::mutex_    (distributed_shared_mutex, shared/exclusive)
-    //   Level 3: mm_lru::update_mutex_    (std::mutex, exclusive, try_lock only)
-    //   所有代码路径必须遵循 1→2→3 的顺序获取锁，严禁反序。
+    //   Level 3: mm_lru::update_mutex_    (shared_spinlock; shared for
+    //                                      promotion, exclusive for eviction)
+    //   Every code path must acquire locks in 1 -> 2 -> 3 order, never reverse.
 private:
     using ttl_mutex_type = detail::striped_mutex<detail::distributed_shared_mutex>;
     mutable ttl_mutex_type mutex_;
@@ -707,14 +838,21 @@ private:
 // significant complexity to `ttl_cache` (a `std::function<void()>` member
 // plus extra locking in `stop()` / `~ttl_cache()`).
 //
-// `ttl_cache::clear_expired()` itself no longer holds any global TTL lock —
-// it collects expired keys under the MM read lock and deletes each key
-// under its own per-stripe write lock — so any external periodic worker
-// is safe to call it concurrently with normal cache operations.
+// `ttl_cache::clear_expired()` itself holds no global TTL lock — it forwards
+// to the underlying cache's item-level expiry index, which sweeps one shard at
+// a time — so any external periodic worker is safe to call it concurrently with
+// normal cache operations.
 //
 // Callers that need background TTL cleanup should use one of:
 //
-//   1. `detail::periodic_worker` directly with a `ttl_cache`:
+//   1. `ttl_cache::start_ttl_cleaner(interval)`, forwarded to the underlying
+//      cache's round-robin cleaner (one shard per cycle). This works for any
+//      `ttl_cache` whose underlying cache exposes a cleaner — `unified_cache`
+//      does. `ttl_cache::clear_expired()` also uses that same index, so the
+//      two never disagree.
+//
+//   2. `detail::periodic_worker` directly, for a cache type with no native
+//      cleaner:
 //
 //        lru::ttl_cache<int, std::string> cache(5s, 1000);
 //        lru::detail::periodic_worker reaper(
@@ -723,10 +861,8 @@ private:
 //      // `reaper` joins its thread on destruction; ensure it is destroyed
 //      // before `cache`.
 //
-//   2. `unified_cache::start_ttl_cleaner()` when using a `unified_cache`
-//      directly (the underlying MM's native TTL support is invoked; this
-//      does not work for `ttl_cache` since the TTL lives in the entry
-//      value, not the MM).
+//   3. `unified_cache::start_ttl_cleaner()` when using a `unified_cache`
+//      directly.
 
 } // namespace lru
 

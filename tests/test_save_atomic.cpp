@@ -1,4 +1,4 @@
-// P2-3: save_atomic — strictly-atomic cross-shard snapshot tests.
+// save_atomic — strictly-atomic cross-shard snapshot tests.
 //
 // Validates that save_atomic():
 //   - Produces a binary payload loadable via load_per_shard().
@@ -33,7 +33,7 @@ TEST(SaveAtomicTest, RoundTripsAllShards) {
     // save_atomic drains handles, shuts down, then snapshots.
     auto data = c.save_atomic(5s);
     EXPECT_FALSE(data.empty());
-    // P1-40 (fix.01 方案 A): save_atomic() QUIESCES the cache for the duration of
+    // save_atomic() QUIESCES the cache for the duration of
     // the snapshot and RESUMES it afterwards — it no longer shuts the cache down.
     // The previous assertion here (`is_shutdown() == true`) pinned exactly the
     // behaviour that let one backup job take the cache out of service until the
@@ -59,7 +59,7 @@ TEST(SaveAtomicTest, EmptyCacheRoundTrip) {
     striped_cache<int, std::string> c(256, 4);
     auto data = c.save_atomic(5s);
     EXPECT_FALSE(data.empty());
-    // P1-40 (fix.01 方案 A): save_atomic() QUIESCES the cache for the duration of
+    // save_atomic() QUIESCES the cache for the duration of
     // the snapshot and RESUMES it afterwards — it no longer shuts the cache down.
     // The previous assertion here (`is_shutdown() == true`) pinned exactly the
     // behaviour that let one backup job take the cache out of service until the
@@ -73,7 +73,7 @@ TEST(SaveAtomicTest, EmptyCacheRoundTrip) {
 }
 
 // ============================================================================
-// P1-40 (fix.01 方案 A): saving must NOT take the source cache out of service
+// Saving must NOT take the source cache out of service
 // ============================================================================
 TEST(SaveAtomicTest, LeavesSourceUsable) {
     striped_cache<int, int> c(256, 4);
@@ -128,7 +128,7 @@ TEST(SaveAtomicTest, ThrowsOnHandleDrainTimeout) {
 
     // 50ms timeout is far shorter than the holder will keep the handle.
     EXPECT_THROW(c.save_atomic(50ms), std::runtime_error);
-    // P1-40 (fix.01 方案 A): save_atomic() QUIESCES the cache for the duration of
+    // save_atomic() QUIESCES the cache for the duration of
     // the snapshot and RESUMES it afterwards — it no longer shuts the cache down.
     // The previous assertion here (`is_shutdown() == true`) pinned exactly the
     // behaviour that let one backup job take the cache out of service until the
@@ -176,7 +176,7 @@ TEST(SaveAtomicTest, ProductionCacheAlias) {
 
     auto data = c.save_atomic(5s);
     EXPECT_FALSE(data.empty());
-    // P1-40 (fix.01 方案 A): save_atomic() QUIESCES the cache for the duration of
+    // save_atomic() QUIESCES the cache for the duration of
     // the snapshot and RESUMES it afterwards — it no longer shuts the cache down.
     // The previous assertion here (`is_shutdown() == true`) pinned exactly the
     // behaviour that let one backup job take the cache out of service until the

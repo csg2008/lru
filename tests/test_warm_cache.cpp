@@ -144,19 +144,27 @@ TEST(WarmCacheDeltaTest, LoadWithDeltaRestoresState) {
     warm_cache_manager<safe_cache<int, std::string>> restore_mgr(restored_ptr);
     EXPECT_TRUE(restore_mgr.load_with_delta(kTestSnapshotBase));
 
+    // load_with_delta() reconstructs into a staged cache and publishes it with
+    // one atomic swap, so callers must re-acquire the live cache from the
+    // manager — the pointer they passed to the constructor is superseded.
+    // (The previous implementation loaded in place, which is what made the
+    // original handle keep working; it also flushed the live cache for the
+    // whole load and could not roll back a partial failure.)
+    auto live = restore_mgr.get_cache();
+
     // Verify final state — peek() returns read_handle<const V> (truthy if hit)
-    auto h1 = restored_ptr->peek(1);
+    auto h1 = live->peek(1);
     ASSERT_TRUE(h1.has_value());
     EXPECT_EQ(*h1, "one");
 
-    auto h2 = restored_ptr->peek(2);
+    auto h2 = live->peek(2);
     ASSERT_TRUE(h2.has_value());
     EXPECT_EQ(*h2, "TWO");
 
-    auto h3 = restored_ptr->peek(3);
+    auto h3 = live->peek(3);
     EXPECT_FALSE(h3.has_value());
 
-    auto h4 = restored_ptr->peek(4);
+    auto h4 = live->peek(4);
     ASSERT_TRUE(h4.has_value());
     EXPECT_EQ(*h4, "four");
 
@@ -176,7 +184,9 @@ TEST(WarmCacheDeltaTest, LoadWithDeltaOnlyFullNoDelta) {
     auto restored_ptr = std::make_shared<safe_cache<int, std::string>>(64);
     warm_cache_manager<safe_cache<int, std::string>> restore_mgr(restored_ptr);
     EXPECT_TRUE(restore_mgr.load_with_delta(kTestSnapshotBase));
-    EXPECT_EQ(restored_ptr->size(), 2u);
+    // See LoadWithDeltaRestoresState: the live cache is the one the manager
+    // published, not the pointer the manager was constructed with.
+    EXPECT_EQ(restore_mgr.get_cache()->size(), 2u);
 
     remove_snapshot_files(kTestSnapshotBase);
 }

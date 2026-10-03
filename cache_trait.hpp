@@ -38,20 +38,20 @@
 
 namespace lru {
 
-// T15: Forward declaration so cache_trait can reference compressed_intrusive_hook
+// Forward declaration so cache_trait can reference compressed_intrusive_hook
 // in its uses_compressed_hook constexpr without requiring compressed_ptr.hpp
 // to be included. Complete type is only needed when the trait is actually
 // instantiated with Hook = compressed_intrusive_hook.
 struct compressed_intrusive_hook;
 
-// T-G1: Forward declaration of ttl_entry (defined in ttl.hpp, which includes
+// Forward declaration of ttl_entry (defined in ttl.hpp, which includes
 // cache_trait.hpp — so we cannot include ttl.hpp here). The complete type is
 // only needed when value_type is ttl_entry<V> AND evict_expired_impl() is
 // instantiated, which happens in user code after both headers are included.
 template <typename Value>
 struct ttl_entry;
 
-// T-G1: Type trait detecting whether V is a ttl_entry<...>. Used by
+// Type trait detecting whether V is a ttl_entry<...>. Used by
 // evict_expired_impl() to decide whether to fall back to value-layer TTL
 // scanning when the MM does not support native TTL (e.g. mm_lru without
 // ttl_heap_, mm_2q, mm_fifo). The partial specialization below matches
@@ -66,7 +66,7 @@ struct is_ttl_entry<ttl_entry<U>> : std::true_type {};
 template <typename V>
 inline constexpr bool is_ttl_entry_v = is_ttl_entry<V>::value;
 
-// T14: Forward declaration of compact_cache so unified_cache's
+// Forward declaration of compact_cache so unified_cache's
 // compact_storage_helper<true> specialization can reference it. The
 // complete type is only needed when is_compact=true and an actual
 // compact_cache member is instantiated (which happens only in user code
@@ -141,14 +141,14 @@ struct single_threaded_policy {
 
     static constexpr bool is_thread_safe = false;
     static constexpr bool is_striped = false;
-    // P0-1: every lock policy declares a default stripe count so that
+    // every lock policy declares a default stripe count so that
     // unified_cache can initialise its striped-mutex storage uniformly and
     // directly (no factory + no reliance on copy elision). 0 == "not striped".
     static constexpr std::size_t default_num_stripes = 0;
 };
 
 /// Thread-safe lock policy using distributed_shared_mutex.
-/// 读操作获取共享锁（允许多个读者并发），写操作获取独占锁。
+/// Reads take the lock shared (concurrent readers); writes take it exclusively.
 ///
 /// Uses detail::distributed_shared_mutex instead of std::shared_mutex because
 /// MinGW's winpthreads pthread_rwlock_t has a concurrency bug where
@@ -164,7 +164,7 @@ struct thread_safe_policy {
 
     static constexpr bool is_thread_safe = true;
     static constexpr bool is_striped = false;
-    // P0-1: see single_threaded_policy::default_num_stripes.
+    // see single_threaded_policy::default_num_stripes.
     static constexpr std::size_t default_num_stripes = 0;
 };
 
@@ -181,7 +181,7 @@ struct thread_safe_policy {
 template <std::size_t NumStripes = 64>
 struct striped_thread_safe_policy {
     using mutex_type = detail::distributed_shared_mutex;
-    // T-P3-5: Use lazy_striped_mutex instead of striped_mutex. This defers
+    // Use lazy_striped_mutex instead of striped_mutex. This defers
     // allocation of the per-stripe distributed_shared_mutex objects until the
     // first global operation (clear, flush, snapshot, etc.) that actually
     // needs them. For sharded_mm_lru caches (which have per-shard locks),
@@ -205,7 +205,7 @@ template <typename Policy>
 inline constexpr bool is_striped_policy_v = Policy::is_striped;
 
 // ============================================================================
-// P2-3 (T3.4): Type trait — check if an MM type provides per-shard locks
+// Type trait — check if an MM type provides per-shard locks
 // (e.g. sharded_mm_lru). When true, unified_cache delegates lock
 // acquisition to `mm_.acquire_shard_*_lock(shard_idx)` instead of
 // `striped_mutex_`, decoupling `num_shards` from `num_stripes`.
@@ -249,7 +249,7 @@ struct cache_trait {
     using probing_style = ProbingStyle;
     static constexpr bool segmented = Segmented;
 
-    /// T15.1: The intrusive hook type. When `compressed_intrusive_hook`,
+    /// The intrusive hook type. When `compressed_intrusive_hook`,
     /// callers can pair this trait with a `compressed_region` allocator
     /// to reduce per-item hook overhead from 16 to 8 bytes.
     using hook_type = Hook;
@@ -261,7 +261,7 @@ struct cache_trait {
     /// regular aliases (cache, safe_cache) keep the default (false).
     static constexpr bool auto_start_drain = false;
 
-    /// P1-4: When true, init_production_features() auto-starts the
+    /// When true, init_production_features() auto-starts the
     /// metrics cache worker (1s default interval) so stats_snapshot()
     /// and prometheus_text() return cached values instead of rebuilding
     /// on every scrape. Production aliases (production_cache,
@@ -274,13 +274,13 @@ struct cache_trait {
     /// setting auto_start_metrics_cache = true.
     static constexpr bool auto_start_metrics_cache = false;
 
-    /// T11.1: When true, unified_cache auto-enables incremental rehash
+    /// When true, unified_cache auto-enables incremental rehash
     /// in the constructor. Segmented/production aliases set this to true
     /// to avoid blocking all writers during hash table expansion. F14
     /// probing mode also supports incremental rehash (dual-array lookup).
     static constexpr bool auto_incremental_rehash = false;
 
-    /// P0-5: When true, unified_cache auto-starts the background rehash
+    /// When true, unified_cache auto-starts the background rehash
     /// balancer in the constructor. The balancer periodically sweeps all
     /// segments (segmented hash table only) and advances rehash state
     /// for segments that aren't on the current write hot path. This
@@ -289,7 +289,7 @@ struct cache_trait {
     /// (production_*, segmented_*, read_heavy_*) set this to true.
     static constexpr bool auto_start_rehash_balancer = false;
 
-    /// T-P1-1 (R-1): The default fairness mode applied by
+    /// The default fairness mode applied by
     /// init_production_features() when the trait is thread-safe.
     ///   - reader_preferred: max read throughput, may starve writers under
     ///     sustained read load. Recommended for read-heavy-write-light
@@ -303,7 +303,7 @@ struct cache_trait {
     static constexpr detail::fairness_mode default_fairness =
         detail::fairness_mode::writer_fair;
 
-    /// T-P1-2 (R-2): When true, init_production_features() applies
+    /// When true, init_production_features() applies
     /// Trait::default_fairness to the underlying mutex(es). The base
     /// trait leaves this false so direct unified_cache<cache_trait<...>>
     /// instantiations preserve the lock's intrinsic default. Aliases
@@ -311,7 +311,7 @@ struct cache_trait {
     /// production_cache, read_heavy_*) set this to true.
     static constexpr bool apply_default_fairness = false;
 
-    /// R-3 (read-heavy trait unification): When true,
+    /// When true,
     /// init_production_features() enables defer_promotion on the
     /// underlying MM config after construction. This eliminates the
     /// historical split where `read_heavy_cache` (alias) and
@@ -321,7 +321,7 @@ struct cache_trait {
     /// on other MM types it is a SFINAE-guarded no-op.
     static constexpr bool auto_defer_promotion = false;
 
-    /// R-3 (read-heavy trait unification): When true,
+    /// When true,
     /// init_production_features() calls
     /// `set_ebr_domain(&detail::epoch_domain::default_domain())` to
     /// switch the read path from hazptr-based reclamation to EBR.
@@ -332,7 +332,7 @@ struct cache_trait {
     /// mm_wtiny_lfu / mm_fifo) it is a guarded no-op.
     static constexpr bool auto_enable_ebr = false;
 
-    /// T-G2: When true, init_production_features() sets a default memory
+    /// When true, init_production_features() sets a default memory
     /// limit of `default_max_memory_bytes` on the memory monitor. This
     /// prevents unbounded memory growth in production when the user forgets
     /// to call set_memory_monitor() / set_max_memory() explicitly. The
@@ -340,14 +340,14 @@ struct cache_trait {
     /// Production aliases set this to true; low-level aliases keep false.
     static constexpr bool auto_set_default_memory_limit = false;
 
-    /// T-G2: The default memory limit (bytes) applied when
+    /// The default memory limit (bytes) applied when
     /// auto_set_default_memory_limit is true. 1 GiB is a conservative
     /// default that protects against runaway growth without cramping
     /// typical workloads. Operators should tune via set_max_memory().
     static constexpr std::size_t default_max_memory_bytes =
         static_cast<std::size_t>(1) << 30;  // 1 GiB
 
-    /// T-G3: When true, init_production_features() enables singleflight
+    /// When true, init_production_features() enables singleflight
     /// coalescing for get_or_fetch() / try_get_or_fetch(). Concurrent
     /// misses for the same key are coalesced — only the leader calls the
     /// provider; followers block on the leader's result. This prevents
@@ -355,7 +355,7 @@ struct cache_trait {
     /// high concurrency. Production / read-heavy aliases set this to true.
     static constexpr bool auto_enable_singleflight = false;
 
-    /// T-G16: When true, init_production_features() enables the slab
+    /// When true, init_production_features() enables the slab
     /// allocator for item allocation. The slab allocator reduces allocation
     /// overhead and memory fragmentation for caches with many small items
     /// (10M+ items) by maintaining per-size-class free lists (lock-free
@@ -371,7 +371,7 @@ struct cache_trait {
     /// Use `production_cache_with_slab` alias to opt in.
     static constexpr bool auto_enable_slab = false;
 
-    /// T14.1: When true, unified_cache delegates storage operations to an
+    /// When true, unified_cache delegates storage operations to an
     /// embedded compact_cache (which uses compact_slot_allocator for
     /// dense fixed-size slot storage). This achieves 50-70% memory savings
     /// for small items (sizeof(K)+sizeof(V) <= 64) by eliminating per-item
@@ -397,7 +397,7 @@ struct cache_trait {
 template <typename LockPolicy = single_threaded_policy>
 using lru_trait = cache_trait<mm_lru, LockPolicy>;
 
-/// T15.2: Compressed LRU trait — uses compressed_intrusive_hook for ~33%
+/// Compressed LRU trait — uses compressed_intrusive_hook for ~33%
 /// per-item hook memory savings (16B → 8B). The trait exposes
 /// `uses_compressed_hook` so downstream code (allocators, diagnostics)
 /// can detect the intended hook type.
@@ -412,7 +412,7 @@ using compressed_lru_trait = cache_trait<mm_lru, LockPolicy,
                                          detail::chain_probing_tag, false,
                                          compressed_intrusive_hook>;
 
-/// T15.2: Compressed sharded LRU trait — pairs compressed_intrusive_hook with
+/// Compressed sharded LRU trait — pairs compressed_intrusive_hook with
 /// sharded_mm_lru so the result is compatible with striped_thread_safe_policy.
 /// (striped_thread_safe_policy requires sharded_mm_lru; plain mm_lru lacks
 /// shard_for/shard/num_shards and cannot be used with striped locking.)
@@ -422,7 +422,7 @@ using compressed_sharded_lru_trait = cache_trait<sharded_mm_lru, LockPolicy,
                                                   compressed_intrusive_hook>;
 
 // ============================================================================
-// T14.1/T14.2: Compact unified LRU traits
+// Compact unified LRU traits
 // ============================================================================
 //
 // These traits set `is_compact = true` on cache_trait. When unified_cache
@@ -469,7 +469,7 @@ template <typename LockPolicy = single_threaded_policy>
 using sharded_lru_trait = cache_trait<sharded_mm_lru, LockPolicy>;
 
 // ============================================================================
-// T-P3: Production-safe traits for safe_cache / striped_cache aliases
+// Production-safe traits for safe_cache / striped_cache aliases
 // ============================================================================
 //
 // Historically the `safe_cache` and `striped_cache` type aliases kept the
@@ -488,7 +488,7 @@ using sharded_lru_trait = cache_trait<sharded_mm_lru, LockPolicy>;
 //   - apply_default_fairness  = true
 //   - default_fairness        = reader_preferred (max read throughput)
 //
-// R-1: The redundant `make_safe_cache` / `make_striped_cache` factory
+// The redundant `make_safe_cache` / `make_striped_cache` factory
 // functions have been removed from lru.hpp — direct construction
 // (`safe_cache<K,V>(n)` / `striped_cache<K,V>(n)`) is now the only way
 // to obtain these caches and produces the same behavior.
@@ -520,7 +520,7 @@ struct safe_sharded_lru_trait : cache_trait<sharded_mm_lru, LockPolicy> {
 };
 
 // ============================================================================
-// R-3: Read-heavy traits — unify alias and factory behavior
+// Read-heavy traits — unify alias and factory behavior
 // ============================================================================
 //
 // Historically `read_heavy_cache` / `read_heavy_striped_cache` /
@@ -554,12 +554,12 @@ struct read_heavy_lru_trait : cache_trait<mm_lru, LockPolicy> {
     // is safe.
     static constexpr bool auto_defer_promotion = true;
     static constexpr bool auto_enable_ebr = true;
-    // P1-4: read-heavy aliases are production-oriented — auto-enable
+    // read-heavy aliases are production-oriented — auto-enable
     // metrics cache to avoid O(N) stats rebuilds under high scrape rates.
     static constexpr bool auto_start_metrics_cache = true;
-    // T-G2: production safety — enforce default memory limit.
+    // production safety — enforce default memory limit.
     static constexpr bool auto_set_default_memory_limit = true;
-    // T-G3: production safety — auto-enable singleflight.
+    // production safety — auto-enable singleflight.
     static constexpr bool auto_enable_singleflight = true;
 };
 
@@ -574,9 +574,9 @@ struct read_heavy_sharded_lru_trait : cache_trait<sharded_mm_lru, LockPolicy> {
     static constexpr bool auto_defer_promotion = true;
     static constexpr bool auto_enable_ebr = true;
     static constexpr bool auto_start_metrics_cache = true;
-    // T-G2: production safety — enforce default memory limit.
+    // production safety — enforce default memory limit.
     static constexpr bool auto_set_default_memory_limit = true;
-    // T-G3: production safety — auto-enable singleflight.
+    // production safety — auto-enable singleflight.
     static constexpr bool auto_enable_singleflight = true;
 };
 
@@ -605,7 +605,7 @@ template <typename LockPolicy = single_threaded_policy>
 struct segmented_lru_trait : cache_trait<mm_lru, LockPolicy, detail::chain_probing_tag, true> {
     static constexpr bool auto_incremental_rehash = true;
     static constexpr bool auto_start_rehash_balancer = true;
-    // P1-4: production-oriented — auto-enable metrics cache (only spawns
+    // production-oriented — auto-enable metrics cache (only spawns
     // worker under thread-safe policy; see init_production_features).
     static constexpr bool auto_start_metrics_cache = true;
 };
@@ -661,7 +661,7 @@ struct segmented_sharded_lru_trait : cache_trait<sharded_mm_lru, LockPolicy, det
 ///   - apply_default_fairness + default_fairness=reader_preferred (T-P1-1 / R-1):
 ///     production_cache defaults to reader_preferred for read-heavy workloads.
 ///
-/// R2: EmbeddedChain enforcement. The underlying MM strategy's hash table
+/// EmbeddedChain enforcement. The underlying MM strategy's hash table
 /// is statically asserted to use EmbeddedChain=true (see mm.hpp
 /// static_assert). Non-EmbeddedChain mode degrades lock-free reads to
 /// shared_lock fallback, killing read throughput under high concurrency.
@@ -680,25 +680,25 @@ struct production_sharded_lru_trait : segmented_sharded_lru_trait<LockPolicy> {
     static constexpr bool auto_incremental_rehash = true;
     static constexpr bool auto_start_rehash_balancer = true;
 
-    // T-P1-1 (R-1): production_cache defaults to reader_preferred.
+    // production_cache defaults to reader_preferred.
     static constexpr detail::fairness_mode default_fairness =
         detail::fairness_mode::reader_preferred;
     static constexpr bool apply_default_fairness = true;
 
-    // R2: Compile-time verification that EmbeddedChain is enforced.
+    // Compile-time verification that EmbeddedChain is enforced.
     // The actual assertion lives in mm_lru's map_type static_assert.
     // This constant documents the requirement at the trait level.
     static constexpr bool requires_embedded_chain = true;
 
-    // T-G7: production-oriented — auto-enable metrics cache. Without this,
+    // production-oriented — auto-enable metrics cache. Without this,
     // high-frequency Prometheus scraping (every 10-15s) rebuilds stats on
     // every call, becoming a CPU hotspot. Aligns with f14_production_cache.
     static constexpr bool auto_start_metrics_cache = true;
 
-    // T-G2: production safety — enforce a default memory limit so the cache
+    // production safety — enforce a default memory limit so the cache
     // cannot cause OOM if the operator forgets to call set_max_memory().
     static constexpr bool auto_set_default_memory_limit = true;
-    // T-G3: production safety — auto-enable singleflight to prevent
+    // production safety — auto-enable singleflight to prevent
     // cache-stampede / thundering-herd on hot key expiry.
     static constexpr bool auto_enable_singleflight = true;
 };
@@ -717,15 +717,15 @@ struct f14_production_sharded_lru_trait
         detail::fairness_mode::reader_preferred;
     static constexpr bool apply_default_fairness = true;
     static constexpr bool requires_embedded_chain = true;
-    // P1-4: production-oriented — auto-enable metrics cache.
+    // production-oriented — auto-enable metrics cache.
     static constexpr bool auto_start_metrics_cache = true;
-    // T-G2: production safety — enforce default memory limit.
+    // production safety — enforce default memory limit.
     static constexpr bool auto_set_default_memory_limit = true;
-    // T-G3: production safety — auto-enable singleflight.
+    // production safety — auto-enable singleflight.
     static constexpr bool auto_enable_singleflight = true;
 };
 
-/// T-G16: Production trait with slab allocator enabled. Inherits all
+/// Production trait with slab allocator enabled. Inherits all
 /// production_cache optimizations (segmented hash table, EBR, incremental
 /// rehash, reader_preferred fairness, singleflight, default memory limit)
 /// and additionally enables the slab allocator for item allocation. Use
@@ -800,7 +800,7 @@ inline constexpr bool has_peek_v = has_peek<MmType, Key>::value;
 // no locks, no allocation. Quality is sufficient for jitter; do not reuse
 // for cryptographic purposes. jitter_pct <= 0 returns dur unchanged.
 //
-// P0-6 (fix.01): the result is ALWAYS nanoseconds, regardless of the input
+// the result is ALWAYS nanoseconds, regardless of the input
 // duration's period. The previous signature returned the caller's duration
 // type, so a `std::chrono::seconds` TTL of 1s jittered to 0.9s truncated to
 // 0s (immediate expiry) ~50% of the time. Returning nanoseconds makes the
@@ -841,7 +841,7 @@ public:
         }
     }
 
-    /// O2: Extended constructor — also writes the measured latency (ns)
+    /// Extended constructor — also writes the measured latency (ns)
     /// to `*out_latency_ns` on destruction. Pass a non-null pointer to
     /// capture the latency for slow-query threshold checking. The output
     /// variable must outlive the timer (typically a stack variable in
@@ -861,7 +861,7 @@ public:
             auto ns = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_).count());
             hist_->record(ns);
-            // O2: write the measured latency to the caller's variable so
+            // write the measured latency to the caller's variable so
             // they can check the slow-query threshold after we destruct.
             // No atomicity needed — same-thread sequenced-before relationship.
             if (out_latency_ns_) {
@@ -886,7 +886,7 @@ private:
 } // namespace detail
 
 // ============================================================================
-// O2: slow_query_notifier — RAII helper that invokes the cache's slow-query
+// slow_query_notifier — RAII helper that invokes the cache's slow-query
 // callback on scope exit. Declared BEFORE scope_latency_timer so it destructs
 // AFTER the timer (destruction is reverse of construction), allowing it to
 // read the latency value written by the timer's destructor.
@@ -913,7 +913,7 @@ private:
 };
 
 // ============================================================================
-// O1: trace_notifier — RAII helper that invokes the cache's trace callback
+// trace_notifier — RAII helper that invokes the cache's trace callback
 // on scope exit. Declared BEFORE scope_latency_timer (and before
 // slow_query_notifier) so it destructs AFTER both, allowing it to read:
 //   - the latency value written by ~scope_latency_timer
@@ -990,7 +990,7 @@ public:
     using mapped_type = Value;
     using value_type = mapped_type;
     using size_type = std::size_t;
-    /// T16: Expose the hash function type so callers can compute
+    /// Expose the hash function type so callers can compute
     /// pre-hashed keys for use with get_prehashed / set_prehashed / etc.
     using hash_type = Hash;
     using key_equal_type = KeyEqual;
@@ -1002,16 +1002,16 @@ public:
     using miss_callback_type = typename callback_mgr::miss_callback_type;
     using insert_callback_type = typename callback_mgr::insert_callback_type;
     using evict_callback_type = typename callback_mgr::eviction_callback_type;
-    /// O7: New event callback types exposed for user registration.
+    /// New event callback types exposed for user registration.
     using update_callback_type = typename callback_mgr::update_callback_type;
     using expire_callback_type = typename callback_mgr::expire_callback_type;
     using reject_callback_type = typename callback_mgr::reject_callback_type;
-    /// O6: Error hook type and event-kind enum exposed for users to
+    /// Error hook type and event-kind enum exposed for users to
     /// register observation/alerting logic when callbacks throw.
     using callback_event_kind = typename callback_mgr::callback_event_kind;
     using error_callback_type = typename callback_mgr::error_callback_type;
 
-    /// O2: Slow query callback — invoked when get()/set() exceeds the
+    /// Slow query callback — invoked when get()/set() exceeds the
     /// configured slow_query_threshold. The callback receives the
     /// operation kind ("get" / "set"), the key, and the measured
     /// latency in nanoseconds. Use this to log tail-latency events
@@ -1023,7 +1023,7 @@ public:
     using slow_query_callback_type = std::function<void(
         slow_op_kind kind, const Key& key, std::uint64_t latency_ns)>;
 
-    /// O1: Trace callback — invoked at the end of get()/set() with the
+    /// Trace callback — invoked at the end of get()/set() with the
     /// operation kind, key, measured latency, and hit/error status. This
     /// is the integration point for distributed tracing systems
     /// (OpenTelemetry, Jaeger, Zipkin, etc.).
@@ -1048,7 +1048,8 @@ public:
         trace_op_kind op, const Key& key, std::uint64_t latency_ns,
         bool hit, bool error)>;
 
-    // B16: 结构化 RemoveRes 枚举（对齐 CacheLib CacheAllocator.h:708-711）
+    // Structured remove result, mirroring CacheLib's RemoveRes
+    // (CacheAllocator.h:718-721: kSuccess / kNotFoundInRam).
     enum class RemoveRes { kSuccess, kNotFound };
 
     /// CAS policy controlling how the predicate is evaluated.
@@ -1059,7 +1060,7 @@ public:
         kLockfreePredicate
     };
 
-    /// P-HIGH-2 (T-H1): OOM event descriptor returned by
+    /// OOM event descriptor returned by
     /// check_memory_pressure(). Carries the snapshot of memory usage at
     /// the moment the cache entered critical mode. The event is produced
     /// inside the write lock but the handler is invoked *outside* the
@@ -1088,7 +1089,7 @@ private:
     >;
 
     /// Striped mutex storage. Only present for striped policies.
-    /// P0-1 (fix.01 方案 C): the non-striped branch is detail::no_striped_mutex
+    /// the non-striped branch is detail::no_striped_mutex
     /// rather than std::tuple<>, so that this member can be *directly*
     /// initialised from a stripe count in every constructor. That removes the
     /// static factory whose returned prvalue of the member type required
@@ -1113,14 +1114,14 @@ public:
     }
 
     ~unified_cache() {
-        // P1-33 (fix.01 方案 A): tell every outstanding read_handle that this
+        // tell every outstanding read_handle that this
         // cache's own state (per_cache_stats_) is about to go away, BEFORE any
         // teardown below. The notifier is process-lifetime, so handles may still
         // dereference it safely; they will simply stop touching cache-owned
         // state. Without this, a handle released after the bounded 5 s wait below
         // (which prints CRITICAL and proceeds anyway) wrote into freed memory.
         active_handle_notifier_->cache_alive.store(false, std::memory_order_release);
-        // P1-4: One-time hint for high-frequency scrapers that did not
+        // One-time hint for high-frequency scrapers that did not
         // enable metrics cache. If stats_snapshot() was called more than
         // 10 times and the metrics cache worker is not running, the user
         // is likely paying O(N) per scrape unnecessarily. Emit a single
@@ -1182,7 +1183,7 @@ public:
                     static_cast<std::size_t>(active_handle_count()));
                 std::fflush(stderr);
             }
-            // P-CRIT-1 (T-C1): Defensive belt-and-suspenders — in case
+            // Defensive belt-and-suspenders — in case
             // shutdown() was never called by the user (cache went out of
             // scope directly), ensure the rehash balancer is joined before
             // mm_ is destroyed. shutdown() already calls this, but it is
@@ -1190,7 +1191,7 @@ public:
             // If shutdown() ran, this is a no-op; if shutdown() threw or
             // the user bypassed it, this still prevents UAF.
             stop_background_rehash_balancer();
-            // T14.1: Compact path — compact_cache's destructor handles its
+            // Compact path — compact_cache's destructor handles its
             // own teardown (slot destruction). Skip the mm_-specific drains.
             if constexpr (Trait::is_compact) {
                 stop_ttl_cleaner();
@@ -1232,7 +1233,7 @@ public:
             // 5. Drain all registered TLS callback rings for cleanup
             tls_callback_ring<Key, Value>::flush_all_registered();
 
-            // P1-12: Final drain of the event tracker's TLS ring so all
+            // Final drain of the event tracker's TLS ring so all
             // events recorded by the callback dispatch above are captured
             // before destruction. If the user holds a shared_ptr to the
             // tracker, they can still query the full event history after
@@ -1257,7 +1258,7 @@ public:
                 dom.try_reclaim();
             });
 
-            // T4.3: Debug-only assertion that no handles are outstanding.
+            // Debug-only assertion that no handles are outstanding.
             // In release builds without tracking, this is a no-op; in
             // debug builds (or when tracking has been force-enabled), a
             // non-zero active handle count indicates a leak that would
@@ -1268,7 +1269,7 @@ public:
                        "use shutdown_and_wait() / force_wait_handles() first");
             }
         } catch (...) {
-            // G23: Swallowing all exceptions silently hides teardown failures.
+            // Swallowing all exceptions silently hides teardown failures.
             // At minimum, log to stderr so operators can diagnose issues.
             std::fprintf(stderr,
                 "[lru] WARNING (G23): exception caught during unified_cache "
@@ -1303,7 +1304,7 @@ public:
         init_production_features();
     }
 
-    /// P1-30 (fix.01 方案 A): striped constructor with an explicit
+    /// striped constructor with an explicit
     /// capacity-amplification opt-in.
     ///
     /// Default is strict: `max_size < num_shards` throws
@@ -1321,7 +1322,7 @@ public:
         init_production_features();
     }
 
-    /// P2-3 (T3.4): Three-argument constructor for striped caches that
+    /// Three-argument constructor for striped caches that
     /// decouples `num_shards` (LRU granularity, memory cost) from
     /// `num_stripes` (legacy stripe-lock count). Only meaningful when
     /// the MM type provides per-shard locks (e.g. sharded_mm_lru); for
@@ -1407,7 +1408,7 @@ public:
     // --------------------------------------------------------------------
 
 private:
-    // P0-1 (fix.01 方案 C): the former make_default_striped_mutex() /
+    // the former make_default_striped_mutex() /
     // make_striped_mutex() static factories have been removed. They returned a
     // prvalue of `striped_mutex_storage` (the member type) into a
     // [[no_unique_address]] member initialiser, which requires guaranteed copy
@@ -1423,7 +1424,7 @@ private:
 
     /// Build a sharded_mm_lru_config with num_shards = num_stripes.
     ///
-    /// P2-3 (T3.4): When the MM provides per-shard locks
+    /// When the MM provides per-shard locks
     /// (`has_per_shard_lock_v<mm_type>` is true), `num_shards` can be
     /// set independently of `num_stripes`. The two-arg overload defaults
     /// `num_shards = num_stripes` for backwards compatibility; the
@@ -1433,7 +1434,7 @@ private:
         return make_sharded_config_for_stripes(num_stripes, num_stripes, max_size);
     }
 
-    /// P1-30: minimum slots per shard for an auto-derived layout. See
+    /// minimum slots per shard for an auto-derived layout. See
     /// shards_for_capacity(). A quota of 1 makes a sharded cache unable to hold
     /// two colliding keys, so it silently under-delivers the capacity it
     /// reports; the auto-derived layout keeps at least this many slots per
@@ -1441,7 +1442,7 @@ private:
     /// upper bound.
     static constexpr size_type kMinItemsPerShard = 2;
 
-    /// P1-30 (方案 B, the "auto-shrink" complement to 方案 A): how many shards /
+    /// how many shards /
     /// stripes to use for a requested capacity.
     ///
     /// A sharded cache cannot hold `max_size` items in fewer than `num_shards`
@@ -1473,7 +1474,7 @@ private:
         return shards;
     }
 
-    /// P2-3 (T3.4): Build a sharded_mm_lru_config with decoupled
+    /// Build a sharded_mm_lru_config with decoupled
     /// `num_shards` and `num_stripes`. When the MM does not provide
     /// per-shard locks, `num_shards` is forced equal to `num_stripes`
     /// (preserving the historical safety constraint).
@@ -1482,7 +1483,7 @@ private:
                                                   size_type max_size,
                                                   bool allow_amplification = false) {
         using mm_t = typename std::decay_t<decltype(mm_)>;
-        // P1-30 (方案 B): never give the MM more shards than there are slots,
+        // never give the MM more shards than there are slots,
         // and keep a usable per-shard quota. See shards_for_capacity().
         size_type effective_shards = shards_for_capacity(num_shards, max_size);
         // For MMs without per-shard locks, num_shards MUST equal
@@ -1497,7 +1498,7 @@ private:
             if constexpr (requires { c.num_shards = effective_num_shards; }) {
                 c.num_shards = effective_num_shards;
             }
-            // P1-30 (fix.01 方案 A): propagate the explicit amplification
+            // propagate the explicit amplification
             // opt-in. Default false ⇒ an undersized max_size throws instead of
             // being silently multiplied by up to num_shards.
             if constexpr (requires { c.allow_amplification = allow_amplification; }) {
@@ -1520,7 +1521,7 @@ private:
     /// Called from constructors when auto_start_drain or auto_enable_slab
     /// is set in the trait.
     void init_production_features() {
-        // T-P1-1 (R-1): Apply the trait's default fairness mode FIRST, before
+        // Apply the trait's default fairness mode FIRST, before
         // any background worker (drain / rehash balancer) is started. The
         // debug-only quiescent-state assertion in set_fairness_mode() trips
         // if state_ != 0 (active writer/waiter); once start_event_drain() or
@@ -1551,7 +1552,7 @@ private:
         if constexpr (Trait::auto_start_drain || Trait::lock_policy::is_thread_safe) {
             start_event_drain();
         }
-        // P1-4: Auto-start the metrics cache worker for production
+        // Auto-start the metrics cache worker for production
         // aliases. Under high Prometheus scrape rates (multiple caches
         // scraped every 10-15s), rebuilding stats_snapshot() and
         // prometheus_text() on every call becomes a CPU hotspot. The
@@ -1584,14 +1585,14 @@ private:
                 this->drain_access_ring();
             });
         }
-        // T11.1: auto-enable incremental rehash for segmented/production
+        // auto-enable incremental rehash for segmented/production
         // traits to avoid blocking all writers during hash table expansion.
         if constexpr (Trait::auto_incremental_rehash) {
             if constexpr (requires { this->set_incremental_rehash(true); }) {
                 this->set_incremental_rehash(true);
             }
         }
-        // R-3: enable defer_promotion on the underlying MM config. The
+        // enable defer_promotion on the underlying MM config. The
         // existing set_defer_promotion() helper already handles both
         // striped and non-striped MMs and is a SFINAE-guarded no-op on
         // MM types whose config has no `defer_promotion` field.
@@ -1600,7 +1601,7 @@ private:
                 this->set_defer_promotion(true);
             }
         }
-        // R-3: enable EBR (Epoch-Based Reclamation). Faster read path
+        // enable EBR (Epoch-Based Reclamation). Faster read path
         // under sustained read contention than hazptr. SFINAE-guarded:
         // only mm_lru / sharded_mm_lru support EBR; other MM types no-op.
         if constexpr (Trait::auto_enable_ebr) {
@@ -1608,7 +1609,7 @@ private:
                 this->set_ebr_domain(&detail::epoch_domain::default_domain());
             }
         }
-        // P0-5: auto-start the background rehash balancer for segmented/
+        // auto-start the background rehash balancer for segmented/
         // production traits. The balancer periodically sweeps segments
         // that aren't on the current write hot path, ensuring cold
         // segments also get rehashed. This is a no-op for non-segmented
@@ -1620,7 +1621,7 @@ private:
                 this->start_background_rehash_balancer();
             }
         }
-        // T-G2: Apply a default memory limit for production aliases. Without
+        // Apply a default memory limit for production aliases. Without
         // this, the memory monitor is inactive by default (max_memory_bytes
         // == 0) and unbounded insertions can cause OOM. The default 1 GiB
         // is conservative; operators should tune via set_max_memory().
@@ -1630,12 +1631,12 @@ private:
                       Trait::lock_policy::is_thread_safe) {
             memory_monitor_.set_max_memory(Trait::default_max_memory_bytes);
         }
-        // T-G3: Auto-enable singleflight for production / read-heavy aliases.
+        // Auto-enable singleflight for production / read-heavy aliases.
         // Prevents cache-stampede when a hot key expires under high concurrency.
         if constexpr (Trait::auto_enable_singleflight) {
             singleflight_enabled_.store(true, std::memory_order_release);
         }
-        // T-G16: Auto-enable slab allocator for production_cache_with_slab.
+        // Auto-enable slab allocator for production_cache_with_slab.
         // The slab allocator reduces allocation overhead for caches with
         // many small items (10M+). SFINAE-guarded: enable_slab_allocator()
         // requires the MM to support set_allocator() — all MM types do.
@@ -1644,13 +1645,13 @@ private:
                 this->enable_slab_allocator();
             }
         }
-        // T-G10: Wire the per-cache handle-release notifier so that
+        // Wire the per-cache handle-release notifier so that
         // shutdown_and_wait() can sleep on a condition_variable instead of
         // busy-polling. read_handle::release() reaches the notifier through
         // per_cache_stats_->release_notifier and calls notify_all() when the
         // last handle is dropped during shutdown.
         //
-        // P1-33 (fix.01 方案 A): the notifier is allocated once and deliberately
+        // the notifier is allocated once and deliberately
         // NEVER freed (process lifetime). A read_handle may outlive this cache —
         // the documented shutdown_and_wait() path gives up after 5 s, warns, and
         // destroys anyway — and it keeps a raw pointer to the notifier so it can
@@ -1677,7 +1678,7 @@ public:
     /// When get_or_fetch() or operator[] encounters a cache miss,
     /// this function is called to generate the value, which is then stored.
     ///
-    /// P1-45 (fix.01 方案 A): the provider is published through an RCU-style
+    /// the provider is published through an RCU-style
     /// atomic shared_ptr, the same pattern already used for
     /// `slow_query_callback_` / `trace_callback_`. Previously this took the
     /// global write lock to assign a plain `std::function`, while the miss path
@@ -1692,7 +1693,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // O2: Slow query logging (threshold-based)
+    // Slow query logging (threshold-based)
     // --------------------------------------------------------------------
 
     /// Set the slow operation threshold. Operations taking longer than
@@ -1734,12 +1735,12 @@ public:
         (void)old_cb;  // released when last concurrent invoker finishes
     }
 
-    /// O2: Total count of slow operations detected since startup.
+    /// Total count of slow operations detected since startup.
     std::size_t slow_query_count() const noexcept {
         return slow_query_count_.load(std::memory_order_acquire);
     }
 
-    /// O2: Notify a slow operation. Called from get()/set() after
+    /// Notify a slow operation. Called from get()/set() after
     /// measuring latency. Fast path: if threshold is 0 or no callback
     /// is registered, this is a single relaxed load + branch.
     void notify_slow_query(slow_op_kind kind, const Key& key,
@@ -1761,7 +1762,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // O1: Distributed tracing callback (OpenTelemetry / Jaeger / Zipkin)
+    // Distributed tracing callback (OpenTelemetry / Jaeger / Zipkin)
     // --------------------------------------------------------------------
 
     /// Register a trace callback. Pass an empty function to clear.
@@ -1785,13 +1786,13 @@ public:
         (void)old_cb;  // released when last concurrent invoker finishes
     }
 
-    /// O1: Total count of trace events fired since startup. When non-zero
+    /// Total count of trace events fired since startup. When non-zero
     /// with a registered callback, confirms tracing is active.
     std::size_t trace_count() const noexcept {
         return trace_count_.load(std::memory_order_acquire);
     }
 
-    /// O1: Notify a trace event. Called from ~trace_notifier() at the end
+    /// Notify a trace event. Called from ~trace_notifier() at the end
     /// of get()/set(). Fast path: if no callback is registered, this is
     /// a single atomic load + branch (no clock reads, no allocations).
     void notify_trace(trace_op_kind op, const Key& key,
@@ -1822,19 +1823,65 @@ public:
     /// config. Uses set_config() to ensure any side effects (e.g., refresh
     /// time recalculation) are applied.
     void set_defer_promotion(bool enabled) {
-        auto lock = acquire_write_lock();
-        if constexpr (is_striped) {
+        if constexpr (has_per_shard_lock_v<mm_type>) {
+            // A sharded MM protects its per-shard state with the per-shard
+            // locks, NOT with the stripe lock: every keyed operation reaches
+            // the shard through acquire_shard_write_lock(). Taking only the
+            // stripe lock here let this setter race with a concurrent set()
+            // on the same shard's config (torn read of defer_promotion).
+            auto shard_locks = acquire_write_lock_all_shards();
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
                 auto cfg = mm_.shard(i).config();
                 cfg.defer_promotion = enabled;
                 mm_.shard(i).set_config(cfg);
             }
         } else if constexpr (requires { mm_.config(); }) {
+            auto lock = acquire_write_lock();
             auto cfg = mm_.config();
             cfg.defer_promotion = enabled;
             mm_.set_config(cfg);
         }
         // For MM types without defer_promotion support, this is a no-op.
+    }
+
+    /// Set the TTL cleanup batch size: the maximum number of expired items the
+    /// cleaner evicts per lock acquisition before releasing the lock to let
+    /// readers and writers through (0 = drain everything under one lock).
+    ///
+    /// Propagated to every shard for a sharded MM, under the per-shard write
+    /// locks — the stripe lock does not protect a shard's config.
+    void set_ttl_evict_batch_size(std::size_t batch) {
+        if constexpr (has_per_shard_lock_v<mm_type>) {
+            auto shard_locks = acquire_write_lock_all_shards();
+            for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
+                auto cfg = mm_.shard(i).config();
+                if constexpr (requires { cfg.ttl_evict_batch_size; }) {
+                    cfg.ttl_evict_batch_size = batch;
+                    mm_.shard(i).set_config(cfg);
+                }
+            }
+        } else if constexpr (requires { mm_.config().ttl_evict_batch_size; }) {
+            auto lock = acquire_write_lock();
+            auto cfg = mm_.config();
+            cfg.ttl_evict_batch_size = batch;
+            mm_.set_config(cfg);
+        }
+        // MM types without a batch knob are a no-op.
+    }
+
+    /// Bill the real payload of keys and values, using detail::deep_size.
+    ///
+    /// Opt-in convenience wrapper over the two setters above: after calling it,
+    /// `std::string` and `std::vector` keys/values are billed by capacity plus
+    /// the container object, so `max_memory` tracks bytes rather than item
+    /// counts. It is not the default because the billed size determines when
+    /// eviction fires, and the constant-per-item billing is documented
+    /// behaviour that existing callers may rely on.
+    void use_real_payload_sizes() {
+        set_key_size_calculator(
+            [](const Key& k) { return detail::deep_size(k); });
+        set_value_size_calculator(
+            [](const Value& v) { return detail::deep_size(v); });
     }
 
     /// Query the current defer_promotion setting.
@@ -1880,7 +1927,7 @@ public:
         return ttl_jitter_enabled_.load(std::memory_order_acquire);
     }
 
-    /// P1-1 (T2.2): Drain the current thread's TLS access ring before
+    /// Drain the current thread's TLS access ring before
     /// entering a write path that may trigger eviction.
     ///
     /// Problem: when defer_promotion is enabled, get() hits do not
@@ -1934,7 +1981,7 @@ public:
         tls_access_ring<Key>::force_flush_dormant_threads();
     }
 
-    /// T-D2 (P2-2): Record an access in this cache's TLS ring, with
+    /// Record an access in this cache's TLS ring, with
     /// this cache's `tls_ring_config_` activated as the active config
     /// for the duration of the call.
     ///
@@ -1975,7 +2022,7 @@ public:
     /// For non-striped thread-safe caches, applies to the global mutex.
     /// For single-threaded caches, this is a no-op (no mutex present).
     ///
-    /// G14: For striped caches, this now delegates to
+    /// For striped caches, this now delegates to
     /// set_fairness_mode_quiescent() (1s timeout) to avoid racing with
     /// threads waiting on stripe mutexes. If the quiescent wait times out,
     /// it falls back to a direct (non-quiescent) switch. Callers that need
@@ -1983,7 +2030,7 @@ public:
     /// directly with a longer timeout.
     void set_fairness_mode(detail::fairness_mode mode) {
         if constexpr (is_striped) {
-            // G14: Prefer quiescent switch to avoid racing with waiters.
+            // Prefer quiescent switch to avoid racing with waiters.
             if (!set_fairness_mode_quiescent(mode, std::chrono::seconds(1))) {
                 // Fallback: quiescent wait timed out — direct switch.
                 if constexpr (requires { striped_mutex_.set_fairness_mode(mode); }) {
@@ -1991,7 +2038,7 @@ public:
                 }
             }
         } else if constexpr (is_thread_safe) {
-            // T-P3: Use set_fairness_mode_locked() because we hold the
+            // Use set_fairness_mode_locked() because we hold the
             // write lock (acquired below) — the mutex's plain
             // set_fairness_mode() has a debug-only assertion that
             // state_ == 0, but acquiring the write lock sets
@@ -2011,7 +2058,7 @@ public:
         // single_threaded_policy: no mutex, no-op
     }
 
-    /// P1-5 (T1.5): Quiescent variant of set_fairness_mode(). Drains all
+    /// Quiescent variant of set_fairness_mode(). Drains all
     /// in-flight readers/writers before atomically switching the fairness
     /// mode, guaranteeing no in-flight operation observes a mode change
     /// mid-critical-section. For striped caches, all stripes are
@@ -2046,7 +2093,7 @@ public:
     }
 
     /// Query the current fairness mode.
-    /// P1-2: Returns writer_fair (the actual default) for single-threaded
+    /// Returns writer_fair (the actual default) for single-threaded
     /// caches and for mutexes that do not support fairness_mode. The
     /// previous fallback returned reader_preferred, which contradicted
     /// the documented default and confused operators reading
@@ -2071,7 +2118,7 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // P1-1: Writer starvation detector forwarding
+    // Writer starvation detector forwarding
     // ----------------------------------------------------------------
     //
     // In reader_preferred mode, writers can starve indefinitely under
@@ -2082,7 +2129,7 @@ public:
     // mutex(es) so operators can configure the timeout and monitor
     // starvation events from the unified_cache API.
 
-    /// P1-1: Set the writer starvation timeout (nanoseconds). 0 disables
+    /// Set the writer starvation timeout (nanoseconds). 0 disables
     /// detection (pure reader_preferred — writers can starve). Default
     /// is 100ms. Only effective in reader_preferred mode. For striped
     /// caches, applies to all stripes.
@@ -2098,7 +2145,7 @@ public:
         }
     }
 
-    /// P1-1: Number of times a reader was redirected to the writer_fair
+    /// Number of times a reader was redirected to the writer_fair
     /// slow path due to writer starvation. Aggregated across all stripes
     /// for striped caches. Returns 0 for single-threaded caches.
     std::size_t writer_starvation_events() const noexcept {
@@ -2117,7 +2164,7 @@ public:
         }
     }
 
-    /// P1-1: Maximum observed writer wait time (ns) across all stripes.
+    /// Maximum observed writer wait time (ns) across all stripes.
     /// Returns 0 for single-threaded caches. Reset via
     /// reset_writer_max_wait_ns().
     uint64_t writer_max_wait_ns() const noexcept {
@@ -2136,7 +2183,7 @@ public:
         }
     }
 
-    /// P1-1: Reset the maximum observed writer wait time to 0. Useful
+    /// Reset the maximum observed writer wait time to 0. Useful
     /// for benchmark baselines or after a transient stall.
     void reset_writer_max_wait_ns() noexcept {
         if constexpr (is_striped) {
@@ -2151,7 +2198,7 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // T-B2 (P0-1-补): NUMA-aware reader counter routing
+    // NUMA-aware reader counter routing
     // ----------------------------------------------------------------
     //
     // On multi-socket NUMA hardware (2+ sockets), reader counter
@@ -2226,7 +2273,7 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // T-D2 (P2-2): Per-cache TLS ring config
+    // Per-cache TLS ring config
     // ----------------------------------------------------------------
     //
     // The TLS access ring (`tls_access_ring<Key>`) historically uses
@@ -2316,7 +2363,7 @@ public:
     tls_ring_config() const noexcept { return tls_ring_config_; }
 
     // ----------------------------------------------------------------
-    // T-B1 (P0-2-补): synchronize_epoch() + epoch_stale_count
+    // synchronize_epoch() + epoch_stale_count
     // ----------------------------------------------------------------
     //
     // Forwards to the default global epoch_domain (used by EBR). This
@@ -2339,7 +2386,7 @@ public:
     /// quiescent-point success, false on timeout.
     bool synchronize_epoch(
             std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
-        // R9: synchronize every active EBR domain (global or per-shard).
+        // synchronize every active EBR domain (global or per-shard).
         // All domains must reach a quiescent point for a full drain.
         bool all_ok = true;
         for_each_ebr_domain([&](detail::epoch_domain& dom) {
@@ -2348,7 +2395,7 @@ public:
         return all_ok;
     }
 
-    /// T-B1 (P0-2-补): Cumulative count of EBR slots that were skipped
+    /// Cumulative count of EBR slots that were skipped
     /// during reclaim because they were stuck in a critical section
     /// (i.e., the thread hadn't exited the CS by the reclaim pass).
     /// Fast-growing count indicates persistent blockage; slow-growing
@@ -2362,7 +2409,7 @@ public:
         return total;
     }
 
-    /// T-A1 (P0-6): Current EBR slot capacity (allocated batches ×
+    /// Current EBR slot capacity (allocated batches ×
     /// kBatchSize). Capacity grows on demand from 128 → 8192 as
     /// threads enter critical sections concurrently. Useful for sizing
     /// the workload against the upper bound.
@@ -2374,7 +2421,7 @@ public:
         return total;
     }
 
-    /// T-A1 (P0-6): Number of times EBR acquire_slot() exhausted all
+    /// Number of times EBR acquire_slot() exhausted all
     /// 8192 slots and had to yield. Non-zero under normal operation
     /// indicates 8000+ simultaneous critical sections — likely a
     /// runaway thread-spawn pattern rather than a normal cache workload.
@@ -2387,7 +2434,7 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // T-A2 (P0-7): hazptr slot exhaustion metrics
+    // hazptr slot exhaustion metrics
     // ----------------------------------------------------------------
     //
     // Forwarded to the default global hazptr_domain. Like EBR metrics
@@ -2395,7 +2442,7 @@ public:
     // operators can detect runaway handle counts without digging into
     // the hazptr internals.
 
-    /// T-A2 (P0-7): Number of times hazptr acquire_slot() exhausted all
+    /// Number of times hazptr acquire_slot() exhausted all
     /// 8192 slots and had to yield. Non-zero indicates the workload has
     /// 8000+ simultaneous live hazard pointers — likely a runaway
     /// reader-heavy workload or a thread/fiber leak. Previously this
@@ -2405,21 +2452,21 @@ public:
         return detail::hazptr_domain::default_domain().slot_exhaustion_count();
     }
 
-    /// T-A2 (P0-7): Current hazptr slot capacity (allocated batches ×
+    /// Current hazptr slot capacity (allocated batches ×
     /// kBatchSize). Capacity grows on demand from 128 → 8192 as
     /// threads acquire hazard pointers concurrently.
     std::size_t hazptr_slot_capacity() const noexcept {
         return detail::hazptr_domain::default_domain().capacity();
     }
 
-    /// P0-3: Maximum slot count the hazptr domain can grow to. Defaults
+    /// Maximum slot count the hazptr domain can grow to. Defaults
     /// to 8192 (kMaxBatches × kBatchSize) and can be raised up to 65536
     /// via `set_hazptr_max_slots()`.
     std::size_t hazptr_max_slot_count() const noexcept {
         return detail::hazptr_domain::default_domain().max_slot_count();
     }
 
-    /// P0-3: Currently-acquired (live) hazard pointer slots. When this
+    /// Currently-acquired (live) hazard pointer slots. When this
     /// approaches `hazptr_max_slot_count()`, operators should either
     /// call `set_hazptr_max_slots()` to expand capacity or investigate
     /// the cause of handle retention (e.g. long-lived read_handle).
@@ -2427,7 +2474,7 @@ public:
         return detail::hazptr_domain::default_domain().active_slot_count();
     }
 
-    /// P0-3: Current slot usage ratio (0.0 .. 1.0). When this exceeds
+    /// Current slot usage ratio (0.0 .. 1.0). When this exceeds
     /// 0.9, operators should either raise the limit via
     /// `set_hazptr_max_slots()` or reduce reader fan-out — sustained
     /// high usage risks `acquire_slot()` returning `npos`, which
@@ -2436,7 +2483,7 @@ public:
         return detail::hazptr_domain::default_domain().slot_usage_ratio();
     }
 
-    /// P0-3: Runtime capacity expansion. Raises the maximum number of
+    /// Runtime capacity expansion. Raises the maximum number of
     /// hazptr slots from the default 8192 up to 65536 (512 batches ×
     /// 128 slots). Existing slots and active handles are unaffected —
     /// only the upper bound is raised, allowing `acquire_slot()` to
@@ -2451,7 +2498,7 @@ public:
         detail::hazptr_domain::default_domain().set_max_slots(n);
     }
 
-    /// L-1: Number of times hazptr acquire_slot() exceeded the spin
+    /// Number of times hazptr acquire_slot() exceeded the spin
     /// budget (kMaxSpinRetries) after slot exhaustion and fell back to
     /// a synchronous try_reclaim() to drain pending retired objects.
     /// Sustained non-zero growth means the workload has 8192+ live
@@ -2469,7 +2516,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // P-HIGH-3 (T-H2): Unified pre-write validation
+    // Unified pre-write validation
     // --------------------------------------------------------------------
     //
     // Every write-path function (set / set_with_ttl / add / replace /
@@ -2498,7 +2545,7 @@ public:
                 std::string("unified_cache::") + fn_name +
                 ": cache is shut down");
         }
-        // P1-40 (fix.01 方案 A): a transactional snapshot (save_atomic) quiesces
+        // a transactional snapshot (save_atomic) quiesces
         // the cache for its duration. Writes are rejected then too — the whole
         // point of the snapshot is that nothing mutates while it serializes —
         // but unlike shutdown this state is reversible via resume().
@@ -2513,7 +2560,7 @@ public:
         return pre_write_result::kProceed;
     }
 
-    /// P-HIGH-3 (T-H2): TOCTOU re-check inside the write lock. Call after
+    /// TOCTOU re-check inside the write lock. Call after
     /// acquiring the write lock, before mutating mm_. Returns true if the
     /// cache was shut down between pre_write_check() and lock acquisition.
     /// The caller should release the lock and return without mutating.
@@ -2521,7 +2568,7 @@ public:
         return is_shutdown();
     }
 
-    /// P1-38 (fix.01 方案 A): report a write that was dropped because the cache
+    /// report a write that was dropped because the cache
     /// is in critical memory mode.
     ///
     /// `set()` and friends used to `return;` on that rejection, so a caller of
@@ -2544,7 +2591,7 @@ public:
         mm_.callbacks().collect_reject(key, value);
     }
 
-    /// P1-34 (fix.01 方案 A): centralised handling of "the handle is empty
+    /// centralised handling of "the handle is empty
     /// because the item's access_ref counter saturated".
     ///
     /// `read_handle` construction is noexcept and degrades to an EMPTY handle on
@@ -2574,18 +2621,18 @@ public:
 
     template <typename V>
     void set(const Key& key, V&& value) {
-        // P-HIGH-3 (T-H2): Unified pre-write validation.
+        // Unified pre-write validation.
         if (pre_write_check("set") == pre_write_result::kRejectInsert) {
-            // P1-38 (fix.01 方案 A): make the drop observable instead of silent.
+            // make the drop observable instead of silent.
             report_write_rejected(key, value);
             return;
         }
-        // T14.1: Compact path — delegate to embedded compact_cache.
+        // Compact path — delegate to embedded compact_cache.
         if constexpr (Trait::is_compact) {
             compact().set(key, std::forward<V>(value));
             return;
         }
-        // P1-1 (T2.2): Drain TLS access ring before acquiring the write
+        // Drain TLS access ring before acquiring the write
         // lock. mm_.set() may trigger evict_lru() internally; without
         // this drain, find_eviction_victim() could pick a key that was
         // just accessed on this thread but whose promotion is still
@@ -2604,8 +2651,8 @@ public:
                 return mm_.stats();
             }
         }();
-        // O2: capture latency for slow-query threshold check.
-        // O1: trace_notifier declared before slow_query_notifier so it
+        // capture latency for slow-query threshold check.
+        // trace_notifier declared before slow_query_notifier so it
         // destructs after, reading latency_ns written by ~scope_latency_timer.
         std::uint64_t set_latency_ns = 0;
         bool trace_hit = false;
@@ -2617,7 +2664,7 @@ public:
             stats_ref.latency_tracking_enabled.load(std::memory_order_relaxed),
             &set_latency_ns);
 
-        // P-HIGH-2 (T-H1): Capture the OOM event inside the write lock,
+        // Capture the OOM event inside the write lock,
         // but dispatch the handler *after* the lock is released. Invoking
         // the handler inside the lock caused deadlocks when the handler
         // called back into cache methods (flush/remove/set).
@@ -2625,7 +2672,7 @@ public:
 
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
-            // P1-38 (fix.01 方案 A): pre_write_check() ran before the lock, so a
+            // pre_write_check() ran before the lock, so a
             // concurrent shutdown() could have landed in between; without this
             // re-check the mutation would proceed into mm_ while the cache is
             // being torn down.
@@ -2635,11 +2682,11 @@ public:
             if (!apply_overflow_policy_for_set(key, shard_idx)) { report_write_rejected(key, value); return; }
             const auto size_before = mm_.size();
             mm_.set(key, std::forward<V>(value));
-            // P1-19 (方案 B): the single admission gate — see
+            // the single admission gate — see
             // enforce_capacity_after_insert().
             enforce_capacity_after_insert(key, size_before);
             trace_hit = true;  // O1: set succeeded
-            // P1-3 / T-H1: Check memory pressure after insertion — may
+            // Check memory pressure after insertion — may
             // enter critical mode if this insertion pushed us over the
             // threshold. The handler is dispatched below, outside the lock.
             oom_evt = check_memory_pressure();
@@ -2648,28 +2695,28 @@ public:
         } else {
             flush_guard fg{mm_};
             auto lock = acquire_write_lock_for_key(key);
-            // P1-38: see the striped branch above.
+            // see the striped branch above.
             if (recheck_shutdown_in_lock()) return;
             if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return; }
             // Task D: overflow enforcement (skip when kAllowGrowth — default).
             if (!apply_overflow_policy_for_set(key, 0)) { report_write_rejected(key, value); return; }
             const auto size_before = mm_.size();
             mm_.set(key, std::forward<V>(value));
-            // P1-19 (方案 B): the single admission gate.
+            // the single admission gate.
             enforce_capacity_after_insert(key, size_before);
             trace_hit = true;  // O1: set succeeded
-            // P1-3 / T-H1: Check memory pressure after insertion.
+            // Check memory pressure after insertion.
             oom_evt = check_memory_pressure();
             maybe_report_memory_to_monitor();
         }
-        // P-HIGH-2 (T-H1): Dispatch OOM handler outside the write lock.
+        // Dispatch OOM handler outside the write lock.
         // In sync mode this invokes the handler inline; in async mode
         // (set_async_oom_handler(true)) it enqueues for the drain worker.
         dispatch_oom_event(oom_evt);
     }
 
     // --------------------------------------------------------------------
-    // P1-1: Native TTL set. Stores the value with an absolute expiry time
+    // Native TTL set. Stores the value with an absolute expiry time
     // computed from `ttl`. The expiry is stored directly on `cache_item`
     // (no wrapper), so `peek_for_get` can check it inline on the hot path
     // without the `ttl_cache` wrapper's double-locking.
@@ -2682,12 +2729,12 @@ public:
     template <typename V, typename Rep, typename Period>
     void set_with_ttl(const Key& key, V&& value,
                       std::chrono::duration<Rep, Period> ttl) {
-        // P-HIGH-3 (T-H2): Unified pre-write validation (previously missing
+        // Unified pre-write validation (previously missing
         // the is_memory_critical() guard — OOM could bypass set_with_ttl).
         if (pre_write_check("set_with_ttl") == pre_write_result::kRejectInsert) {
             return;
         }
-        // T14.1: Compact path — compact_cache does not support TTL natively.
+        // Compact path — compact_cache does not support TTL natively.
         // Fall back to plain set() (item is stored without expiry).
         if constexpr (Trait::is_compact) {
             (void)ttl;  // suppress unused warning
@@ -2701,7 +2748,7 @@ public:
         // avalanches when many keys share the same nominal TTL.
         std::uint64_t expiry_ns = 0;
         if (ttl > std::chrono::duration<Rep, Period>::zero()) {
-            // P0-6: keep the whole computation in nanoseconds. Jitter applied
+            // keep the whole computation in nanoseconds. Jitter applied
             // in the caller's duration type (usually seconds) truncated
             // 0.9s -> 0s, so a 1s TTL expired immediately ~50% of the time.
             std::chrono::nanoseconds effective_ttl =
@@ -2717,7 +2764,7 @@ public:
         set_with_expiry_ns_impl(key, std::forward<V>(value), expiry_ns);
     }
 
-    /// P1-31 (fix.01): store a value with an absolute expiry expressed the same
+    /// store a value with an absolute expiry expressed the same
     /// way the MM layer stores it — nanoseconds since the steady_clock epoch,
     /// 0 meaning "no TTL".
     ///
@@ -2752,7 +2799,7 @@ private:
     template <typename V>
     void set_with_expiry_ns_impl(const Key& key, V&& value,
                                  std::uint64_t expiry_ns) {
-        // P1-1 (T2.2): Drain TLS ring before write lock — see set().
+        // Drain TLS ring before write lock — see set().
         maybe_drain_tls_ring_pre_evict();
         const std::size_t shard_idx = [&]() -> std::size_t {
             if constexpr (is_striped) return mm_.shard_for(key);
@@ -2765,8 +2812,8 @@ private:
                 return mm_.stats();
             }
         }();
-        // O2: capture latency for slow-query threshold check.
-        // O1: trace_notifier declared before slow_query_notifier so it
+        // capture latency for slow-query threshold check.
+        // trace_notifier declared before slow_query_notifier so it
         // destructs after, reading latency_ns written by ~scope_latency_timer.
         std::uint64_t set_latency_ns = 0;
         bool trace_hit = false;
@@ -2780,7 +2827,7 @@ private:
 
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
-            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            // re-check shutdown under the lock.
             if (recheck_shutdown_in_lock()) return;
             if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return; }
             if (!apply_overflow_policy_for_set(key, shard_idx)) return;
@@ -2790,7 +2837,7 @@ private:
             } else {
                 mm_.set(key, std::forward<V>(value));
             }
-            // P1-19 (方案 B): the single admission gate.
+            // the single admission gate.
             enforce_capacity_after_insert(key, size_before);
             trace_hit = true;  // O1: set succeeded
             maybe_report_memory_to_monitor();
@@ -2798,7 +2845,7 @@ private:
         } else {
             flush_guard fg{mm_};
             auto lock = acquire_write_lock_for_key(key);
-            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            // re-check shutdown under the lock.
             if (recheck_shutdown_in_lock()) return;
             if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return; }
             if (!apply_overflow_policy_for_set(key, 0)) return;
@@ -2808,7 +2855,7 @@ private:
             } else {
                 mm_.set(key, std::forward<V>(value));
             }
-            // P1-19 (方案 B): the single admission gate.
+            // the single admission gate.
             enforce_capacity_after_insert(key, size_before);
             trace_hit = true;  // O1: set succeeded
             maybe_report_memory_to_monitor();
@@ -2818,16 +2865,16 @@ private:
 public:
     template <typename V>
     bool add(const Key& key, V&& value) {
-        // P-HIGH-3 (T-H2): Unified pre-write validation (previously missing
+        // Unified pre-write validation (previously missing
         // both shutdown and is_memory_critical() guards).
         if (pre_write_check("add") == pre_write_result::kRejectInsert) {
             return false;
         }
-        // T14.1: Compact path.
+        // Compact path.
         if constexpr (Trait::is_compact) {
             return compact().add(key, std::forward<V>(value));
         }
-        // P1-1 (T2.2): Drain TLS ring before write lock — see set().
+        // Drain TLS ring before write lock — see set().
         maybe_drain_tls_ring_pre_evict();
         // Task B: cache shard_idx once per call.
         const std::size_t shard_idx = [&]() -> std::size_t {
@@ -2836,7 +2883,7 @@ public:
         }();
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
-            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            // re-check shutdown under the lock.
             if (recheck_shutdown_in_lock()) return false;
             if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return false; }
             // Task D: overflow enforcement (skip when kAllowGrowth — default).
@@ -2848,7 +2895,7 @@ public:
         } else {
             flush_guard fg{mm_};
             auto lock = acquire_write_lock_for_key(key);
-            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            // re-check shutdown under the lock.
             if (recheck_shutdown_in_lock()) return false;
             if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return false; }
             // Task D: overflow enforcement (skip when kAllowGrowth — default).
@@ -2861,21 +2908,21 @@ public:
 
     template <typename V>
     bool replace(const Key& key, V&& value) {
-        // P-HIGH-3 (T-H2): Unified pre-write validation (previously missing
+        // Unified pre-write validation (previously missing
         // both shutdown and is_memory_critical() guards). replace() does not
         // add memory, but rejecting it in critical mode is safe and keeps
         // behavior consistent across all write paths.
         if (pre_write_check("replace") == pre_write_result::kRejectInsert) {
             return false;
         }
-        // T14.1: Compact path — compact_cache lacks a replace() method,
+        // Compact path — compact_cache lacks a replace() method,
         // so emulate it via contains() + set().
         if constexpr (Trait::is_compact) {
             if (!compact().contains(key)) return false;
             compact().set(key, std::forward<V>(value));
             return true;
         }
-        // P1-1 (T2.2): Drain TLS ring before write lock — see set().
+        // Drain TLS ring before write lock — see set().
         // replace() updates an existing item in-place; it does not add a
         // new item, so eviction is not triggered. But we drain anyway
         // for consistency and to keep the LRU list fresh in case the
@@ -2909,14 +2956,14 @@ public:
     /// Uses the provider set via set_value_provider().
     /// Throws std::runtime_error if no provider is set.
     ///
-    /// T-G3: When singleflight is enabled (default for production aliases),
+    /// When singleflight is enabled (default for production aliases),
     /// concurrent misses for the same key are coalesced — only the leader
     /// calls the provider; followers block on the leader's result. This
     /// prevents cache-stampede / thundering-herd when a hot key expires.
     /// Delegates to get_or_fetch(key, provider) to reuse the singleflight
     /// integration there.
     Value get_or_fetch(const Key& key) {
-        // P-HIGH-3 (T-H2): Unified pre-write validation. get_or_fetch may
+        // Unified pre-write validation. get_or_fetch may
         // insert on miss, so it must respect shutdown and OOM guards.
         // Note: if the key is already cached, the hit path proceeds
         // normally even in critical mode (reads are always allowed).
@@ -2925,7 +2972,7 @@ public:
             throw cache_closed_exception(
                 "unified_cache::get_or_fetch: cache is shut down");
         }
-        // P1-45 (fix.01 方案 A): RCU snapshot of the value provider. Holding a
+        // RCU snapshot of the value provider. Holding a
         // shared_ptr copy guarantees the callable stays alive for this whole
         // call even if another thread replaces it concurrently, and the callable
         // can never be observed half-constructed.
@@ -2965,14 +3012,14 @@ public:
                         } else {
                             record_access_in_ring(key);
                             mm_.shard(shard_idx).stats().register_hit();
-                            // R8: collect hit callback in defer path.
+                            // collect hit callback in defer path.
                             mm_.shard(shard_idx).callbacks().collect_hit(key, *handle);
                             flush_shard_pending(shard_idx);
                         }
                     } else {
                         record_access_in_ring(key);
                         mm_.shard(shard_idx).stats().register_hit();
-                        // R8: collect hit callback in defer_promotion mode.
+                        // collect hit callback in defer_promotion mode.
                         mm_.shard(shard_idx).callbacks().collect_hit(key, *handle);
                         flush_shard_pending(shard_idx);
                     }
@@ -2989,7 +3036,7 @@ public:
                         flush_shard_pending(shard_idx);
                         return *handle2;
                     }
-                    // P1-45: one RCU snapshot (see set_value_provider()).
+                    // one RCU snapshot (see set_value_provider()).
                     provider = value_provider_.load();
                     if (!provider || !*provider) {
                         mm_.shard(shard_idx).stats().register_miss();
@@ -3026,13 +3073,13 @@ public:
                         } else {
                             record_access_in_ring(key);
                             mm_.stats().register_hit();
-                            // R8: collect hit callback in defer path.
+                            // collect hit callback in defer path.
                             mm_.callbacks().collect_hit(key, *handle);
                         }
                     } else {
                         record_access_in_ring(key);
                         mm_.stats().register_hit();
-                        // R8: collect hit callback in defer_promotion mode.
+                        // collect hit callback in defer_promotion mode.
                         mm_.callbacks().collect_hit(key, *handle);
                     }
                     return *handle;
@@ -3046,7 +3093,7 @@ public:
                         mm_.callbacks().collect_hit(key, *handle2);
                         return *handle2;
                     }
-                    // P1-45: one RCU snapshot (see set_value_provider()).
+                    // one RCU snapshot (see set_value_provider()).
                     provider = value_provider_.load();
                     if (!provider || !*provider) {
                         mm_.stats().register_miss();
@@ -3058,9 +3105,9 @@ public:
                 }
             }
         }
-        // T-G3: When singleflight is enabled, delegate to the provider-aware
+        // When singleflight is enabled, delegate to the provider-aware
         // overload so concurrent misses for the same key are coalesced.
-        // P1-45: `provider` is a shared_ptr snapshot, so the lambda below keeps
+        // `provider` is a shared_ptr snapshot, so the lambda below keeps
         // the callable alive by co-owning it (a reference capture would dangle if
         // the lambda outlived this frame).
         if (singleflight_enabled_.load(std::memory_order_acquire)) {
@@ -3069,13 +3116,13 @@ public:
         }
         // Phase 2: Call provider outside any lock
         Value v = (*provider)(key);
-        // P1-1 (T2.2): Drain TLS ring before write lock — see set().
+        // Drain TLS ring before write lock — see set().
         // The provider ran outside the lock; this thread may have
         // accumulated TLS ring entries from prior get() calls.
         maybe_drain_tls_ring_pre_evict();
         // Phase 3: Insert under write lock (double-check again)
         {
-            // P-HIGH-3 (T-H2): OOM guard for the insertion phase. Reads of
+            // OOM guard for the insertion phase. Reads of
             // existing items are allowed even in critical mode (handled by
             // the peek_for_get hit paths above), but new insertions are
             // rejected. Also re-check shutdown (TOCTOU: cache may have been
@@ -3087,7 +3134,7 @@ public:
             }
             if constexpr (is_striped) {
                 auto lock = acquire_write_lock_for_key(key);
-                // P-HIGH-3 (T-H2): TOCTOU re-check inside the lock.
+                // TOCTOU re-check inside the lock.
                 if (recheck_shutdown_in_lock()) {
                     throw cache_closed_exception(
                         "unified_cache::get_or_fetch: cache is shut down");
@@ -3110,7 +3157,7 @@ public:
             } else {
                 flush_guard fg{mm_};
                 auto lock = acquire_write_lock_for_key(key);
-                // P-HIGH-3 (T-H2): TOCTOU re-check inside the lock.
+                // TOCTOU re-check inside the lock.
                 if (recheck_shutdown_in_lock()) {
                     throw cache_closed_exception(
                         "unified_cache::get_or_fetch: cache is shut down");
@@ -3140,7 +3187,7 @@ public:
         requires std::invocable<Fn, const Key&> &&
                  std::convertible_to<std::invoke_result_t<Fn, const Key&>, Value>
     Value get_or_fetch(const Key& key, Fn&& provider) {
-        // P-HIGH-3 (T-H2): Unified pre-write validation (shutdown check).
+        // Unified pre-write validation (shutdown check).
         // OOM check is deferred to Phase 3 (insertion) — see below.
         if (is_shutdown()) {
             throw cache_closed_exception(
@@ -3177,14 +3224,14 @@ public:
                         } else {
                             record_access_in_ring(key);
                             mm_.shard(shard_idx).stats().register_hit();
-                            // R8: collect hit callback in defer path.
+                            // collect hit callback in defer path.
                             mm_.shard(shard_idx).callbacks().collect_hit(key, *handle);
                             flush_shard_pending(shard_idx);
                         }
                     } else {
                         record_access_in_ring(key);
                         mm_.shard(shard_idx).stats().register_hit();
-                        // R8: collect hit callback in defer_promotion mode.
+                        // collect hit callback in defer_promotion mode.
                         mm_.shard(shard_idx).callbacks().collect_hit(key, *handle);
                         flush_shard_pending(shard_idx);
                     }
@@ -3217,13 +3264,13 @@ public:
                         } else {
                             record_access_in_ring(key);
                             mm_.stats().register_hit();
-                            // R8: collect hit callback in defer path.
+                            // collect hit callback in defer path.
                             mm_.callbacks().collect_hit(key, *handle);
                         }
                     } else {
                         record_access_in_ring(key);
                         mm_.stats().register_hit();
-                        // R8: collect hit callback in defer_promotion mode.
+                        // collect hit callback in defer_promotion mode.
                         mm_.callbacks().collect_hit(key, *handle);
                     }
                     return *handle;
@@ -3232,7 +3279,7 @@ public:
                 mm_.callbacks().collect_miss(key);
             }
         }
-        // T-M1: singleflight / cache stampede protection.
+        // singleflight / cache stampede protection.
         // When enabled, concurrent misses on the same key are coalesced:
         // the first caller (leader) executes the provider; subsequent
         // callers (followers) block on a CV until the leader completes,
@@ -3248,6 +3295,12 @@ public:
                 // Follower: block on leader's result. wait_and_get
                 // rethrows any provider exception captured by the leader.
                 singleflight_.record_coalesced();
+                // Also bump the stats counter so the raw cache_stats field is
+                // truthful for direct readers. The exported metric is sourced
+                // from the tracker, but a field that only ever reads zero is a
+                // trap for anyone who reads stats() instead of the exporter.
+                mm_.stats().stampede_coalesced_count.fetch_add(
+                    1, std::memory_order_relaxed);
                 Value leader_v = sf_state->wait_and_get();
                 // Re-check the cache: the leader should have inserted.
                 // If present, return a handle-pinned value for parity
@@ -3279,7 +3332,7 @@ public:
         // Call provider outside lock
         try {
             Value v = std::forward<Fn>(provider)(key);
-            // P1-1 (T2.2): Drain TLS ring before write lock — see set().
+            // Drain TLS ring before write lock — see set().
             // The provider ran outside the lock; this thread may have
             // accumulated TLS ring entries from prior get() calls.
             maybe_drain_tls_ring_pre_evict();
@@ -3288,7 +3341,7 @@ public:
             // completion signal is emitted on exactly one path.
             Value result;
             {
-                // P-HIGH-3 (T-H2): OOM guard for the insertion phase + TOCTOU
+                // OOM guard for the insertion phase + TOCTOU
                 // shutdown re-check inside the lock. See get_or_fetch(key) for
                 // full rationale.
                 if (is_memory_critical()) {
@@ -3337,7 +3390,7 @@ public:
                     }
                 }
             }
-            // T-M1: Signal singleflight completion (success path). On
+            // Signal singleflight completion (success path). On
             // exception, the catch block below signals with the captured
             // exception_ptr so followers rethrow it.
             if (sf_is_leader) {
@@ -3345,7 +3398,7 @@ public:
             }
             return result;
         } catch (...) {
-            // T-M1: Propagate provider/insertion exception to all
+            // Propagate provider/insertion exception to all
             // followers waiting on this key, then rethrow to caller.
             if (sf_is_leader) {
                 singleflight_.complete(key, sf_state, std::nullopt,
@@ -3362,7 +3415,7 @@ public:
         return get_or_fetch(key);
     }
 
-    /// H0: Get with handle — 返回 read_handle，防止持有期被淘汰。
+    /// Get with a handle: returns a read_handle that pins the item against eviction.
     /// Lock-free read path: peek_for_get() uses find_and_pin() to
     /// atomically increment refcount under the hash table's bucket lock,
     /// eliminating the need for a stripe-level read lock in Phase 1.
@@ -3372,7 +3425,7 @@ public:
         if (is_shutdown()) {
             throw cache_closed_exception("unified_cache::get: cache is shut down");
         }
-        // T14.1: Compact path — delegate to compact_cache::get(), which
+        // Compact path — delegate to compact_cache::get(), which
         // returns std::optional<std::reference_wrapper<Value>>. Wrap the
         // pointer in a non-pinning read_handle (refcount=nullptr). The
         // caller must ensure the value is not used after the cache is
@@ -3384,7 +3437,7 @@ public:
             // Construct a non-pinning handle: value ptr set, refcount=nullptr.
             return read_handle<Value>(&ref->get(), nullptr, nullptr);
         }
-        // T-P3-1: Precompute hash ONCE and reuse it for shard dispatch,
+        // Precompute hash ONCE and reuse it for shard dispatch,
         // hash-table lookup, and write-lock acquisition. Previously the
         // hash was computed up to 3 times per get(): once in shard_for(key),
         // once in peek_for_get(key), and once in try_acquire_write_lock_for_key(key).
@@ -3403,11 +3456,11 @@ public:
                 return mm_.stats();
             }
         }();
-        // O2: capture latency for slow-query threshold check. The notifier
+        // capture latency for slow-query threshold check. The notifier
         // is declared BEFORE the timer so it destructs AFTER the timer
         // (destruction is reverse of construction), allowing it to read
         // the latency value written by the timer's destructor.
-        // O1: trace_notifier declared before slow_query_notifier so it
+        // trace_notifier declared before slow_query_notifier so it
         // destructs after both, reading latency + hit flag.
         std::uint64_t get_latency_ns = 0;
         bool trace_hit = false;
@@ -3424,13 +3477,13 @@ public:
             // pins the item under the hash table's bucket shared lock.
             read_handle<Value> handle;
             {
-                // T-P3-1: Reuse precomputed hash for lock-free lookup.
-                // T-G11: clear overflow flag so we can attribute any
+                // Reuse precomputed hash for lock-free lookup.
+                // clear overflow flag so we can attribute any
                 // empty result to this call.
                 detail::tls_clear_incRef_overflow_flag();
                 handle = mm_.peek_for_get_with_hash(key, hash);
                 if (!handle) {
-                    // T-G11: refcount overflow → bump counter, yield,
+                    // refcount overflow → bump counter, yield,
                     // retry once. If the retry also overflows, throw
                     // (distinguishes overflow from a real miss).
                     if (detail::tls_last_incRef_was_overflow()) {
@@ -3467,7 +3520,7 @@ public:
                     }
                 }
                 if (should_try_promote) {
-                    // T-P3-1: Reuse precomputed hash for write-lock acquisition.
+                    // Reuse precomputed hash for write-lock acquisition.
                     auto wlock = try_acquire_write_lock_for_hash(hash);
                     if (wlock.owns_lock()) {
                         mm_.promote(key);
@@ -3478,7 +3531,7 @@ public:
                         // Write lock contended — defer promotion
                         record_access_in_ring(key);
                         mm_.shard(shard_idx).stats().register_hit();
-                        // R8: defer_promotion mode previously skipped the hit
+                        // defer_promotion mode previously skipped the hit
                         // callback — hit metrics/callbacks silently undercounted
                         // on the default production path. collect_hit is a
                         // zero-cost atomic check when no hit callbacks are
@@ -3490,7 +3543,7 @@ public:
                     // defer_promotion mode: always defer to TLS ring
                     record_access_in_ring(key);
                     mm_.shard(shard_idx).stats().register_hit();
-                    // R8: see note in the "Write lock contended" branch above —
+                    // see note in the "Write lock contended" branch above —
                     // collect the hit callback in defer_promotion mode too.
                     mm_.shard(shard_idx).callbacks().collect_hit(key, *handle);
                     flush_shard_pending(shard_idx);
@@ -3503,8 +3556,8 @@ public:
             read_handle<Value> handle;
             {
                 // Lock-free: find_and_pin() atomically pins item
-                // T-P3-1: Reuse precomputed hash for lock-free lookup.
-                // T-G11: clear overflow flag + retry on overflow.
+                // Reuse precomputed hash for lock-free lookup.
+                // clear overflow flag + retry on overflow.
                 detail::tls_clear_incRef_overflow_flag();
                 handle = mm_.peek_for_get_with_hash(key, hash);
                 if (!handle) {
@@ -3540,7 +3593,7 @@ public:
                     }
                 }
                 if (should_try_promote) {
-                    // T-P3-1: Reuse precomputed hash for write-lock acquisition.
+                    // Reuse precomputed hash for write-lock acquisition.
                     auto wlock = try_acquire_write_lock_for_hash(hash);
                     if (wlock.owns_lock()) {
                         mm_.promote(key);
@@ -3549,20 +3602,20 @@ public:
                     } else {
                         record_access_in_ring(key);
                         mm_.stats().register_hit();
-                        // R8: collect hit callback in defer mode (see striped note).
+                        // collect hit callback in defer mode (see striped note).
                         mm_.callbacks().collect_hit(key, *handle);
                     }
                 } else {
                     // defer_promotion mode: always defer to TLS ring
                     record_access_in_ring(key);
                     mm_.stats().register_hit();
-                    // R8: collect hit callback in defer_promotion mode.
+                    // collect hit callback in defer_promotion mode.
                     mm_.callbacks().collect_hit(key, *handle);
                 }
             }
             return handle;
         }
-        // O2: slow_q_notifier destructs here (after timer_) and invokes
+        // slow_q_notifier destructs here (after timer_) and invokes
         // notify_slow_query if the latency exceeded the threshold.
     }
 
@@ -3584,7 +3637,7 @@ public:
         if (is_shutdown()) {
             return std::nullopt;
         }
-        // T14.1: Compact path — compact_cache::get() already acquires the
+        // Compact path — compact_cache::get() already acquires the
         // necessary lock internally; there's no separate "try" path. We
         // delegate to get() and wrap the result. (This means try_get on
         // compact caches is not truly non-blocking, but compact_cache's
@@ -3595,7 +3648,7 @@ public:
             read_handle<Value> handle(&ref->get(), nullptr, nullptr);
             return std::optional<read_handle<Value>>{std::move(handle)};
         }
-        // T-P3-6 + T-P3-1: Precompute hash ONCE and reuse it for shard
+        // Precompute hash ONCE and reuse it for shard
         // dispatch, lock-free lookup, and (when needed) write-lock
         // acquisition. Previously try_get recomputed the hash up to 3x
         // (shard_for, peek_for_get, try_acquire_write_lock_for_key),
@@ -3607,13 +3660,13 @@ public:
             else return 0;
         }();
         if constexpr (is_striped) {
-            // T-P3-6: Use precomputed hash for lock-free lookup.
-            // T-G11: clear the thread-local overflow flag before the
+            // Use precomputed hash for lock-free lookup.
+            // clear the thread-local overflow flag before the
             // lookup so we can attribute any failure to this call.
             detail::tls_clear_incRef_overflow_flag();
             read_handle<Value> handle = mm_.peek_for_get_with_hash(key, hash);
             if (!handle) {
-                // T-G11: if the failure was due to refcount overflow,
+                // if the failure was due to refcount overflow,
                 // bump the per-shard counter and retry once with yield.
                 // Overflow may be transient (handles being released
                 // concurrently), so a single retry recovers most cases.
@@ -3638,7 +3691,7 @@ public:
             // Task C: attach per-cache stats if enabled.
             attach_handle_stats_if_enabled(handle);
 
-            // T-P3-6: Fast path for defer_promotion mode — check BEFORE
+            // Fast path for defer_promotion mode — check BEFORE
             // attempting any write lock. When defer_promotion is true,
             // skip try_acquire_write_lock_for_hash entirely and just
             // record the access in the TLS ring. This makes try_get
@@ -3652,7 +3705,7 @@ public:
                     // Fast path: defer promotion to TLS ring, no lock needed.
                     record_access_in_ring(key);
                     mm_.shard(shard_idx).stats().register_hit();
-                    // R8: collect the hit callback in defer_promotion mode so
+                    // collect the hit callback in defer_promotion mode so
                     // hit metrics/callbacks are not silently undercounted.
                     mm_.shard(shard_idx).callbacks().collect_hit(key, *handle);
                     flush_shard_pending(shard_idx);
@@ -3661,7 +3714,7 @@ public:
             }
 
             // Non-defer path: try non-blocking write lock for promotion.
-            // T-P3-1: Reuse precomputed hash for write-lock acquisition.
+            // Reuse precomputed hash for write-lock acquisition.
             auto wlock = try_acquire_write_lock_for_hash(hash);
             if (wlock.owns_lock()) {
                 mm_.promote(key);
@@ -3672,15 +3725,15 @@ public:
                 // Lock contended — defer promotion via TLS ring.
                 record_access_in_ring(key);
                 mm_.shard(shard_idx).stats().register_hit();
-                // R8: collect hit callback in defer path.
+                // collect hit callback in defer path.
                 mm_.shard(shard_idx).callbacks().collect_hit(key, *handle);
                 flush_shard_pending(shard_idx);
             }
             return std::optional<read_handle<Value>>{std::move(handle)};
         } else {
             flush_guard fg{mm_};
-            // T-P3-6: Use precomputed hash for lock-free lookup.
-            // T-G11: clear the overflow flag and retry on overflow.
+            // Use precomputed hash for lock-free lookup.
+            // clear the overflow flag and retry on overflow.
             detail::tls_clear_incRef_overflow_flag();
             read_handle<Value> handle = mm_.peek_for_get_with_hash(key, hash);
             if (!handle) {
@@ -3704,21 +3757,21 @@ public:
             // Task C: attach per-cache stats if enabled.
             attach_handle_stats_if_enabled(handle);
 
-            // T-P3-6: Fast path for defer_promotion mode — skip write lock
+            // Fast path for defer_promotion mode — skip write lock
             // entirely, just record access in TLS ring.
             if constexpr (requires { mm_.config().defer_promotion; }) {
                 if (mm_.config().defer_promotion) {
                     // Fast path: defer promotion to TLS ring, no lock needed.
                     record_access_in_ring(key);
                     mm_.stats().register_hit();
-                    // R8: collect hit callback in defer_promotion mode.
+                    // collect hit callback in defer_promotion mode.
                     mm_.callbacks().collect_hit(key, *handle);
                     return std::optional<read_handle<Value>>{std::move(handle)};
                 }
             }
 
             // Non-defer path: try non-blocking write lock for promotion.
-            // T-P3-1: Reuse precomputed hash for write-lock acquisition.
+            // Reuse precomputed hash for write-lock acquisition.
             auto wlock = try_acquire_write_lock_for_hash(hash);
             if (wlock.owns_lock()) {
                 mm_.promote(key);
@@ -3727,14 +3780,14 @@ public:
             } else {
                 record_access_in_ring(key);
                 mm_.stats().register_hit();
-                // R8: collect hit callback in defer path.
+                // collect hit callback in defer path.
                 mm_.callbacks().collect_hit(key, *handle);
             }
             return std::optional<read_handle<Value>>{std::move(handle)};
         }
     }
 
-    /// P10: fast_get — ultra-light read path for hot loops.
+    /// fast_get — ultra-light read path for hot loops.
     ///
     /// Trades correctness guarantees for raw throughput. Compared to
     /// `get()` / `try_get()`, fast_get skips:
@@ -3761,29 +3814,29 @@ public:
     ///
     /// For all other use cases, prefer `get()` or `try_get()`.
     read_handle<Value> fast_get(const Key& key) {
-        // P1-34 (fix.01): the doc block above promises an EMPTY handle on
+        // the doc block above promises an EMPTY handle on
         // shutdown, but the implementation had no such check, so a shut-down
         // cache still served reads. Honour the documented contract.
         if (is_shutdown()) return {};
-        // T14.1: Compact path — no fast variant; fall back to get().
+        // Compact path — no fast variant; fall back to get().
         // compact_cache::get() already runs a per-key striped lock with
         // no extra overhead, so the fast path is the same as the slow.
         if constexpr (Trait::is_compact) {
             return get(key);
         }
-        // T-P3-1: Precompute hash ONCE for shard dispatch + lookup.
+        // Precompute hash ONCE for shard dispatch + lookup.
         const std::size_t hash = hash_type{}(key);
-        // P10: Inline shard index lookup (no lambda indirection like get()).
+        // Inline shard index lookup (no lambda indirection like get()).
         std::size_t shard_idx = 0;
         if constexpr (is_striped) {
             shard_idx = mm_.shard_for_hash(hash);
-            // P10: Direct lock-free lookup — no flush_guard, no latency timer.
+            // Direct lock-free lookup — no flush_guard, no latency timer.
             auto handle = mm_.shard(shard_idx).peek_for_get_with_hash(key, hash);
             if (!handle) {
                 mm_.shard(shard_idx).stats().register_miss();
                 return {};
             }
-            // P10: Always defer promotion. record_access_in_ring() pushes
+            // Always defer promotion. record_access_in_ring() pushes
             // to a TLS ring (lock-free, no write-lock acquisition). The
             // ring is drained later by the background worker or by the
             // next operation that needs the write lock for other reasons.
@@ -3791,7 +3844,7 @@ public:
             mm_.shard(shard_idx).stats().register_hit();
             return handle;
         } else {
-            // P10: Non-striped path — same lock-free lookup, single shard.
+            // Non-striped path — same lock-free lookup, single shard.
             auto handle = mm_.peek_for_get_with_hash(key, hash);
             if (!handle) {
                 mm_.stats().register_miss();
@@ -3828,7 +3881,7 @@ public:
         const auto count = static_cast<std::size_t>(std::distance(first, last));
         std::vector<std::optional<read_handle<Value>>> results(count);
 
-        // T14.1: Compact path — delegate key-by-key to compact_cache::get().
+        // Compact path — delegate key-by-key to compact_cache::get().
         // (compact_cache doesn't expose a bulk API, but its per-key get()
         // is already lock-protected and fast for small items.)
         if constexpr (Trait::is_compact) {
@@ -3843,11 +3896,11 @@ public:
             return results;
         }
 
-        // P2-1: For striped caches, group keys by shard and process each
+        // For striped caches, group keys by shard and process each
         // shard's keys under a single lock acquisition. This reduces lock
         // contention from O(n) acquisitions to O(num_shards) acquisitions.
         if constexpr (is_striped) {
-            // T16.4: Compute the hash ONCE per key and reuse it for both
+            // Compute the hash ONCE per key and reuse it for both
             // shard dispatch (shard_for_hash) and hash-table lookup
             // (peek_for_get_with_hash). This halves the number of hash
             // computations in bulk_get — previously each key was hashed
@@ -3868,7 +3921,7 @@ public:
                 shard_groups[shard_idx].push_back({idx, *it, h});
             }
 
-            // P1-9: Process each shard group WITHOUT acquiring the shard
+            // Process each shard group WITHOUT acquiring the shard
             // read lock. peek_for_get_with_hash() is lock-free (hazptr/EBR-
             // protected find_and_pin_lockfree), so the read lock was both
             // unnecessary and harmful:
@@ -3991,7 +4044,7 @@ public:
         if (h && h->has_value()) {
             return **h;
         }
-        // P-HIGH-3 (T-H2): try_get returned nullopt — either a genuine miss
+        // try_get returned nullopt — either a genuine miss
         // or shutdown. Re-check shutdown explicitly because try_get silently
         // returns nullopt on shutdown (non-throwing contract).
         if (is_shutdown()) {
@@ -4004,7 +4057,7 @@ public:
             if constexpr (is_striped) return mm_.shard_for(key);
             else return 0;
         }();
-        // T-M1: singleflight / cache stampede protection (see get_or_fetch
+        // singleflight / cache stampede protection (see get_or_fetch
         // for full design). Same leader/follower model: leader executes the
         // provider and inserts; followers block on the leader's result.
         typename detail::singleflight_tracker<Key, Value>::state_ptr sf_state;
@@ -4015,6 +4068,8 @@ public:
             sf_is_leader = sf_result.is_leader;
             if (!sf_is_leader) {
                 singleflight_.record_coalesced();
+                mm_.stats().stampede_coalesced_count.fetch_add(
+                    1, std::memory_order_relaxed);
                 Value leader_v = sf_state->wait_and_get();
                 // Re-check the cache for a handle-pinned value. If the
                 // leader's insertion failed, return the leader's value.
@@ -4042,9 +4097,9 @@ public:
         // Miss — call provider outside lock.
         try {
             Value v = std::forward<Fn>(provider)(key);
-            // P1-1 (T2.2): Drain TLS ring before write lock — see set().
+            // Drain TLS ring before write lock — see set().
             maybe_drain_tls_ring_pre_evict();
-            // P-HIGH-3 (T-H2): OOM guard — skip insertion in critical mode,
+            // OOM guard — skip insertion in critical mode,
             // return the fetched value without caching.
             if (is_memory_critical()) {
                 if (sf_is_leader) {
@@ -4057,7 +4112,7 @@ public:
             Value result;
             if constexpr (is_striped) {
                 auto lock = acquire_write_lock_for_key(key);
-                // P-HIGH-3 (T-H2): TOCTOU re-check inside the lock.
+                // TOCTOU re-check inside the lock.
                 if (recheck_shutdown_in_lock()) {
                     throw cache_closed_exception(
                         "unified_cache::try_get_or_fetch: cache is shut down");
@@ -4081,7 +4136,7 @@ public:
             } else {
                 flush_guard fg{mm_};
                 auto lock = acquire_write_lock_for_key(key);
-                // P-HIGH-3 (T-H2): TOCTOU re-check inside the lock.
+                // TOCTOU re-check inside the lock.
                 if (recheck_shutdown_in_lock()) {
                     throw cache_closed_exception(
                         "unified_cache::try_get_or_fetch: cache is shut down");
@@ -4105,7 +4160,7 @@ public:
             }
             return result;
         } catch (...) {
-            // T-M1: Propagate provider/insertion exception to followers.
+            // Propagate provider/insertion exception to followers.
             if (sf_is_leader) {
                 singleflight_.complete(key, sf_state, std::nullopt,
                                         std::current_exception());
@@ -4135,7 +4190,7 @@ public:
         if constexpr (is_striped) {
             handle = mm_.peek_for_get(key);
             if (!handle && detail::tls_last_incRef_was_overflow()) {
-                // P1-34 (fix.01 方案 A): found but unpinnable (access_ref
+                // found but unpinnable (access_ref
                 // saturated) — account for it and retry once instead of
                 // reporting a miss. See note_peek_overflow_if_any().
                 note_peek_overflow_if_any(shard_idx);
@@ -4180,7 +4235,7 @@ public:
             flush_guard fg{mm_};
             handle = mm_.peek_for_get(key);
             if (!handle && detail::tls_last_incRef_was_overflow()) {
-                // P1-34 (fix.01 方案 A): see the striped branch above.
+                // see the striped branch above.
                 note_peek_overflow_if_any(shard_idx);
                 std::this_thread::yield();
                 handle = mm_.peek_for_get(key);
@@ -4220,7 +4275,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // T16.3: Pre-hashed API. Callers that already computed `Hash{}(key)`
+    // Pre-hashed API. Callers that already computed `Hash{}(key)`
     // can pass it in to avoid redundant re-hashing across shard dispatch,
     // stripe selection, and hash-table lookup. For string keys this can
     // save ~100ns per operation (2 saved hash computations).
@@ -4231,7 +4286,7 @@ public:
     // undefined behavior (wrong shard, wrong stripe, silent data loss).
     // --------------------------------------------------------------------
 
-    /// T16.3: `get` with a pre-computed hash. Equivalent to `get(key)`
+    /// `get` with a pre-computed hash. Equivalent to `get(key)`
     /// but reuses the caller's hash for shard dispatch and stripe locking.
     /// Returns an empty read_handle on miss (consistent with `get()`).
     /// Throws cache_closed_exception on shutdown.
@@ -4247,8 +4302,8 @@ public:
             if constexpr (is_striped) return mm_.shard(shard_idx).stats();
             else return mm_.stats();
         }();
-        // O2: capture latency for slow-query threshold check.
-        // O1: trace_notifier declared before slow_query_notifier so it
+        // capture latency for slow-query threshold check.
+        // trace_notifier declared before slow_query_notifier so it
         // destructs after both, reading latency + hit flag.
         std::uint64_t get_latency_ns = 0;
         bool trace_hit = false;
@@ -4261,7 +4316,7 @@ public:
             &get_latency_ns);
 
         if constexpr (is_striped) {
-            // P1-7: Reuse the caller-supplied hash for the hash-table lookup.
+            // Reuse the caller-supplied hash for the hash-table lookup.
             // The previous code called peek_for_get(key), which re-computes
             // Hash{}(key) internally — defeating the purpose of the pre-hashed
             // API and adding a redundant hash computation on every get_prehashed
@@ -4306,7 +4361,7 @@ public:
         }
     }
 
-    /// T16.3: `try_get` with a pre-computed hash. Non-throwing variant.
+    /// `try_get` with a pre-computed hash. Non-throwing variant.
     /// Returns std::nullopt on miss or shutdown; otherwise an engaged
     /// optional containing the read_handle.
     std::optional<read_handle<Value>> try_get_prehashed(const Key& key, std::size_t hash) noexcept {
@@ -4320,14 +4375,14 @@ public:
         }
     }
 
-    /// T16.3: `set` with a pre-computed hash.
+    /// `set` with a pre-computed hash.
     template <typename V>
     void set_prehashed(const Key& key, std::size_t hash, V&& value) {
-        // P-HIGH-3 (T-H2): Unified pre-write validation.
+        // Unified pre-write validation.
         if (pre_write_check("set_prehashed") == pre_write_result::kRejectInsert) {
             return;
         }
-        // P1-1 (T2.2): Drain TLS ring before write lock — see set().
+        // Drain TLS ring before write lock — see set().
         maybe_drain_tls_ring_pre_evict();
         const std::size_t shard_idx = [&]() -> std::size_t {
             if constexpr (is_striped) return mm_.shard_for_hash(hash);
@@ -4337,8 +4392,8 @@ public:
             if constexpr (is_striped) return mm_.shard(shard_idx).stats();
             else return mm_.stats();
         }();
-        // O2: capture latency for slow-query threshold check.
-        // O1: trace_notifier declared before slow_query_notifier so it
+        // capture latency for slow-query threshold check.
+        // trace_notifier declared before slow_query_notifier so it
         // destructs after both, reading latency + hit flag.
         std::uint64_t set_latency_ns = 0;
         bool trace_hit = false;
@@ -4350,7 +4405,7 @@ public:
             stats_ref.latency_tracking_enabled.load(std::memory_order_relaxed),
             &set_latency_ns);
 
-        // P-HIGH-2 (T-H1): Capture OOM event inside the write lock,
+        // Capture OOM event inside the write lock,
         // dispatch the handler *after* lock release — see set().
         std::optional<oom_event> oom_evt;
 
@@ -4366,7 +4421,7 @@ public:
         } else {
             flush_guard fg{mm_};
             auto lock = acquire_write_lock_for_key(key);
-            // P1-38 (fix.01 方案 A): re-check shutdown under the lock.
+            // re-check shutdown under the lock.
             if (recheck_shutdown_in_lock()) return;
             if (!check_memory_admission(key, value)) { report_write_rejected(key, value); return; }
             if (!apply_overflow_policy_for_set(key, 0)) return;
@@ -4375,12 +4430,12 @@ public:
             oom_evt = check_memory_pressure();
             maybe_report_memory_to_monitor();
         }
-        // P-HIGH-2 (T-H1): Dispatch OOM handler outside the write lock.
+        // Dispatch OOM handler outside the write lock.
         dispatch_oom_event(oom_evt);
     }
 
-    /// T16.3: `peek` with a pre-computed hash.
-    /// P1-8: Lock-free — the underlying mm_.peek_with_hash() uses
+    /// `peek` with a pre-computed hash.
+    /// Lock-free — the underlying mm_.peek_with_hash() uses
     /// find_and_pin_lockfree() (hazptr/EBR-protected), which is thread-safe
     /// without external locking. The previous implementation acquired a
     /// read lock, which was both unnecessary (the hash table's lock-free
@@ -4398,8 +4453,8 @@ public:
         }
     }
 
-    /// T16.3: `contains` with a pre-computed hash.
-    /// P1-8: Lock-free — mm_.contains_with_hash() delegates to the hash
+    /// `contains` with a pre-computed hash.
+    /// Lock-free — mm_.contains_with_hash() delegates to the hash
     /// table's contains(), which uses optimistic seqlock reads + hazptr
     /// fallback. No external lock needed. The previous read lock added
     /// contention without providing any safety guarantee (contains()
@@ -4444,10 +4499,15 @@ public:
         requires std::invocable<Eq, const Value&, const Value&> &&
                  std::convertible_to<std::invoke_result_t<Eq, const Value&, const Value&>, bool>
     bool cas(const Key& key, const Value& expected, Value desired, Eq&& eq_pred) {
-        // P0-5 (fix.01): cas mutates the cache, so it honours the
-        // shutdown/quiesce guard like every other write path. It previously
-        // slipped past it, letting a quiesced cache be mutated mid-snapshot.
-        (void)pre_write_check("cas");
+        // cas mutates the cache, so it honours the shutdown/quiesce guard like
+        // every other write path. The memory-critical rejection is NOT
+        // discarded here (unlike del/remove/pop/evict, which only free memory):
+        // cas can install a larger value, so rejecting it under memory pressure
+        // is the consistent behaviour with set().
+        if (pre_write_check("cas") == pre_write_result::kRejectInsert) {
+            report_write_rejected(key, desired);
+            return false;
+        }
         // Task B: cache shard_idx once per call.
         const std::size_t shard_idx = [&]() -> std::size_t {
             if constexpr (is_striped) return mm_.shard_for(key);
@@ -4520,8 +4580,11 @@ public:
         // The policy parameter selects this overload; only lockfree is valid.
         // (kLockedPredicate callers use the 4-arg overload above.)
         (void)policy;
-        // P0-5 (fix.01): see the 4-arg overload.
-        (void)pre_write_check("cas");
+        // See the 4-arg overload: the memory-critical rejection is honoured.
+        if (pre_write_check("cas") == pre_write_result::kRejectInsert) {
+            report_write_rejected(key, desired);
+            return false;
+        }
         // Task B: cache shard_idx once per call.
         const std::size_t shard_idx = [&]() -> std::size_t {
             if constexpr (is_striped) return mm_.shard_for(key);
@@ -4616,7 +4679,7 @@ public:
         std::vector<std::optional<read_handle<Value>>> results(keys.size());
 
         if constexpr (has_per_shard_lock_v<mm_type>) {
-            // P1-2 (fix.01 方案 A): for `sharded_mm_lru` we MUST acquire the
+            // for `sharded_mm_lru` we MUST acquire the
             // per-shard WRITE lock — exactly as set_multi() already does — and
             // not the stripe lock. `mm_.promote()` moves the item in the
             // intrusive list and takes no lock of its own (sharded_mm_lru::
@@ -4655,7 +4718,7 @@ public:
                 flush_shard_pending(shard_idx);
             }
         } else if constexpr (is_striped) {
-            // P1-4: group by (stripe, shard) pair. Previously keys were
+            // group by (stripe, shard) pair. Previously keys were
             // grouped by stripe only and the shard_idx was cached from
             // the first key — that assumed stripe_idx == shard_idx, which
             // no longer holds now that shards use the high hash bits.
@@ -4786,7 +4849,7 @@ public:
     /// The returned shared_ptr holds a copy of the value, safe to use even if the
     /// cache entry is later evicted. Returns nullptr on cache miss.
     std::shared_ptr<Value> get_shared(const Key& key) {
-        // P1-34 (fix.01): reject reads after shutdown (see contains()).
+        // reject reads after shutdown (see contains()).
         if (is_shutdown()) return nullptr;
         // Task B: cache shard_idx once per call.
         const std::size_t shard_idx = [&]() -> std::size_t {
@@ -4795,7 +4858,7 @@ public:
         }();
         auto h = mm_.peek_for_get(key);
         if (!h && detail::tls_last_incRef_was_overflow()) {
-            // P1-34 (fix.01 方案 A): the item WAS found but could not be pinned
+            // the item WAS found but could not be pinned
             // because its access_ref counter saturated. Account for it (the
             // counter is what operators alert on) and retry once — saturation is
             // transient, since the pinning handles are being released. Without
@@ -4841,7 +4904,7 @@ public:
     auto get_view(const Key& key) const {
         // Lock-free: peek() uses find_and_pin() to atomically pin the item.
         // The read_handle h keeps the item alive during view construction.
-        // P1-34 (fix.01): reject reads after shutdown (see contains()).
+        // reject reads after shutdown (see contains()).
         auto h = [&]() {
             if (is_shutdown()) return decltype(mm_.peek(key)){};
             return mm_.peek(key);
@@ -4885,14 +4948,31 @@ public:
         return result;
     }
 
+    /// Attribute a successful explicit removal to the shard that owned the key.
+    ///
+    /// Counted at the cache layer rather than in each strategy's del(), so every
+    /// removal entry point is covered by construction and the three eviction
+    /// reasons stay comparable.
+    void note_explicit_removal(const Key& key) {
+        if constexpr (has_per_shard_lock_v<mm_type>) {
+            mm_.shard(mm_.shard_for_hash(Hash{}(key)))
+                .stats()
+                .evictions_explicit.value.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            mm_.stats().evictions_explicit.value.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+
     bool del(const Key& key) {
-        // P0-5 (fix.01): every mutating path must honour the shutdown/quiesce
+        // every mutating path must honour the shutdown/quiesce
         // guard. Deletes only free memory, so the memory-critical rejection is
         // intentionally ignored here; a closed cache must not mutate, though.
         (void)pre_write_check("del");
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
             auto result = mm_.del(key);
+            if (result) note_explicit_removal(key);
             maybe_report_memory_to_monitor();
             flush_shard_pending(key);
             return result;
@@ -4900,6 +4980,7 @@ public:
             flush_guard fg{mm_};
             auto lock = acquire_write_lock_for_key(key);
             auto result = mm_.del(key);
+            if (result) note_explicit_removal(key);
             maybe_report_memory_to_monitor();
             return result;
         }
@@ -4909,7 +4990,7 @@ public:
     /// The item is removed from the cache immediately; memory is
     /// freed when all outstanding handles are released.
     bool force_del(const Key& key) {
-        // P0-5 (fix.01): see del().
+        // see del().
         (void)pre_write_check("force_del");
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
@@ -4945,7 +5026,7 @@ public:
 
     /// Delete with extended result code.
     DelResult del_ex(const Key& key) {
-        // P0-5 (fix.01): see del().
+        // see del().
         (void)pre_write_check("del_ex");
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
@@ -4979,11 +5060,11 @@ public:
         }
     }
 
-    // B16: 返回 RemoveRes 的删除操作
+    // Removal that reports a structured RemoveRes.
     RemoveRes remove(const Key& key) {
-        // P0-5 (fix.01): see del().
+        // see del().
         (void)pre_write_check("remove");
-        // T14.1: Compact path.
+        // Compact path.
         if constexpr (Trait::is_compact) {
             bool removed = compact().del(key);
             return removed ? RemoveRes::kSuccess : RemoveRes::kNotFound;
@@ -4992,6 +5073,7 @@ public:
             auto lock = acquire_write_lock_for_key(key);
             auto result = mm_.del(key) ? RemoveRes::kSuccess : RemoveRes::kNotFound;
             if (result == RemoveRes::kSuccess) {
+                note_explicit_removal(key);
                 maybe_report_memory_to_monitor();
             }
             flush_shard_pending(key);
@@ -5001,6 +5083,7 @@ public:
             auto lock = acquire_write_lock_for_key(key);
             auto result = mm_.del(key) ? RemoveRes::kSuccess : RemoveRes::kNotFound;
             if (result == RemoveRes::kSuccess) {
+                note_explicit_removal(key);
                 maybe_report_memory_to_monitor();
             }
             return result;
@@ -5013,7 +5096,7 @@ public:
     ///
     /// All current MM types implement pop(); this function requires that method.
     std::optional<Value> pop(const Key& key) {
-        // P0-5 (fix.01): see del().
+        // see del().
         (void)pre_write_check("pop");
         if constexpr (is_striped) {
             auto lock = acquire_write_lock_for_key(key);
@@ -5046,9 +5129,9 @@ public:
     /// Pop the LRU item from the cache. Unlike eviction, this does NOT fire
     /// eviction callbacks. Returns std::nullopt if the cache is empty.
     std::optional<std::pair<Key, Value>> pop_lru() {
-        // P0-5 (fix.01): see del().
+        // see del().
         (void)pre_write_check("pop_lru");
-        // P1-1 (T2.2): Drain TLS ring before write lock — see set().
+        // Drain TLS ring before write lock — see set().
         maybe_drain_tls_ring_pre_evict();
         flush_guard fg{mm_};
         auto lock = acquire_write_lock();
@@ -5066,9 +5149,9 @@ public:
     /// Evict one item according to the MM strategy. This fires eviction callbacks.
     /// Returns true if an item was evicted.
     bool evict() {
-        // P0-5 (fix.01): see del().
+        // see del().
         (void)pre_write_check("evict");
-        // P1-1 (T2.2): Drain TLS ring before write lock — see set().
+        // Drain TLS ring before write lock — see set().
         maybe_drain_tls_ring_pre_evict();
         flush_guard fg{mm_};
         auto lock = acquire_write_lock();
@@ -5094,7 +5177,14 @@ public:
     }
 
     void flush() {
-        // T14.1: Compact path.
+        // flush() is a full-cache mutation, so it honours the same
+        // shutdown/quiesce guard as every other write path. Without it a
+        // quiesced cache could be emptied mid-snapshot, breaking the
+        // "nothing mutates while save_atomic() serializes" invariant that
+        // makes the snapshot transactional. The memory-critical result is
+        // intentionally ignored: flushing only frees memory.
+        (void)pre_write_check("flush");
+        // Compact path.
         if constexpr (Trait::is_compact) {
             compact().flush();
             return;
@@ -5104,7 +5194,7 @@ public:
         tls_callback_ring<Key, Value>::flush_all_registered();
         flush_guard fg{mm_};
         auto lock = acquire_write_lock();
-        // P1-8 (T2.6 bugfix, phase 3): `mm_.flush()` now refreshes hash
+        // `mm_.flush()` now refreshes hash
         // stats internally (between Pass 1 and Pass 2, before any items
         // are retired). The previous external `mm_.refresh_hash_stats()`
         // call was removed because it traversed hash chains AFTER items
@@ -5157,7 +5247,7 @@ public:
     /// Recommended for production read-heavy-write-light workloads where
     /// write-path P99 latency matters. Should be called before the cache fills up.
     ///
-    /// T19.2: Effective for ALL hash table modes:
+    /// Effective for ALL hash table modes:
     ///   - **Chain mode** (`chain_probing_tag`): migrates one bucket at a time
     ///     per insert/erase, draining the old bucket list into the new array.
     ///   - **F14 SIMD mode** (`f14_probing_tag`): migrates one 14-slot chunk at
@@ -5181,16 +5271,16 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // T2.1 / T2.4: EBR (Epoch-Based Reclamation) integration
+    // EBR (Epoch-Based Reclamation) integration
     // --------------------------------------------------------------------
 
-    /// T2.1: Set the EBR domain for deferred reclamation. When non-null,
+    /// Set the EBR domain for deferred reclamation. When non-null,
     /// the read path (find_and_pin_lockfree) acquires an epoch_guard at
     /// entry, protecting all nodes from reclamation during traversal.
     /// Evicted items are retired via the domain's retire() instead of
     /// hazptr. Propagated to all shards for sharded caches.
     ///
-    /// T2.4: Use is_ebr_mode() to check if EBR is active. Callers can
+    /// Use is_ebr_mode() to check if EBR is active. Callers can
     /// use concurrent_hash_table::reclaim_guard for mode-agnostic code.
     ///
     /// Note: Only mm_lru and sharded_mm_lru support EBR. Calling this
@@ -5212,7 +5302,7 @@ public:
         }
     }
 
-    /// T2.4: Check whether EBR mode is active (domain has been set).
+    /// Check whether EBR mode is active (domain has been set).
     /// Returns false for MM types that don't support EBR.
     bool is_ebr_mode() const noexcept {
         if constexpr (is_striped) {
@@ -5230,7 +5320,7 @@ public:
         }
     }
 
-    /// R9 (per-shard EBR): Enable an independent epoch_domain per shard.
+    /// Enable an independent epoch_domain per shard.
     ///
     /// Each shard gets its own EBR domain, so reclamation on one shard is
     /// scoped to that shard's readers instead of the whole cache. This is
@@ -5284,16 +5374,16 @@ public:
         return true;
     }
 
-    /// R9: True when per-shard EBR domains are active.
+    /// True when per-shard EBR domains are active.
     bool per_shard_ebr_enabled() const noexcept { return per_shard_ebr_enabled_; }
 
-    /// R9: Number of active EBR domains (1 global default, or N per-shard).
+    /// Number of active EBR domains (1 global default, or N per-shard).
     std::size_t ebr_domain_count() const noexcept {
         return per_shard_ebr_enabled_ ? per_shard_ebr_domains_.size() : 1;
     }
 
 private:
-    /// R9: Invoke `fn(detail::epoch_domain&)` on every active EBR domain.
+    /// Invoke `fn(detail::epoch_domain&)` on every active EBR domain.
     /// When per-shard EBR is enabled, this iterates the per-shard domains;
     /// otherwise it calls fn on the global default domain exactly once.
     /// Used by the reclaim worker and reclamation metrics so per-shard
@@ -5310,7 +5400,7 @@ private:
         }
     }
 
-    /// R9: Aggregate pending (unreclaimed) object count across all active
+    /// Aggregate pending (unreclaimed) object count across all active
     /// EBR domains.
     std::size_t ebr_pending_count() const noexcept {
         std::size_t total = 0;
@@ -5320,7 +5410,7 @@ private:
         return total;
     }
 
-    /// R9: Aggregate total objects reclaimed across all active EBR domains.
+    /// Aggregate total objects reclaimed across all active EBR domains.
     std::size_t ebr_reclaim_total() const noexcept {
         std::size_t total = 0;
         for_each_ebr_domain([&](detail::epoch_domain& dom) {
@@ -5329,7 +5419,7 @@ private:
         return total;
     }
 
-    /// R9: Aggregate force-advance count (stuck-slot skips) across all
+    /// Aggregate force-advance count (stuck-slot skips) across all
     /// active EBR domains.
     std::size_t ebr_force_advance_count() const noexcept {
         std::size_t total = 0;
@@ -5341,7 +5431,7 @@ private:
 
 public:
 
-    /// T-G4: Query the EBR force-advance policy of the default epoch
+    /// Query the EBR force-advance policy of the default epoch
     /// domain. `kFailAdvance` (default) refuses to advance the epoch
     /// when a slot is stuck, preventing UAF at the cost of un-reclaimed
     /// memory. See `detail::force_advance_policy` for the full semantics.
@@ -5349,13 +5439,13 @@ public:
         return get_force_advance_policy();
     }
 
-    /// T-G4: Set the EBR force-advance policy on the default epoch
+    /// Set the EBR force-advance policy on the default epoch
     /// domain. Operators can opt in to `kForceAdvanceAfter5s` (old
     /// behavior) when they accept the UAF risk in exchange for
     /// guaranteed reclamation progress. R9: propagates to every active
     /// EBR domain (global default or per-shard domains).
     void set_epoch_force_advance_policy(detail::force_advance_policy policy) noexcept {
-        // P0-4: Surface the memory-safety risk of force-advance policies
+        // Surface the memory-safety risk of force-advance policies
         // loudly. kForceAdvanceAfter5s / kForceAdvanceAfterNs skip stuck
         // TLS slots after a timeout; a thread descheduled past the timeout
         // (GC pause, SIGSTOP, cgroup throttle) can later dereference a
@@ -5374,7 +5464,7 @@ public:
         set_force_advance_policy(policy);
     }
 
-    /// T11.5: Set the rehash strategy by name. String-based API for
+    /// Set the rehash strategy by name. String-based API for
     /// configuration files / CLI flags. Equivalent to:
     ///   - "incremental": set_incremental_rehash(true)
     ///   - "blocking":    set_incremental_rehash(false)
@@ -5392,7 +5482,7 @@ public:
         }
     }
 
-    /// T11.5: Query the current rehash strategy by name.
+    /// Query the current rehash strategy by name.
     std::string_view rehash_strategy() const noexcept {
         if constexpr (is_striped) {
             return mm_.shard(0).rehash_strategy();
@@ -5401,7 +5491,7 @@ public:
         }
     }
 
-    /// T11.3: Number of writes blocked by a non-incremental (blocking) rehash.
+    /// Number of writes blocked by a non-incremental (blocking) rehash.
     /// Non-zero values indicate the user should enable incremental rehash to
     /// avoid stalling writers during hash table expansion. Aggregated across
     /// all shards for striped caches.
@@ -5417,7 +5507,7 @@ public:
         }
     }
 
-    /// P1-5: Number of times find_and_pin_lockfree fell back to the
+    /// Number of times find_and_pin_lockfree fell back to the
     /// lock-protected path because the target segment was in incremental
     /// rehash. Aggregated across all shards for striped caches.
     std::size_t rehash_lockfree_fallback_count() const noexcept {
@@ -5432,7 +5522,7 @@ public:
         }
     }
 
-    /// P0-D: Fraction of the hash table currently in an incremental rehash.
+    /// Fraction of the hash table currently in an incremental rehash.
     /// For segmented tables this is the average fraction of segments
     /// rehashing across all shards; for non-segmented tables it is 0.0
     /// (idle) or 1.0 (rehashing). Exposed as a Prometheus gauge so
@@ -5452,10 +5542,10 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // T13: Hash overload detection and callback
+    // Hash overload detection and callback
     // --------------------------------------------------------------------
 
-    /// T13.1: Set the hash table load factor threshold above which the
+    /// Set the hash table load factor threshold above which the
     /// overload callback fires and `hash_overload_events` is incremented.
     /// Default: 2.0. Lower this for latency-sensitive workloads (e.g.
     /// 1.5) to get earlier warning of capacity pressure; raise it for
@@ -5472,7 +5562,7 @@ public:
         }
     }
 
-    /// T13.2: Register a callback invoked when the hash table load
+    /// Register a callback invoked when the hash table load
     /// factor exceeds `hash_overload_threshold`. The callback receives
     /// (current_load_factor, threshold) and is called from the rehash
     /// hot path — it must be cheap and non-blocking. Exceptions are
@@ -5494,7 +5584,7 @@ public:
         }
     }
 
-    /// P2-4 (T2.4): Toggle async mode for the overload callback on every
+    /// Toggle async mode for the overload callback on every
     /// shard's hash table. See `concurrent_hash_table::set_async_overload_callback`
     /// for semantics. When enabled, the rehash hot path enqueues overload
     /// events instead of invoking the user callback inline; a background
@@ -5514,7 +5604,7 @@ public:
         }
     }
 
-    /// P2-4 (T2.4): Drain pending overload events from every shard's hash
+    /// Drain pending overload events from every shard's hash
     /// table and dispatch the registered callback for each. Returns the
     /// total number of events drained across all shards. Designed to be
     /// called from a background worker (the event drain worker invokes
@@ -5550,7 +5640,7 @@ public:
         std::vector<std::size_t> per_shard_size;             // items per shard
         std::vector<std::size_t> per_shard_bucket_count;     // hash table buckets per shard
 
-        // P1-2: Per-shard fine-grained metrics for hotspot detection.
+        // Per-shard fine-grained metrics for hotspot detection.
         std::vector<std::size_t> per_shard_hits;             // hits per shard
         std::vector<std::size_t> per_shard_misses;           // misses per shard
         std::vector<std::size_t> per_shard_evictions;        // evictions per shard
@@ -5566,7 +5656,7 @@ public:
         // TLS access ring (calling thread's view).
         std::size_t tls_ring_backlog{0};
         std::size_t tls_ring_dropped_promotions{0};  // cumulative
-        // T-M4: Cross-thread TLS backlog aggregate. While `tls_ring_backlog`
+        // Cross-thread TLS backlog aggregate. While `tls_ring_backlog`
         // reflects only the calling thread's ring (the per-thread view),
         // `tls_ring_backlog_total` is the aggregate across all threads
         // — the metric operators actually need to detect backlog overflow
@@ -5578,7 +5668,7 @@ public:
         // staleness (<= 64 per thread) — sufficient for overflow
         // detection, which only needs trend-level accuracy.
         std::size_t tls_ring_backlog_total{0};
-        // T-M4: Per-shard retire-pending snapshot. Hazptr/EBR domains are
+        // Per-shard retire-pending snapshot. Hazptr/EBR domains are
         // global by default (retired objects go to one shared domain), so
         // for the default configuration every shard will report the same
         // value (the global pending count). This vector is sized
@@ -5596,14 +5686,14 @@ public:
         bool incremental_rehash_enabled{false};
         std::size_t num_shards{1};
 
-        // T19.3: Probing / hashing mode in effect. Operators reading a
+        // Probing / hashing mode in effect. Operators reading a
         // diagnostics dump need to know whether the cache is running in
         // chain mode, F14 SIMD mode, or segmented mode, because the rehash
         // behaviour and the meaning of bucket_count differ across modes.
         bool f14_probing{false};        // true if F14 SIMD probing is active
         bool segmented_hash_table{false}; // true if 64-segment table is active
         bool compressed_hook{false};     // true if compressed_intrusive_hook is in use
-        // T-P1-3 (R-3): EmbeddedChain mode. When false, the hash table
+        // EmbeddedChain mode. When false, the hash table
         // degrades all lock-free read paths to shared_lock fallback
         // (use-after-free prevention), killing read throughput under high
         // concurrency. production_cache and all MM strategies assert this
@@ -5613,7 +5703,7 @@ public:
         // fallback" hard constraint.
         bool embedded_chain{false};      // true if hash table uses EmbeddedChain (lock-free reads)
 
-        // T17.3: Deferred-reclamation health (hazptr + EBR).
+        // Deferred-reclamation health (hazptr + EBR).
         // These mirror the fields already exposed via stats_snapshot() /
         // prometheus_text(); surfacing them here lets operators see reclaim
         // state alongside lock/rehash diagnostics in a single dump.
@@ -5628,7 +5718,7 @@ public:
         std::size_t reclaim_freed_bytes{0};
         std::size_t reclaim_invocation_count{0};
 
-        // R9: pending-deletion soft-cap observability. Items explicitly
+        // pending-deletion soft-cap observability. Items explicitly
         // force-deleted while still holding active read_handles are deferred
         // in `pending_deletion_` (per-shard). `pending_deletion_skipped_count`
         // counts force_del() calls REFUSED because the list was at/over the
@@ -5636,13 +5726,13 @@ public:
         std::size_t pending_deletion_count{0};
         std::size_t pending_deletion_skipped_count{0};
 
-        // R9: EBR domain layout. `per_shard_ebr_enabled` is true when each
+        // EBR domain layout. `per_shard_ebr_enabled` is true when each
         // shard owns an independent epoch_domain (via enable_per_shard_ebr());
         // `ebr_domain_count` is 1 (global default) or the number of shards.
         bool per_shard_ebr_enabled{false};
         std::size_t ebr_domain_count{1};
 
-        // L-1: Hazptr slot-exhaustion diagnostics. Surface the hard-cap
+        // Hazptr slot-exhaustion diagnostics. Surface the hard-cap
         // fallback path so operators can alert before acquire_slot()
         // starts throwing std::runtime_error (which happens after
         // kMaxSyncFallbacks=64 sync-reclaim rounds all fail to free a
@@ -5655,7 +5745,7 @@ public:
         std::size_t hazptr_slot_exhaustion_count{0};
         std::size_t hazptr_sync_fallback_count{0};
         std::size_t hazptr_slot_capacity{0};
-        // P0-3: hazptr slot usage gauge. `hazptr_active_slot_count` is
+        // hazptr slot usage gauge. `hazptr_active_slot_count` is
         // the current live handle count; `hazptr_max_slot_count` is the
         // runtime-configurable upper bound (default 8192, raised via
         // `set_hazptr_max_slots()`); `hazptr_slot_usage_ratio` is the
@@ -5667,7 +5757,7 @@ public:
         std::size_t hazptr_max_slot_count{0};
         float hazptr_slot_usage_ratio{0.0f};
 
-        // P0-2: EBR force-advance policy and counters. Surface the active
+        // EBR force-advance policy and counters. Surface the active
         // policy and how often the safety net has fired so operators can
         // detect stuck-thread scenarios and tune the policy / timeout.
         //   - ebr_force_advance_policy: 0=kFailAdvance, 1=kForceAdvanceAfter5s,
@@ -5679,7 +5769,7 @@ public:
         std::size_t ebr_force_advance_count{0};
         std::size_t ebr_epoch_stale_count{0};
 
-        // T-B4 (P2-10): Diagnostics cache freshness.
+        // Diagnostics cache freshness.
         // Age of the cached hash-table diagnostics snapshot, in milliseconds.
         // Returns std::numeric_limits<uint64_t>::max() if the cache has never
         // been refreshed OR the underlying hash table doesn't cache
@@ -5689,21 +5779,21 @@ public:
         // authoritative value.
         std::uint64_t diagnostics_cache_age_ms{0};
 
-        // P1-3: Drain worker started flag. When false, the hazptr
+        // Drain worker started flag. When false, the hazptr
         // domain's retire_obj() will emit a one-shot stderr warning on
         // the first retire. Operators should call start_event_drain()
         // at startup to set this to true; thread-safe aliases do this
         // automatically at construction.
         bool drain_worker_started{false};
 
-        // P1-2: Active fairness mode. "writer_fair" (default) prevents
+        // Active fairness mode. "writer_fair" (default) prevents
         // writer starvation under sustained read load; "reader_preferred"
         // maximizes read throughput at the cost of writer latency.
         // Surfaced so operators can verify the active mode without
         // calling get_fairness_mode() separately.
         std::string fairness_mode_str{"writer_fair"};
 
-        // P1-1: Writer starvation detector metrics. Only meaningful in
+        // Writer starvation detector metrics. Only meaningful in
         // reader_preferred mode — in writer_fair mode writers are
         // already served promptly and these counters stay 0.
         //   - writer_starvation_events: number of times a reader was
@@ -5712,6 +5802,21 @@ public:
         //   - writer_max_wait_ns: maximum observed writer wait time.
         std::size_t writer_starvation_events{0};
         std::uint64_t writer_max_wait_ns{0};
+
+        // Latency percentiles (ns) for the hot paths, derived from the same
+        // histograms Prometheus exports. They read 0 unless latency tracking is
+        // enabled (set_latency_tracking(true)) — the histograms are gated on it.
+        // Operators get the tail directly instead of having to compute it from
+        // a scrape.
+        std::uint64_t get_latency_p50{0};
+        std::uint64_t get_latency_p95{0};
+        std::uint64_t get_latency_p99{0};
+        std::uint64_t set_latency_p50{0};
+        std::uint64_t set_latency_p95{0};
+        std::uint64_t set_latency_p99{0};
+        std::uint64_t read_lock_wait_p99{0};
+        std::uint64_t write_lock_wait_p99{0};
+        std::uint64_t eviction_search_steps_p99{0};
     };
 
     /// Snapshot of runtime diagnostics. Lock-free / atomic reads only;
@@ -5722,13 +5827,13 @@ public:
         diagnostics_info info;
         info.defer_promotion_enabled = is_defer_promotion_enabled();
         info.incremental_rehash_enabled = incremental_rehash_enabled();
-        // T19.3: Surface the probing/hashing mode so operators can tell at
+        // Surface the probing/hashing mode so operators can tell at
         // a glance whether the cache is running chain, F14, or segmented.
         info.f14_probing = std::is_same_v<typename trait_type::probing_style,
                                          detail::f14_probing_tag>;
         info.segmented_hash_table = trait_type::segmented;
         info.compressed_hook = trait_type::uses_compressed_hook;
-        // T-P1-3 (R-3): Surface EmbeddedChain mode so operators can verify
+        // Surface EmbeddedChain mode so operators can verify
         // at runtime that the cache is using lock-free reads. All MM
         // strategies expose `map_type::uses_embedded_chain`. Detection is
         // guarded by `if constexpr (requires {...})` for forward
@@ -5742,7 +5847,7 @@ public:
         info.tls_ring_backlog = tls_access_ring<Key>::instance().size();
         info.tls_ring_dropped_promotions =
             tls_access_ring<Key>::dropped_count_all_threads();
-        // T-M4: Cross-thread backlog aggregate. The per-thread view above is
+        // Cross-thread backlog aggregate. The per-thread view above is
         // misleading for production monitoring — a single shard with high
         // backlog but only inspected from a low-traffic thread would read
         // ~0. The atomic aggregate across all threads is the right signal.
@@ -5759,7 +5864,7 @@ public:
             info.per_stripe_try_fail_count.reserve(info.num_shards);
             info.per_shard_size.reserve(info.num_shards);
             info.per_shard_bucket_count.reserve(info.num_shards);
-            // P1-2: Reserve fine-grained per-shard vectors.
+            // Reserve fine-grained per-shard vectors.
             info.per_shard_hits.reserve(info.num_shards);
             info.per_shard_misses.reserve(info.num_shards);
             info.per_shard_evictions.reserve(info.num_shards);
@@ -5775,7 +5880,7 @@ public:
                     s.current_size.load(std::memory_order_relaxed));
                 info.per_shard_bucket_count.push_back(
                     mm_.shard(i).bucket_count());
-                // P1-2: Fine-grained per-shard metrics.
+                // Fine-grained per-shard metrics.
                 info.per_shard_hits.push_back(
                     s.hits.value.load(std::memory_order_relaxed));
                 info.per_shard_misses.push_back(
@@ -5807,7 +5912,7 @@ public:
             } else {
                 info.per_shard_bucket_count.push_back(0);
             }
-            // P1-2: Fine-grained metrics for non-sharded caches.
+            // Fine-grained metrics for non-sharded caches.
             info.per_shard_hits.push_back(
                 s.hits.value.load(std::memory_order_relaxed));
             info.per_shard_misses.push_back(
@@ -5825,7 +5930,7 @@ public:
                 info.rehash_new_bucket_count = mm_.rehash_new_bucket_count();
             }
         }
-        // T17.3: Refresh deferred-reclamation counters from the global
+        // Refresh deferred-reclamation counters from the global
         // hazptr/EBR domains and the per-cache accumulator. Mirrors the
         // logic in stats_snapshot() so diagnostics_text() and Prometheus
         // report consistent numbers. Lock-free reads only.
@@ -5834,12 +5939,12 @@ public:
         std::size_t total = detail::hazptr_domain::default_domain().reclaim_total()
                           + ebr_reclaim_total();
         info.reclaim_pending_count = pending;
-        // R9: pending-deletion soft-cap + EBR domain layout observability.
+        // pending-deletion soft-cap + EBR domain layout observability.
         info.pending_deletion_count = pending_deletion_count();
         info.pending_deletion_skipped_count = pending_deletion_skipped_count();
         info.per_shard_ebr_enabled = per_shard_ebr_enabled_;
         info.ebr_domain_count = ebr_domain_count();
-        // T-M4: Populate per-shard retire-pending. Hazptr/EBR domains are
+        // Populate per-shard retire-pending. Hazptr/EBR domains are
         // global by default, so every shard reports the same pending count
         // — we mirror `info.reclaim_pending_count` into a vector sized
         // num_shards. This keeps the field forward-compatible with
@@ -5852,33 +5957,33 @@ public:
             per_cache_stats_.reclaim_invocation_count.load(std::memory_order_relaxed);
         info.reclaim_freed_bytes =
             per_cache_stats_.reclaim_freed_bytes.load(std::memory_order_relaxed);
-        // T-B4 (P2-10): Surface the diagnostics cache age so operators
+        // Surface the diagnostics cache age so operators
         // reading a `diagnostics_text()` dump can immediately tell whether
         // the hash-table metrics (max_chain_length, per-segment load factor)
         // are fresh or stale. For non-segmented tables this returns max
         // (no cache, age is meaningless — operators should check the
         // segmented_hash_table flag first).
         info.diagnostics_cache_age_ms = diagnostics_cache_age_ms();
-        // P1-3: Surface the drain worker state so operators can verify (via
+        // Surface the drain worker state so operators can verify (via
         // a single diagnostics dump) that reclamation is actually running
         // for THIS cache. Reports the cache's own worker handles rather
         // than the process-global "was a worker ever started" flag, which
         // is monotonic and would read 1 even after this cache stopped its
         // worker.
         info.drain_worker_started = is_event_drain_running();
-        // P1-2: Surface the active fairness mode so operators can
+        // Surface the active fairness mode so operators can
         // verify (via a single diagnostics dump) whether the cache is
         // running writer_fair (default, prevents writer starvation) or
         // reader_preferred (max read throughput, may starve writers).
         info.fairness_mode_str =
             detail::fairness_mode_to_string(get_fairness_mode());
-        // P1-1: Writer starvation detector metrics. Aggregate across
+        // Writer starvation detector metrics. Aggregate across
         // all stripes for striped caches. Non-zero writer_starvation_events
         // in reader_preferred mode indicates the safety net is firing —
         // operators should consider switching to writer_fair permanently.
         info.writer_starvation_events = writer_starvation_events();
         info.writer_max_wait_ns = writer_max_wait_ns();
-        // L-1: Hazptr slot-exhaustion diagnostics. Mirror the global
+        // Hazptr slot-exhaustion diagnostics. Mirror the global
         // hazptr_domain counters into diagnostics so operators can alert
         // on sustained sync-fallback growth before acquire_slot() starts
         // throwing std::runtime_error (which happens after
@@ -5889,7 +5994,7 @@ public:
             detail::hazptr_domain::default_domain().hazptr_sync_fallback_count();
         info.hazptr_slot_capacity =
             detail::hazptr_domain::default_domain().capacity();
-        // P0-3: hazptr slot usage gauges — surface live handles and
+        // hazptr slot usage gauges — surface live handles and
         // the runtime-configurable upper bound so operators can detect
         // sustained high usage and raise the limit via
         // `set_hazptr_max_slots()` before acquire_slot() starts
@@ -5900,7 +6005,7 @@ public:
             detail::hazptr_domain::default_domain().max_slot_count();
         info.hazptr_slot_usage_ratio =
             detail::hazptr_domain::default_domain().slot_usage_ratio();
-        // P0-2: EBR force-advance diagnostics. Surface the active policy
+        // EBR force-advance diagnostics. Surface the active policy
         // (as the underlying enum integer) and the cumulative safety-net
         // counters so operators can detect stuck-thread scenarios and
         // tune the policy / timeout via set_force_advance_policy().
@@ -5908,6 +6013,22 @@ public:
             static_cast<std::size_t>(get_force_advance_policy());
         info.ebr_force_advance_count = ebr_force_advance_count();
         info.ebr_epoch_stale_count = epoch_stale_count();
+        // Latency percentiles from the aggregate histograms. Read through the
+        // same snapshot the Prometheus exporter uses, so a dump and a scrape
+        // never disagree.
+        {
+            const auto snap = stats_snapshot();
+            info.get_latency_p50 = snap.get_latency.percentile(0.50);
+            info.get_latency_p95 = snap.get_latency.percentile(0.95);
+            info.get_latency_p99 = snap.get_latency.percentile(0.99);
+            info.set_latency_p50 = snap.set_latency.percentile(0.50);
+            info.set_latency_p95 = snap.set_latency.percentile(0.95);
+            info.set_latency_p99 = snap.set_latency.percentile(0.99);
+            info.read_lock_wait_p99 = snap.read_lock_wait_latency.percentile(0.99);
+            info.write_lock_wait_p99 = snap.write_lock_wait_latency.percentile(0.99);
+            info.eviction_search_steps_p99 =
+                snap.eviction_search_steps_hist.percentile(0.99);
+        }
         return info;
     }
 
@@ -5915,7 +6036,7 @@ public:
     /// inspection via debugger or log. For Prometheus scraping use
     /// prometheus_text() instead.
     ///
-    /// T-G12: Results are cached for `diagnostics_cache_ttl_ms()`
+    /// Results are cached for `diagnostics_cache_ttl_ms()`
     /// (default 500ms) — high-frequency callers (e.g. dashboards polling
     /// at 10Hz) get the same snapshot without rebuilding on every call.
     /// Call `refresh_diagnostics_cache()` to force an immediate rebuild.
@@ -5949,6 +6070,20 @@ public:
 
         append("=== LRU cache diagnostics ===");
 
+        // Latency percentiles first: they answer "is it slow, and where" in
+        // one line each, which is the question an operator usually starts from.
+        append("--- latency (ns) ---");
+        append_kv_u64("get_latency_p50", info.get_latency_p50);
+        append_kv_u64("get_latency_p95", info.get_latency_p95);
+        append_kv_u64("get_latency_p99", info.get_latency_p99);
+        append_kv_u64("set_latency_p50", info.set_latency_p50);
+        append_kv_u64("set_latency_p95", info.set_latency_p95);
+        append_kv_u64("set_latency_p99", info.set_latency_p99);
+        append_kv_u64("read_lock_wait_p99", info.read_lock_wait_p99);
+        append_kv_u64("write_lock_wait_p99", info.write_lock_wait_p99);
+        append_kv_u64("eviction_search_steps_p99", info.eviction_search_steps_p99);
+        append("(percentiles are 0 unless set_latency_tracking(true) is enabled)");
+
         // Aggregate.
         append_kv("num_shards", info.num_shards);
         append_kv("active_handle_count", info.active_handle_count);
@@ -5962,14 +6097,14 @@ public:
         append_kv("incremental_rehash_enabled",
                   info.incremental_rehash_enabled ? 1 : 0);
 
-        // T19.3: Hash table / probing mode in effect. This is critical for
+        // Hash table / probing mode in effect. This is critical for
         // operators interpreting the rest of the dump — the rehash semantics
         // and bucket_count meaning differ across chain, F14, and segmented.
         append("--- hash table mode ---");
         append_kv("f14_probing", info.f14_probing ? 1 : 0);
         append_kv("segmented_hash_table", info.segmented_hash_table ? 1 : 0);
         append_kv("compressed_hook", info.compressed_hook ? 1 : 0);
-        // T-P1-3 (R-3): EmbeddedChain mode. Operators should alert if this
+        // EmbeddedChain mode. Operators should alert if this
         // is 0 — it means the cache is using shared_lock fallback for reads
         // (use-after-free prevention), which kills throughput under high
         // concurrency. All production aliases assert this at compile time,
@@ -5979,7 +6114,7 @@ public:
         // restate it here alongside the probing mode for a single-glance view.
         append_kv("rehash_mode",
                   info.incremental_rehash_enabled ? 1 /*incremental*/ : 0 /*blocking*/);
-        // T-B4 (P2-10): Diagnostics cache age — operators use this to
+        // Diagnostics cache age — operators use this to
         // determine if max_chain_length / per-segment LF are fresh. Only
         // meaningful when segmented_hash_table == 1 (non-segmented tables
         // don't cache). A value >> balancer interval (1s default) means
@@ -5993,7 +6128,7 @@ public:
 
         // Per-shard.
         append("--- per-stripe contention ---");
-        // T-M4: Iterate using the min size so a partial diagnostics
+        // Iterate using the min size so a partial diagnostics
         // snapshot (e.g. MM type without per-shard retire tracking wired
         // through yet) cannot trigger OOB reads.
         const std::size_t per_shard_n = std::min({info.per_stripe_wait_count.size(),
@@ -6037,7 +6172,7 @@ public:
             out.push_back('\n');
         }
 
-        // T17.3: Deferred-reclamation health. Useful for diagnosing
+        // Deferred-reclamation health. Useful for diagnosing
         // memory growth caused by reclaim starvation under sustained
         // write pressure (no quiescent point reached for hazptr/EBR).
         append("--- reclaim health (hazptr + EBR) ---");
@@ -6045,13 +6180,13 @@ public:
         append_kv("reclaim_total", info.reclaim_total);
         append_kv("reclaim_freed_bytes", info.reclaim_freed_bytes);
         append_kv("reclaim_invocation_count", info.reclaim_invocation_count);
-        // R9: pending-deletion soft cap + EBR domain layout.
+        // pending-deletion soft cap + EBR domain layout.
         append_kv("pending_deletion_count", info.pending_deletion_count);
         append_kv("pending_deletion_skipped_count", info.pending_deletion_skipped_count);
         append_kv("per_shard_ebr_enabled", info.per_shard_ebr_enabled);
         append_kv("ebr_domain_count", info.ebr_domain_count);
 
-        // L-1: Hazptr slot-exhaustion / hard-cap fallback diagnostics.
+        // Hazptr slot-exhaustion / hard-cap fallback diagnostics.
         // Non-zero hazptr_sync_fallback_count indicates the workload has
         // 8192+ live hazard pointers for extended periods — sustained
         // growth signals an imminent std::runtime_error throw from
@@ -6060,7 +6195,7 @@ public:
         append_kv("hazptr_slot_exhaustion_count", info.hazptr_slot_exhaustion_count);
         append_kv("hazptr_sync_fallback_count", info.hazptr_sync_fallback_count);
         append_kv("hazptr_slot_capacity", info.hazptr_slot_capacity);
-        // P0-3: live handle count vs runtime-configurable upper bound.
+        // live handle count vs runtime-configurable upper bound.
         // When usage_ratio exceeds 0.9, raise the limit via
         // set_hazptr_max_slots() or reduce reader fan-out.
         append_kv("hazptr_active_slot_count", info.hazptr_active_slot_count);
@@ -6076,7 +6211,7 @@ public:
             out.push_back('\n');
         }
 
-        // P0-2: EBR force-advance policy and counters. Non-zero
+        // EBR force-advance policy and counters. Non-zero
         // ebr_force_advance_count indicates stuck-thread scenarios
         // triggered the safety net — operators should investigate the
         // cause (long-running CS, GC pause, descheduled thread) and
@@ -6086,7 +6221,7 @@ public:
         append_kv("ebr_force_advance_count", info.ebr_force_advance_count);
         append_kv("ebr_epoch_stale_count", info.ebr_epoch_stale_count);
 
-        // P1-3: Drain worker state. When false, retire_obj() emits a
+        // Drain worker state. When false, retire_obj() emits a
         // one-shot stderr warning on first call — operators should
         // call start_event_drain() at startup (thread-safe aliases do
         // this automatically at construction).
@@ -6094,12 +6229,12 @@ public:
         append_kv("drain_worker_started",
             static_cast<std::size_t>(info.drain_worker_started ? 1 : 0));
 
-        // P1-2: Active fairness mode. writer_fair (default) prevents
+        // Active fairness mode. writer_fair (default) prevents
         // writer starvation; reader_preferred maximizes read throughput.
         append("--- fairness (P1-2) ---");
         append_kv_str("fairness_mode", info.fairness_mode_str);
 
-        // P1-1: Writer starvation detector metrics. Only meaningful in
+        // Writer starvation detector metrics. Only meaningful in
         // reader_preferred mode — non-zero writer_starvation_events
         // indicates the safety net fired. Operators should consider
         // switching to writer_fair permanently if events grow steadily.
@@ -6112,7 +6247,7 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // T-G12: diagnostics_json + short-time diagnostics cache
+    // diagnostics_json + short-time diagnostics cache
     // ----------------------------------------------------------------
     //
     // `diagnostics_json()` produces a structured JSON view of the same
@@ -6128,20 +6263,20 @@ public:
     // requires explicit enable + worker) because diagnostics are cheap
     // to rebuild and the cache only needs to amortize 10Hz+ polling.
 
-    /// T-G12: Return the diagnostics cache TTL in milliseconds. The
+    /// Return the diagnostics cache TTL in milliseconds. The
     /// cache is always enabled; this only controls freshness. Default
     /// 500ms — callers polling faster than this get cached results.
     std::uint32_t diagnostics_cache_ttl_ms() const noexcept {
         return diagnostics_cache_ttl_ms_.load(std::memory_order_relaxed);
     }
 
-    /// T-G12: Set the diagnostics cache TTL. Lower values trade CPU for
+    /// Set the diagnostics cache TTL. Lower values trade CPU for
     /// freshness; 0 disables caching entirely (every call rebuilds).
     void set_diagnostics_cache_ttl_ms(std::uint32_t ms) noexcept {
         diagnostics_cache_ttl_ms_.store(ms, std::memory_order_relaxed);
     }
 
-    /// T-G12: Force an immediate rebuild of the cached diagnostics
+    /// Force an immediate rebuild of the cached diagnostics
     /// snapshot. The next `diagnostics_text()` / `diagnostics_json()`
     /// call observes the fresh snapshot. Safe to call concurrently.
     void refresh_diagnostics_cache() {
@@ -6153,7 +6288,7 @@ public:
             std::memory_order_release);
     }
 
-    /// T-G12: Structured JSON diagnostics dump. Same content as
+    /// Structured JSON diagnostics dump. Same content as
     /// `diagnostics_text()` but in a machine-parseable format. Reads
     /// from the same short-time cache as `diagnostics_text()`.
     ///
@@ -6245,7 +6380,7 @@ public:
         append_kv_u_field("reclaim_total", info.reclaim_total);
         append_kv_u_field("reclaim_freed_bytes", info.reclaim_freed_bytes);
         append_kv_u_field("reclaim_invocation_count", info.reclaim_invocation_count);
-        // R9: pending-deletion soft cap + EBR domain layout.
+        // pending-deletion soft cap + EBR domain layout.
         append_kv_u_field("pending_deletion_count", info.pending_deletion_count);
         append_kv_u_field("pending_deletion_skipped_count", info.pending_deletion_skipped_count);
         append_kv_b_field("per_shard_ebr_enabled", info.per_shard_ebr_enabled);
@@ -6312,7 +6447,7 @@ public:
     }
 
 private:
-    /// T-G12: Return a shared_ptr to a cached diagnostics_info snapshot.
+    /// Return a shared_ptr to a cached diagnostics_info snapshot.
     /// Rebuilds lazily if the cache is stale (older than TTL) or empty.
     /// The returned pointer is always non-null. Safe to call concurrently.
     std::shared_ptr<const diagnostics_info> cached_diagnostics() const {
@@ -6358,7 +6493,7 @@ public:
     /// descending by total_accesses. Useful for detecting load imbalance
     /// and hash distribution skew in production.
     ///
-    /// T18.1: The struct now also carries memory_usage, pending_reclaim
+    /// The struct now also carries memory_usage, pending_reclaim
     /// (global hazptr+EBR pending count, identical across shards — per-shard
     /// retire tracking is not yet wired through cache_stats), and a per-shard
     /// rehash_in_progress flag. Use hot_shards_by_memory() to rank shards
@@ -6372,8 +6507,8 @@ public:
         double hit_rate;
         std::size_t memory_bytes;
         std::size_t rehash_count;
-        // T18.1: Memory-dimension and reclaim-dimension fields.
-        std::size_t memory_usage;          // alias for memory_bytes (named per tasks.md)
+        // Memory-dimension and reclaim-dimension fields.
+        std::size_t memory_usage;          // alias for memory_bytes
         std::size_t pending_reclaim;       // global pending reclaim count (hazptr + EBR)
         bool rehash_in_progress;           // per-shard rehash flag
     };
@@ -6382,7 +6517,7 @@ public:
         if constexpr (requires { mm_.num_shards(); mm_.shard(0); }) {
             const std::size_t n = mm_.num_shards();
             result.reserve(n);
-            // T18.1: Snapshot the global pending-reclaim count once so all
+            // Snapshot the global pending-reclaim count once so all
             // shards report a consistent value (it is global by nature —
             // hazptr/EBR domains are not partitioned per shard).
             const std::size_t global_pending =
@@ -6423,7 +6558,7 @@ public:
         return result;
     }
 
-    /// T18.2: Identify the top-N shards by accounted memory rather than
+    /// Identify the top-N shards by accounted memory rather than
     /// access volume. Useful for detecting memory imbalance caused by a few
     /// shards holding disproportionately many items.
     ///
@@ -6480,7 +6615,7 @@ public:
                     /*rehash_in_progress*/ per_shard_rehashing
                 });
             }
-            // T18.2: Sort descending by memory_usage (tie-break by accesses).
+            // Sort descending by memory_usage (tie-break by accesses).
             std::sort(result.begin(), result.end(),
                 [](const shard_hotspot& a, const shard_hotspot& b) {
                     if (a.memory_usage != b.memory_usage) {
@@ -6495,7 +6630,7 @@ public:
         return result;
     }
 
-    /// T3.2 (P1-2): Hot key detection — returns the top-N hottest keys
+    /// Hot key detection — returns the top-N hottest keys
     /// by estimated hit count. Requires event tracking to be enabled
     /// (see `enable_event_tracking()`); otherwise returns an empty vector.
     ///
@@ -6547,7 +6682,7 @@ public:
         return tracker->top_keys(top_n);
     }
 
-    /// T3.2 (P1-2): Hot key detection with human-readable key names.
+    /// Hot key detection with human-readable key names.
     /// Requires `set_key_to_string()` to be set on the event tracker;
     /// otherwise the key name is the hash formatted as a hex string.
     ///
@@ -6562,11 +6697,11 @@ public:
     }
 
     bool contains(const Key& key) const {
-        // P1-34 (fix.01): a shut-down cache reports nothing — consistent with
+        // a shut-down cache reports nothing — consistent with
         // get()/try_get() rejecting reads after shutdown (previously contains()
         // still answered, contradicting fast_get()'s documented contract).
         if (is_shutdown()) return false;
-        // T14.1: Compact path.
+        // Compact path.
         if constexpr (Trait::is_compact) {
             return compact().contains(key);
         }
@@ -6579,14 +6714,14 @@ public:
     // Peek - read without promoting (only available if mm_type supports it)
     // --------------------------------------------------------------------
 
-    /// H0: Peek with handle — 不提升 LRU，返回 handle 防止持有期被淘汰。
+    /// Peek with a handle: no LRU promotion, but the handle still pins the item.
     /// Lock-free: mm_.peek() uses find_and_pin() to atomically pin the item
     /// under the hash table's bucket lock, eliminating the need for a
     /// stripe-level read lock.
     read_handle<const Value> peek(const Key& key) const {
-        // P1-34 (fix.01): reject reads after shutdown (see contains()).
+        // reject reads after shutdown (see contains()).
         if (is_shutdown()) return {};
-        // T14.1: Compact path — compact_cache::peek() returns
+        // Compact path — compact_cache::peek() returns
         // std::optional<std::reference_wrapper<const Value>>. Wrap the
         // pointer in a non-pinning read_handle.
         if constexpr (Trait::is_compact) {
@@ -6597,7 +6732,7 @@ public:
         if constexpr (detail::has_peek_v<mm_type, Key>) {
             read_handle<const Value> h = mm_.peek(key);
             if (!h && detail::tls_last_incRef_was_overflow()) {
-                // P1-34 (fix.01 方案 A): the item exists but could not be pinned
+                // the item exists but could not be pinned
                 // (access_ref saturated), which is NOT the same as a miss.
                 // Account for it and retry once — saturation is transient, since
                 // the pinning handles are being released. The counter is mutable
@@ -6621,7 +6756,7 @@ public:
     // --------------------------------------------------------------------
 
     bool empty() const {
-        // T14.1: Compact path.
+        // Compact path.
         if constexpr (Trait::is_compact) {
             return compact().empty();
         }
@@ -6629,7 +6764,7 @@ public:
     }
 
     size_type size() const {
-        // T14.1: Compact path.
+        // Compact path.
         if constexpr (Trait::is_compact) {
             return compact().size();
         }
@@ -6637,7 +6772,7 @@ public:
     }
 
     size_type max_size() const {
-        // T14.1: Compact path.
+        // Compact path.
         if constexpr (Trait::is_compact) {
             return compact().max_size();
         }
@@ -6645,14 +6780,14 @@ public:
     }
 
     size_type max_memory() const {
-        // T14.1: Compact path.
+        // Compact path.
         if constexpr (Trait::is_compact) {
             return compact().max_memory();
         }
         return mm_.max_memory();
     }
 
-    /// P1-30 (fix.01 方案 A): the capacity the CALLER requested, before any
+    /// the capacity the CALLER requested, before any
     /// per-shard amplification. When the cache was constructed with
     /// `allow_amplification = true` and asked for fewer slots than shards,
     /// this reports the original request while `max_size()` reports the
@@ -6669,7 +6804,7 @@ public:
     }
 
     size_type current_memory() const {
-        // T14.1: Compact path.
+        // Compact path.
         if constexpr (Trait::is_compact) {
             return compact().current_memory();
         }
@@ -6681,7 +6816,7 @@ public:
     /// the cache would cause use-after-free. Call this before cache destruction
     /// in debug/test scenarios to verify no handles outlive the cache.
     ///
-    /// P1-13: For striped caches, this no longer acquires the global read
+    /// For striped caches, this no longer acquires the global read
     /// lock (which shared-locks all 64 stripes — an unnecessary barrier on
     /// the read path). Instead it walks each shard under that shard's
     /// shared lock, allowing concurrent reads/writes on other shards.
@@ -6693,7 +6828,7 @@ public:
         if constexpr (is_striped) {
             if constexpr (requires { mm_.num_shards(); }) {
                 for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
-                    // P1-37 (fix.01 方案 A): take the lock that actually protects
+                    // take the lock that actually protects
                     // shard i. For sharded_mm_lru that is the PER-SHARD lock, not
                     // the stripe lock — the stripe lock is a different lock and
                     // does not exclude a writer inside mm_.shard(i), so the
@@ -6723,7 +6858,7 @@ public:
     }
 
     void max_size(size_type new_max) {
-        // T14.1: Compact path.
+        // Compact path.
         if constexpr (Trait::is_compact) {
             compact().max_size(new_max);
             return;
@@ -6734,7 +6869,7 @@ public:
         maybe_report_memory_to_monitor();
     }
 
-    /// P2-1: Strict variant of max_size() — throws std::invalid_argument
+    /// Strict variant of max_size() — throws std::invalid_argument
     /// when the requested capacity would be silently amplified by the
     /// sharded MM layer (i.e. new_max < num_shards for striped caches).
     /// Use this when the caller needs hard capacity guarantees (e.g.
@@ -6749,7 +6884,7 @@ public:
     /// @throws std::invalid_argument if new_max < num_shards (sharded
     ///         caches only) and new_max != unlimited.
     void max_size_strict(size_type new_max) {
-        // T14.1: Compact path — no sharded amplification, just delegate.
+        // Compact path — no sharded amplification, just delegate.
         if constexpr (Trait::is_compact) {
             compact().max_size(new_max);
             return;
@@ -6765,7 +6900,7 @@ public:
     }
 
     void max_memory(size_type new_max) {
-        // T14.1: Compact path — compact_cache does not support max_memory
+        // Compact path — compact_cache does not support max_memory
         // directly; the limit is implicitly kMaxItemSize * max_size.
         // We ignore the call (could log a warning in debug builds).
         if constexpr (Trait::is_compact) {
@@ -6778,8 +6913,32 @@ public:
         maybe_report_memory_to_monitor();
     }
 
+    /// Set the memory budget in bytes on BOTH the eviction strategy and the
+    /// memory monitor, then re-evaluate the watermarks.
+    ///
+    /// `mm_.max_memory` and `memory_monitor::max_memory_bytes` used to be two
+    /// independent budgets: the first drove the watermark logic (and defaulted
+    /// to unlimited, so the watermarks never engaged), the second drove
+    /// admission. A deployment that set one left the other unchanged. Pass 0 or
+    /// lru::unlimited to clear both.
+    void set_max_memory(size_type bytes) {
+        if constexpr (!Trait::is_compact) {
+            {
+                flush_guard fg{mm_};
+                auto lock = acquire_write_lock();
+                mm_.max_memory(bytes);
+            }
+            memory_monitor_.set_max_memory(bytes == unlimited ? 0 : bytes);
+            if (auto evt = check_memory_pressure()) {
+                dispatch_oom_event(*evt);
+            }
+        } else {
+            (void)bytes;
+        }
+    }
+
     // ----------------------------------------------------------------
-    // P1-3: Memory watermark and OOM protection
+    // Memory watermark and OOM protection
     // ----------------------------------------------------------------
 
     /// Set memory watermarks as fractions of max_memory in [0.0, 1.0].
@@ -6791,16 +6950,21 @@ public:
     /// Defaults: soft=0.85, critical=0.95.
     /// Set both to 1.0 to disable watermark-based OOM protection.
     ///
-    /// \note soft_watermark must be <= critical_watermark.
-    ///       Values are clamped to [0.0, 1.0].
+    /// \note Both values must be in [0.0, 1.0] and soft_watermark must be
+    ///       <= critical_watermark; anything else throws std::invalid_argument.
     void set_memory_watermarks(double soft_watermark, double critical_watermark) {
-        // Clamp and validate.
-        if (soft_watermark < 0.0) soft_watermark = 0.0;
-        if (soft_watermark > 1.0) soft_watermark = 1.0;
-        if (critical_watermark < 0.0) critical_watermark = 0.0;
-        if (critical_watermark > 1.0) critical_watermark = 1.0;
+        // Reject loudly instead of clamping and silently swapping: matching
+        // lru::config::validate(), which throws for the same mistake. Silently
+        // swapping meant a deployment that passed the pair the wrong way round
+        // got a different policy than it asked for, with no indication.
+        auto in_range = [](double f) { return f >= 0.0 && f <= 1.0; };
+        if (!in_range(soft_watermark) || !in_range(critical_watermark)) {
+            throw std::invalid_argument(
+                "set_memory_watermarks: watermarks must be in [0, 1]");
+        }
         if (soft_watermark > critical_watermark) {
-            std::swap(soft_watermark, critical_watermark);
+            throw std::invalid_argument(
+                "set_memory_watermarks: soft_watermark must be <= critical_watermark");
         }
         memory_soft_watermark_.store(soft_watermark, std::memory_order_relaxed);
         memory_critical_watermark_.store(critical_watermark, std::memory_order_relaxed);
@@ -6826,7 +6990,7 @@ public:
     /// Register an OOM handler callback. Invoked when the cache enters
     /// critical memory mode. The handler receives (current_memory, max_memory).
     ///
-    /// P-HIGH-2 (T-H1): The handler is now invoked *outside* the write lock
+    /// The handler is now invoked *outside* the write lock
     /// (synchronous mode, the default) or by the event drain worker
     /// (asynchronous mode, see `set_async_oom_handler(true)`). This means
     /// the handler is free to call cache methods (flush/remove/set) without
@@ -6846,7 +7010,7 @@ public:
         oom_handler_ = std::move(handler);
     }
 
-    /// P-HIGH-2 (T-H1): Toggle asynchronous OOM handler dispatch.
+    /// Toggle asynchronous OOM handler dispatch.
     ///
     /// When enabled, OOM events are enqueued on a lock-free MPSC queue
     /// and dispatched by the event drain worker (must be started via
@@ -6864,12 +7028,12 @@ public:
         async_oom_handler_.store(enabled, std::memory_order_release);
     }
 
-    /// P-HIGH-2 (T-H1): Returns true if async OOM handler mode is enabled.
+    /// Returns true if async OOM handler mode is enabled.
     bool is_async_oom_handler() const noexcept {
         return async_oom_handler_.load(std::memory_order_acquire);
     }
 
-    /// P-HIGH-2 (T-H1): Drain pending OOM events and invoke the handler
+    /// Drain pending OOM events and invoke the handler
     /// for each. Called by the event drain worker when async mode is
     /// enabled. Returns the number of events dispatched.
     /// Safe to call from any thread; no-op if no events are pending.
@@ -6903,7 +7067,7 @@ public:
         return 1;
     }
 
-    /// P1-3 / P-HIGH-2 (T-H1): Check memory pressure and update critical
+    /// Check memory pressure and update critical
     /// mode. Called from set() / set_prehashed() inside the write lock.
     ///
     /// Returns std::nullopt when the insertion should proceed normally
@@ -6922,7 +7086,16 @@ public:
     ///   - Sets `memory_critical_mode_` when ratio >= critical watermark.
     ///   - Clears it when ratio drops below the soft watermark.
     std::optional<oom_event> check_memory_pressure() {
-        const auto max_mem = mm_.max_memory();
+        std::size_t max_mem = mm_.max_memory();
+        if (max_mem == unlimited || max_mem == 0) {
+            // Fall back to the memory monitor's budget. Without this the
+            // watermarks were silently inert on every default-constructed
+            // cache: mm_.max_memory() is unlimited by default, so this function
+            // returned before comparing anything, set_memory_watermarks() had
+            // no effect at all, and the rejecting was done by the monitor's own
+            // separate budget (default 1 GiB for the thread-safe traits).
+            max_mem = memory_monitor_.max_memory();
+        }
         if (max_mem == unlimited || max_mem == 0) return std::nullopt;
 
         const auto cur_mem = mm_.current_memory();
@@ -6954,7 +7127,7 @@ public:
         return std::nullopt;
     }
 
-    /// P-HIGH-2 (T-H1): Dispatch an OOM event produced by
+    /// Dispatch an OOM event produced by
     /// `check_memory_pressure()`. Must be called *outside* the write lock.
     ///
     /// - In synchronous mode (default): invokes `oom_handler_` inline.
@@ -6989,7 +7162,7 @@ public:
 
     /// Get number of items for serialization header.
     ///
-    /// P1-13: No lock — mm_.size() reads per-shard atomic counters with
+    /// No lock — mm_.size() reads per-shard atomic counters with
     /// relaxed ordering. Acquiring the global read lock here would
     /// shared-lock all 64 stripes just to read an atomic sum, blocking
     /// writers on every stripe during the call. The returned value is
@@ -7001,7 +7174,7 @@ public:
 
     /// Get serialized size estimate (items only; metadata extra).
     ///
-    /// P1-13: No lock — same rationale as serialized_item_count().
+    /// No lock — same rationale as serialized_item_count().
     size_type serialized_size_estimate() const {
         return mm_.size() * (sizeof(Key) + sizeof(Value) + sizeof(size_type) * 2);
     }
@@ -7032,7 +7205,7 @@ public:
     std::vector<uint8_t> save_per_shard();
     void load_per_shard(std::span<const uint8_t> data);
 
-    /// P2-3: Strictly-atomic cross-shard snapshot.
+    /// Strictly-atomic cross-shard snapshot.
     ///
     /// Sequence:
     ///   1. quiesce(timeout) — reject new writes (they throw
@@ -7071,7 +7244,7 @@ public:
     std::vector<uint8_t> save_atomic(
         std::chrono::duration<Rep, Period> handle_drain_timeout);
 
-    /// T-G15: Atomic-or-per-shard snapshot with graceful degradation.
+    /// Atomic-or-per-shard snapshot with graceful degradation.
     ///
     /// Attempts `save_atomic(handle_drain_timeout)` first. If the handle
     /// drain times out (e.g. a long-lived read_handle is held by another
@@ -7107,11 +7280,11 @@ public:
     // --------------------------------------------------------------------
 
     stats_type stats_snapshot() const {
-        // P1-4: Track scrape frequency so the destructor can warn about
+        // Track scrape frequency so the destructor can warn about
         // high-frequency scraping without metrics cache enabled. Use
         // relaxed ordering — this is a best-effort heuristic counter.
         scrape_count_.fetch_add(1, std::memory_order_relaxed);
-        // P2-E: Fast path — return the cached snapshot if metrics caching
+        // Fast path — return the cached snapshot if metrics caching
         // is enabled and the cache is still fresh. The cache is refreshed
         // lazily by the background drain worker (or by an explicit
         // refresh_metrics_cache() call) so the typical scrape path is a
@@ -7136,9 +7309,9 @@ public:
     }
 
 private:
-    /// P2-E: Build the stats snapshot without consulting the cache.
+    /// Build the stats snapshot without consulting the cache.
     stats_type build_stats_snapshot_uncached() const {
-        // P1-1: Refresh hash table diagnostics (including rehash stats)
+        // Refresh hash table diagnostics (including rehash stats)
         // before taking the snapshot, so the returned stats reflect the
         // latest rehash activity. This is O(bucket_count) but callers
         // typically invoke stats_snapshot() infrequently (e.g. once per
@@ -7179,7 +7352,7 @@ private:
         // snapshots, matching the semantics of hits/misses/insertions.
         snap.tls_ring_dropped_promotions.value.fetch_add(
             tls_access_ring<Key>::drain_dropped_count(), std::memory_order_relaxed);
-        // P0-1: refresh hazptr/EBR reclaim diagnostics from the global
+        // refresh hazptr/EBR reclaim diagnostics from the global
         // domains so stats consumers can monitor deferred reclamation
         // health. pending_count is a snapshot; values may change between
         // two reads, but that is acceptable for monitoring.
@@ -7201,7 +7374,7 @@ private:
         snap.reclaim_freed_bytes.store(
             per_cache_stats_.reclaim_freed_bytes.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
-        // T-M1: singleflight stampede coalescing diagnostics — cumulative
+        // singleflight stampede coalescing diagnostics — cumulative
         // count of follower requests collapsed into a leader's provider
         // call. Sourced from the per-cache singleflight_tracker.
         snap.stampede_coalesced_count.store(
@@ -7212,7 +7385,7 @@ private:
 
 public:
     // --------------------------------------------------------------------
-    // P2-E: Metrics cache (stats_snapshot / prometheus_text)
+    // Metrics cache (stats_snapshot / prometheus_text)
     // --------------------------------------------------------------------
     //
     // High-frequency metrics scraping (e.g. Prometheus pulling every 5s
@@ -7340,7 +7513,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // P1-4: Runtime latency tracking toggle
+    // Runtime latency tracking toggle
     // --------------------------------------------------------------------
 
     /// Enable or disable latency histogram tracking on the hot path.
@@ -7348,7 +7521,7 @@ public:
     /// reducing get()/set() overhead by ~10-20%.
     /// Default: enabled (for backward compatibility).
     ///
-    /// T12.3: When transitioning enabled → disabled, also calls
+    /// When transitioning enabled → disabled, also calls
     /// `release_memory()` on all per-shard histograms to clear
     /// accumulated data. This prevents stale latency samples from
     /// being reported via `stats_snapshot()` / `prometheus_text()`
@@ -7361,7 +7534,7 @@ public:
                     s.latency_tracking_enabled.load(std::memory_order_acquire);
                 s.latency_tracking_enabled.store(
                     enabled, std::memory_order_release);
-                // T12.3: on disable, release histogram data.
+                // on disable, release histogram data.
                 if (was_enabled && !enabled) {
                     s.get_latency.release_memory();
                     s.set_latency.release_memory();
@@ -7404,7 +7577,7 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // P2-2: Runtime lock order checking toggle
+    // Runtime lock order checking toggle
     // ----------------------------------------------------------------
     //
     // When enabled, lock acquisitions are validated against rank ordering
@@ -7448,7 +7621,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // P1-7: Pending deletion count (items removed but pinned by read_handles)
+    // Pending deletion count (items removed but pinned by read_handles)
     // --------------------------------------------------------------------
 
     /// Number of items in pending-deletion state. These are items that
@@ -7462,7 +7635,7 @@ public:
         return mm_.pending_deletion_count();
     }
 
-    /// R9: Number of explicit force-delete operations refused because the
+    /// Number of explicit force-delete operations refused because the
     /// pending-deletion soft cap (mm config `max_pending_deletion`) was
     /// reached. A non-zero, growing value indicates callers are holding
     /// read_handles too long (potential handle leak).
@@ -7502,7 +7675,7 @@ public:
         return mm_.callbacks().is_async_mode();
     }
 
-    /// P1-10: Current async callback queue size, aggregated across all
+    /// Current async callback queue size, aggregated across all
     /// shards for striped caches. Returns 0 when async callbacks are
     /// disabled. Used by prometheus_text() to export
     /// lru_cache_async_queue_size.
@@ -7519,7 +7692,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // T-M1: singleflight / cache stampede protection
+    // singleflight / cache stampede protection
     // --------------------------------------------------------------------
     //
     // When enabled, get_or_fetch() / try_get_or_fetch() coalesce
@@ -7549,7 +7722,7 @@ public:
         return singleflight_enabled_.load(std::memory_order_acquire);
     }
 
-    /// T-M1: Cumulative count of follower requests that were collapsed
+    /// Cumulative count of follower requests that were collapsed
     /// into a leader's in-flight provider call. Aggregated across all
     /// keys and shards. Resets only on cache destruction (cumulative
     /// counter, like hits/misses).
@@ -7557,7 +7730,7 @@ public:
         return singleflight_.coalesced_count();
     }
 
-    /// T-M1: Current number of in-flight singleflight keys (keys whose
+    /// Current number of in-flight singleflight keys (keys whose
     /// leader is currently executing the provider). Diagnostic only —
     /// acquires all shard locks, so do not call on the hot path.
     std::size_t singleflight_inflight_count() const {
@@ -7592,26 +7765,26 @@ public:
         if (closed_.exchange(true, std::memory_order_acq_rel)) {
             return;  // already shut down
         }
-        // T-G10: Signal handle-release path that shutdown is in progress,
+        // Signal handle-release path that shutdown is in progress,
         // so the last read_handle::release() notifies shutdown_and_wait().
             active_handle_notifier_->shutdown_in_progress.store(true, std::memory_order_release);
         // T-G10 subtask 4: stop the OS memory sampler so its background
         // thread doesn't race with teardown. Idempotent no-op if never
         // started.
         memory_monitor_.stop_os_sampling();
-        // P-CRIT-1 (T-C1): Stop the rehash balancer FIRST so it cannot
+        // Stop the rehash balancer FIRST so it cannot
         // touch mm_ members while we drain/tear down below. Previously
         // this stop() was defined but never invoked from shutdown() or
         // the destructor, causing use-after-free when the cache was
         // destroyed after start_background_rehash_balancer() was called.
         // Idempotent (no-op if never started).
         stop_background_rehash_balancer();
-        // T14.1: Compact path — delegate shutdown to compact_cache, then
+        // Compact path — delegate shutdown to compact_cache, then
         // skip the mm_-specific drain/callback flush below.
         if constexpr (Trait::is_compact) {
             stop_ttl_cleaner();
             stop_event_drain();
-            // P2-E: stop metrics cache worker on compact path too.
+            // stop metrics cache worker on compact path too.
             stop_metrics_cache_worker();
             compact().shutdown();
             return;
@@ -7619,7 +7792,7 @@ public:
         // 1. Stop background workers so they don't race with the drain.
         stop_ttl_cleaner();
         stop_event_drain();
-        // P2-E: stop the metrics cache worker so it stops referencing
+        // stop the metrics cache worker so it stops referencing
         // stats_cache_ / prometheus_cache_ during teardown.
         stop_metrics_cache_worker();
         // 2. Drain deferred LRU promotions one final time.
@@ -7642,7 +7815,7 @@ public:
         }
     }
 
-    /// T7.3: Shut down the cache, optionally waiting for all other
+    /// Shut down the cache, optionally waiting for all other
     /// threads' TLS access rings to be drained into the backup buffer.
     ///
     /// When `wait_for_drain == true`, this issues a cross-thread flush
@@ -7698,7 +7871,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // P1-6: Graceful shutdown with active handle wait
+    // Graceful shutdown with active handle wait
     // --------------------------------------------------------------------
 
     /// Shut down the cache and wait for all active read_handles to be
@@ -7711,7 +7884,7 @@ public:
     ///
     /// Idempotent: if the cache is already shut down, just waits.
     ///
-    /// O10: Per-cache handle tracking is default-on, and the per-T global
+    /// Per-cache handle tracking is default-on, and the per-T global
     /// counter is now also default-on in release builds, so this function
     /// is reliable out of the box. It can only return `false` (without
     /// waiting) when the caller has explicitly disabled BOTH per-cache
@@ -7733,7 +7906,7 @@ public:
         return wait_for_handles_to_drain(timeout);
     }
 
-    /// P1-40 (fix.01 方案 A): wait for every outstanding `read_handle` to be
+    /// wait for every outstanding `read_handle` to be
     /// released WITHOUT closing the cache.
     ///
     /// Extracted from `shutdown_and_wait()` so the reversible quiesce path
@@ -7745,11 +7918,11 @@ public:
     ///         must then use `force_wait_handles()` or join its own threads.
     template <typename Rep, typename Period>
     bool wait_for_handles_to_drain(std::chrono::duration<Rep, Period> timeout) {
-        // T4.1: cannot reliably count handles without any tracking source.
+        // cannot reliably count handles without any tracking source.
         if (!tracking_reliable_for_wait()) {
             return false;  // caller must use force_wait_handles() instead
         }
-        // T-G10: Wait on a condition_variable instead of busy-polling.
+        // Wait on a condition_variable instead of busy-polling.
         // read_handle::release() calls notify_all() when the last handle
         // is dropped during shutdown, so this returns immediately without
         // waiting out the full timeout. A 10ms ceiling on wait_for guards
@@ -7770,7 +7943,7 @@ public:
         return true;
     }
 
-    /// P1-40 (fix.01 方案 A): reversibly take the cache out of service for a
+    /// reversibly take the cache out of service for a
     /// transactional snapshot.
     ///
     /// `save_atomic()` used to call `shutdown_and_wait()`, which sets `closed_`
@@ -7802,19 +7975,19 @@ public:
         return true;
     }
 
-    /// P1-40: restore service after a `quiesce()`. Idempotent and safe to call
+    /// restore service after a `quiesce()`. Idempotent and safe to call
     /// on a cache that was never quiesced (including from an exception path).
     void resume() noexcept {
         quiesced_.store(false, std::memory_order_release);
     }
 
-    /// P1-40: true while a transactional snapshot holds the cache quiesced.
+    /// true while a transactional snapshot holds the cache quiesced.
     /// Distinct from `is_shutdown()`, which is permanent.
     bool is_quiesced() const noexcept {
         return quiesced_.load(std::memory_order_acquire);
     }
 
-    /// T4.1: Result of a shutdown wait operation. Distinguishes between
+    /// Result of a shutdown wait operation. Distinguishes between
     /// a successful drain, a timeout, and the "tracking disabled" case
     /// where the wait could not be performed reliably.
     enum class shutdown_status {
@@ -7826,7 +7999,7 @@ public:
                               // threads manually before destroying the cache
     };
 
-    /// T4.1: Same as `shutdown_and_wait()` but returns a detailed status
+    /// Same as `shutdown_and_wait()` but returns a detailed status
     /// code so the caller can distinguish "timeout" from "tracking
     /// disabled" cases.
     template <typename Rep, typename Period>
@@ -7837,7 +8010,7 @@ public:
         if (!tracking_reliable_for_wait()) {
             return shutdown_status::tracking_disabled;
         }
-        // T-G10: condition_variable wait — see shutdown_and_wait().
+        // condition_variable wait — see shutdown_and_wait().
             auto& n = *active_handle_notifier_;
         std::unique_lock<std::mutex> lk(n.mtx);
         auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -7853,7 +8026,7 @@ public:
         return shutdown_status::success;
     }
 
-    /// T4.2: Force-wait for outstanding handles using the per-T global
+    /// Force-wait for outstanding handles using the per-T global
     /// atomic counter, even when per-cache tracking is disabled.
     ///
     /// This is intended for process-exit / graceful-shutdown scenarios
@@ -7866,7 +8039,7 @@ public:
     ///   2. `shutdown()` — reject new operations, drain TLS rings.
     ///   3. Poll `read_handle<Value>::active_count()` until 0 or timeout.
     ///
-    /// T7.4: After step 2, also issues a synchronous TLS access-ring
+    /// After step 2, also issues a synchronous TLS access-ring
     /// drain so that pending LRU promotions from other threads are
     /// not lost. The drain wait reuses the same `timeout` budget.
     ///
@@ -7886,14 +8059,14 @@ public:
     bool force_wait_handles(
         std::chrono::duration<Rep, Period> timeout,
         std::chrono::milliseconds poll_interval = std::chrono::milliseconds(1)) {
-        // O10: Global tracking is now default-on in release builds, so this
+        // Global tracking is now default-on in release builds, so this
         // call is usually a no-op. Keep it for callers that have explicitly
         // disabled tracking via `enable_global_handle_tracking(false)` and
         // then need force_wait_handles() to work — re-enabling here ensures
         // new handles are counted even if the caller previously opted out.
         read_handle<Value>::enable_global_handle_tracking(true);
         shutdown();
-        // T7.4: Synchronously drain other threads' TLS access rings so
+        // Synchronously drain other threads' TLS access rings so
         // pending promotions are not lost on process exit. Use half the
         // timeout budget so we leave time for the handle wait below.
         auto tls_deadline = std::chrono::steady_clock::now() + timeout / 2;
@@ -7914,7 +8087,7 @@ public:
         return true;
     }
 
-    /// T4.1: Helper — true if `active_handle_count()` is currently
+    /// Helper — true if `active_handle_count()` is currently
     /// reliable enough to wait on. Returns false when neither per-cache
     /// tracking nor the per-T global counter is being maintained.
     bool tracking_reliable_for_wait() const noexcept {
@@ -7931,7 +8104,7 @@ public:
     /// handle leaks or excessive pinning when multiple cache instances
     /// share the same Value type.
     ///
-    /// P2-1: Default is now `true` (production behavior). The per-T
+    /// Default is now `true` (production behavior). The per-T
     /// global counter in read_handle<T> is only maintained under
     /// `-DLRU_DEBUG=1`; in release builds it is a no-op, so per-cache
     /// tracking is the only source of active_handle_count. Disable
@@ -7968,7 +8141,7 @@ public:
     //   - lru_cache_get_latency_ns_bucket{le="..."} (histogram)
     //   - lru_cache_set_latency_ns_bucket{le="..."} (histogram)
     //
-    // P2-4: Per-shard load-factor detail. By default only aggregate
+    // Per-shard load-factor detail. By default only aggregate
     // gauges are emitted (worst / avg / p95 across shards) to keep the
     // scrape payload compact for caches with 64+ shards. Call
     // `set_prometheus_per_shard_detail(true)` to emit the legacy
@@ -7979,7 +8152,7 @@ public:
     // The output is multi-line text terminated by '\n'. For sharded caches,
     // counters are aggregated across shards.
     //
-    // P2-E: When metrics caching is enabled via `set_metrics_cache_enabled()`
+    // When metrics caching is enabled via `set_metrics_cache_enabled()`
     // (with `start_metrics_cache_worker()` driving the periodic rebuild),
     // callers scraping at high frequency (e.g. Prometheus every 5s) hit a
     // pre-built snapshot + pre-formatted string instead of recomputing
@@ -7988,13 +8161,13 @@ public:
     // expiry; concurrent callers serialize on a brief spinlock so only one
     // rebuild is in flight at a time.
     //
-    // P2-4: When `prometheus_per_shard_detail_` is false (default), the
+    // When `prometheus_per_shard_detail_` is false (default), the
     // output includes only aggregate load-factor gauges
     // (`lru_hash_load_factor_worst`, `lru_hash_load_factor_avg`,
     // `lru_hash_load_factor_p95`) — not the per-shard labelled series.
     // This keeps the scrape payload O(1) regardless of shard count.
     std::string prometheus_text() const {
-        // P2-E: try the cached formatted string first.
+        // try the cached formatted string first.
         if (metrics_cache_enabled_.load(std::memory_order_acquire)) {
             auto cached = prometheus_cache_.load(std::memory_order_acquire);
             if (cached) return *cached;
@@ -8009,7 +8182,7 @@ public:
         return build_prometheus_text_uncached();
     }
 
-    /// P2-4: Toggle per-shard detail in `prometheus_text()`.
+    /// Toggle per-shard detail in `prometheus_text()`.
     ///
     /// When false (default), only aggregate gauges are emitted:
     ///   - `lru_hash_load_factor_worst` — max load factor across shards
@@ -8028,7 +8201,7 @@ public:
     /// load factor).
     void set_prometheus_per_shard_detail(bool enabled) noexcept {
         prometheus_per_shard_detail_.store(enabled, std::memory_order_release);
-        // P2-E: Rebuild the prometheus cache immediately with the new flag
+        // Rebuild the prometheus cache immediately with the new flag
         // value so the next scrape reflects the change. Using rebuild
         // instead of invalidation avoids a race where a concurrent scrape
         // sees a null cache and rebuilds with the OLD flag value (having
@@ -8041,14 +8214,14 @@ public:
         }
     }
 
-    /// P2-4: Query whether per-shard detail is currently being emitted
+    /// Query whether per-shard detail is currently being emitted
     /// in `prometheus_text()`.
     bool prometheus_per_shard_detail() const noexcept {
         return prometheus_per_shard_detail_.load(std::memory_order_acquire);
     }
 
 private:
-    /// P2-E: Build the Prometheus exposition text without consulting the
+    /// Build the Prometheus exposition text without consulting the
     /// cache. Used by `prometheus_text()` on cache miss / when caching is
     /// disabled.
     std::string build_prometheus_text_uncached() const {
@@ -8086,6 +8259,27 @@ private:
         out.append(std::to_string(snap.evictions.value.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
+        // Eviction breakdown by reason. A single evictions_total cannot answer
+        // "why is memory not dropping?" — capacity pressure, TTL expiry and an
+        // explicit delete call for completely different responses.
+        append("# HELP lru_cache_evictions_capacity_total Items evicted to make room.");
+        append("# TYPE lru_cache_evictions_capacity_total counter");
+        out.append("lru_cache_evictions_capacity_total ");
+        out.append(std::to_string(snap.evictions_capacity.value.load(std::memory_order_relaxed)));
+        out.push_back('\n');
+
+        append("# HELP lru_cache_evictions_ttl_total Items removed because their TTL expired.");
+        append("# TYPE lru_cache_evictions_ttl_total counter");
+        out.append("lru_cache_evictions_ttl_total ");
+        out.append(std::to_string(snap.evictions_ttl.value.load(std::memory_order_relaxed)));
+        out.push_back('\n');
+
+        append("# HELP lru_cache_evictions_explicit_total Items removed by an explicit del()/remove().");
+        append("# TYPE lru_cache_evictions_explicit_total counter");
+        out.append("lru_cache_evictions_explicit_total ");
+        out.append(std::to_string(snap.evictions_explicit.value.load(std::memory_order_relaxed)));
+        out.push_back('\n');
+
         // Gauges
         append("# HELP lru_cache_size Current number of items in the cache.");
         append("# TYPE lru_cache_size gauge");
@@ -8117,7 +8311,7 @@ private:
         out.append(std::to_string(snap.tls_ring_backlog.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // T-M4/T-P2-4: Cross-thread TLS backlog aggregate. Unlike
+        // Cross-thread TLS backlog aggregate. Unlike
         // lru_cache_tls_ring_backlog (which reflects only the calling
         // thread's ring), this is the aggregate across all threads.
         // Non-zero values with flat drain rate signal the drain worker is
@@ -8144,7 +8338,7 @@ private:
         out.append(std::to_string(snap.write_lock_wait_count.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // P1-10: Read lock wait total — sourced from the read_lock_wait_latency
+        // Read lock wait total — sourced from the read_lock_wait_latency
         // histogram's sample count. The histogram records one sample per
         // read-lock slow-path entry, so its count() equals the total number
         // of read lock waits. This is the read-side counterpart of
@@ -8156,7 +8350,7 @@ private:
         out.append(std::to_string(snap.read_lock_wait_latency.count()));
         out.push_back('\n');
 
-        // P1-10: Async callback queue size — current backlog of callback
+        // Async callback queue size — current backlog of callback
         // events waiting for the async dispatch worker. Non-zero values
         // indicate the worker is not keeping up (or the queue max_size is
         // too small), which can cause callback delivery delays. Sourced
@@ -8167,7 +8361,7 @@ private:
         out.append(std::to_string(async_queue_size_aggregated()));
         out.push_back('\n');
 
-        // O6: Total callback failures observed across sync + async
+        // Total callback failures observed across sync + async
         // dispatch. A non-zero / growing value indicates a registered
         // callback is throwing — operators should consult the
         // on_callback_error hook (or logs) to identify the culprit.
@@ -8196,7 +8390,7 @@ private:
         out.append(std::to_string(snap.ttl_expired_count.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // P1-10: Total TTL checks performed on the read path. The ratio
+        // Total TTL checks performed on the read path. The ratio
         // ttl_expired_total / ttl_checked_total gives the expiration rate
         // observed by readers — a high ratio (>10%) indicates the background
         // TTL cleaner is not running frequently enough and expired items
@@ -8234,7 +8428,7 @@ private:
         append("# TYPE lru_cache_eviction_search_steps histogram");
         emit_histogram_lines(out, "lru_cache_eviction_search_steps", snap.eviction_search_steps_hist);
 
-        // P1-1: Rehash diagnostics — track hash table expansion frequency,
+        // Rehash diagnostics — track hash table expansion frequency,
         // duration, and migration volume. High rehash_count or long
         // rehash_total_time_ns indicates frequent capacity growth causing
         // tail latency spikes. Use reserve() to pre-size the table.
@@ -8256,7 +8450,7 @@ private:
         out.append(std::to_string(snap.rehash_migrated_items.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // T13.4: Hash load factor and overload metrics.
+        // Hash load factor and overload metrics.
         // Exported as gauges — current load factor of the worst shard,
         // configured threshold, and cumulative overload events.
         append("# HELP lru_hash_load_factor Current hash table load factor (worst shard).");
@@ -8265,7 +8459,7 @@ private:
         out.append(std::to_string(snap.hash_load_factor.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // P2-4: Per-shard aggregate gauges — always emitted for sharded
+        // Per-shard aggregate gauges — always emitted for sharded
         // caches so the scrape payload is O(1) regardless of shard count.
         // The legacy 64-line `lru_hash_load_factor_per_shard{shard="N"}`
         // series is gated behind `set_prometheus_per_shard_detail(true)`
@@ -8289,7 +8483,7 @@ private:
                 sum += static_cast<double>(lf);  // explicit, -Wdouble-promotion
             }
             const double avg = sum / static_cast<double>(num_shards);
-            // P95: nearest-rank method on the sorted (ascending) series.
+            // nearest-rank method on the sorted (ascending) series.
             // For 64 shards, rank = ceil(0.95 * 64) = 61 -> 61st-smallest.
             // (0-indexed: position 60). For 4 shards, rank = ceil(0.95*4)=4
             // -> largest. This matches Prometheus histogram quantile
@@ -8319,7 +8513,7 @@ private:
             out.append(std::to_string(p95));
             out.push_back('\n');
 
-            // P2-4: Per-shard labelled series — opt-in via
+            // Per-shard labelled series — opt-in via
             // `set_prometheus_per_shard_detail(true)`. Skipped by default
             // to keep the scrape payload compact for caches with 64+
             // shards. The detailed series is most useful when piped
@@ -8348,7 +8542,7 @@ private:
         out.append(std::to_string(snap.hash_overload_events.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // T11.3: Rehash-blocked-writes counter — non-zero values indicate the
+        // Rehash-blocked-writes counter — non-zero values indicate the
         // user should enable incremental rehash (`set_rehash_strategy("incremental")`).
         append("# HELP lru_rehash_blocked_writes_total Writes blocked by a non-incremental (blocking) rehash.");
         append("# TYPE lru_rehash_blocked_writes_total counter");
@@ -8356,7 +8550,7 @@ private:
         out.append(std::to_string(rehash_blocked_writes_count()));
         out.push_back('\n');
 
-        // P1-5: Lock-free read path fallback counter — non-zero values indicate
+        // Lock-free read path fallback counter — non-zero values indicate
         // the lock-free read path is being degraded by rehash activity.
         append("# HELP lru_rehash_lockfree_fallback_total Lock-free read paths that fell back to the lock-protected path due to incremental rehash.");
         append("# TYPE lru_rehash_lockfree_fallback_total counter");
@@ -8364,7 +8558,7 @@ private:
         out.append(std::to_string(rehash_lockfree_fallback_count()));
         out.push_back('\n');
 
-        // P0-D: Rehash-in-progress ratio — gauge of the fraction of the
+        // Rehash-in-progress ratio — gauge of the fraction of the
         // hash table currently rehashing. Sustained values near 1.0 indicate
         // the background rehash balancer cannot keep up with write pressure.
         append("# HELP lru_rehash_in_progress_ratio Fraction of hash table segments currently in an incremental rehash.");
@@ -8379,7 +8573,7 @@ private:
         out.append(std::to_string(snap.tls_ring_flush_count.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // P0-1: hazptr/EBR reclaim diagnostics — these track deferred
+        // hazptr/EBR reclaim diagnostics — these track deferred
         // reclamation health. High pending with low reclaim growth
         // indicates the reclaim worker is not running or too many
         // read_handles are long-lived.
@@ -8407,7 +8601,7 @@ private:
         out.append(std::to_string(snap.reclaim_invocation_count.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // L-1: Hazptr slot-exhaustion / hard-cap fallback diagnostics.
+        // Hazptr slot-exhaustion / hard-cap fallback diagnostics.
         // Surface the sync-reclaim fallback path so operators can alert
         // before acquire_slot() starts throwing std::runtime_error (which
         // happens after kMaxSyncFallbacks=64 sync-reclaim rounds all fail
@@ -8431,7 +8625,7 @@ private:
         out.append(std::to_string(hazptr_slot_capacity()));
         out.push_back('\n');
 
-        // P0-3: live handle count vs runtime-configurable upper bound.
+        // live handle count vs runtime-configurable upper bound.
         // Operators alert on usage_ratio > 0.9 — sustained high usage
         // risks acquire_slot() returning npos, degrading reads to cache
         // misses (via empty read_handle). Raise the limit via
@@ -8454,7 +8648,7 @@ private:
         out.append(std::to_string(hazptr_slot_usage_ratio()));
         out.push_back('\n');
 
-        // P1-2: Active fairness mode as a numeric gauge (0=reader_preferred,
+        // Active fairness mode as a numeric gauge (0=reader_preferred,
         // 1=writer_fair). Operators alert on unexpected switches — e.g.
         // a cache that should be writer_fair (default) but is reported as
         // 0 indicates an unintended set_fairness_mode(reader_preferred)
@@ -8478,7 +8672,7 @@ private:
             static_cast<std::size_t>(is_drain_worker_started() ? 1 : 0)));
         out.push_back('\n');
 
-        // P1-6: Per-worker drain state. The reclaim worker handles
+        // Per-worker drain state. The reclaim worker handles
         // hazptr/EBR pending lists (memory safety); the callback worker
         // drains TLS rings and dispatches user callbacks. Both should
         // be 1 in production — alert on 0 for either.
@@ -8495,7 +8689,7 @@ private:
             static_cast<std::size_t>(is_callback_worker_running() ? 1 : 0)));
         out.push_back('\n');
 
-        // P1-1: Writer starvation detector metrics. Non-zero
+        // Writer starvation detector metrics. Non-zero
         // writer_starvation_events in reader_preferred mode indicates
         // the safety net fired — operators should consider switching
         // to writer_fair permanently. writer_max_wait_ns tracks the
@@ -8512,7 +8706,7 @@ private:
         out.append(std::to_string(writer_max_wait_ns()));
         out.push_back('\n');
 
-        // T-M1: singleflight / cache stampede coalescing diagnostics.
+        // singleflight / cache stampede coalescing diagnostics.
         // Non-zero values indicate the stampede protection is actively
         // preventing thundering-herd provider invocations on hot keys.
         append("# HELP lru_stampede_coalesced_total Cumulative count of follower requests collapsed into a leader's in-flight provider call.");
@@ -8521,7 +8715,7 @@ private:
         out.append(std::to_string(snap.stampede_coalesced_count.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // T-G11: refcount overflow diagnostics. Non-zero values almost
+        // refcount overflow diagnostics. Non-zero values almost
         // certainly indicate a handle leak in user code — under normal
         // operation, access_ref (32 bits, max ~4B) is unreachable.
         append("# HELP lru_incRef_overflow_count_total Cumulative count of incRef() calls that returned kIncFailedOverflow (access_ref saturated at 2^32-1). Non-zero values indicate a read_handle leak.");
@@ -8530,7 +8724,7 @@ private:
         out.append(std::to_string(snap.incRef_overflow_count.value.load(std::memory_order_relaxed)));
         out.push_back('\n');
 
-        // T-B4 (P2-10): Diagnostics cache freshness — operators use this
+        // Diagnostics cache freshness — operators use this
         // to detect a stalled or missing balancer. Expected value ≈ balancer
         // interval (1s default). Values >> interval indicate the balancer
         // thread died or `start_background_rehash_balancer()` was never
@@ -8542,7 +8736,7 @@ private:
         out.append(std::to_string(diagnostics_cache_age_ms()));
         out.push_back('\n');
 
-        // P1-3: Memory watermark / OOM protection status
+        // Memory watermark / OOM protection status
         append("# HELP lru_cache_memory_critical 1 if cache is in critical memory mode (read-only), 0 otherwise.");
         append("# TYPE lru_cache_memory_critical gauge");
         out.append("lru_cache_memory_critical ");
@@ -8561,7 +8755,7 @@ private:
         out.append(std::to_string(memory_critical_watermark()));
         out.push_back('\n');
 
-        // P-HIGH-2 (T-H1): Async OOM handler dispatch mode.
+        // Async OOM handler dispatch mode.
         append("# HELP lru_cache_async_oom_handler 1 if OOM handler is dispatched asynchronously by the drain worker, 0 if synchronous.");
         append("# TYPE lru_cache_async_oom_handler gauge");
         out.append("lru_cache_async_oom_handler ");
@@ -8574,7 +8768,7 @@ private:
 private:
     /// Helper: emit Prometheus histogram bucket lines + sum/count.
     ///
-    /// P2-2: the histogram now uses 512 log-linear buckets (16 sub-buckets
+    /// the histogram now uses 512 log-linear buckets (16 sub-buckets
     /// per power-of-2 octave). Bucket upper bounds are computed via
     /// latency_histogram::bucket_upper_bound(i) instead of the old
     /// power-of-2 formula. The overflow bucket (last index) is emitted
@@ -8636,7 +8830,7 @@ public:
     /// Register a hit callback. The callback is invoked outside the cache lock.
     /// For sharded caches, the callback is propagated to all shards.
     void on_hit(hit_callback_type callback) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.callbacks().on_hit(callback);
         if constexpr (requires { mm_.shard(0); }) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -8648,7 +8842,7 @@ public:
     /// Register a miss callback. The callback is invoked outside the cache lock.
     /// For sharded caches, the callback is propagated to all shards.
     void on_miss(miss_callback_type callback) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.callbacks().on_miss(callback);
         if constexpr (requires { mm_.shard(0); }) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -8660,7 +8854,7 @@ public:
     /// Register an insert callback. The callback is invoked outside the cache lock.
     /// For sharded caches, the callback is propagated to all shards.
     void on_insert(insert_callback_type callback) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.callbacks().on_insert(callback);
         if constexpr (requires { mm_.shard(0); }) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -8672,7 +8866,7 @@ public:
     /// Register an eviction callback. The callback is invoked outside the cache lock.
     /// For sharded caches, the callback is propagated to all shards.
     void on_evict(evict_callback_type callback) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.callbacks().on_evict(callback);
         if constexpr (requires { mm_.shard(0); }) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -8681,12 +8875,12 @@ public:
         }
     }
 
-    /// O7: Register an update callback — fires when set() overwrites an
+    /// Register an update callback — fires when set() overwrites an
     /// existing key's value (distinct from on_insert which fires for
     /// fresh inserts). For sharded caches, the callback is propagated
     /// to all shards.
     void on_update(update_callback_type callback) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.callbacks().on_update(callback);
         if constexpr (requires { mm_.shard(0); }) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -8695,11 +8889,11 @@ public:
         }
     }
 
-    /// O7: Register an expire callback — fires when an item is evicted
+    /// Register an expire callback — fires when an item is evicted
     /// due to TTL expiry (distinct from on_evict which fires for
     /// capacity eviction). For sharded caches, propagated to all shards.
     void on_expire(expire_callback_type callback) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.callbacks().on_expire(callback);
         if constexpr (requires { mm_.shard(0); }) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -8708,11 +8902,11 @@ public:
         }
     }
 
-    /// O7: Register a reject callback — fires when an insert is rejected
+    /// Register a reject callback — fires when an insert is rejected
     /// by the overflow policy (cache full, OOM, admission denial).
     /// For sharded caches, propagated to all shards.
     void on_reject(reject_callback_type callback) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.callbacks().on_reject(callback);
         if constexpr (requires { mm_.shard(0); }) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -8721,7 +8915,7 @@ public:
         }
     }
 
-    /// O6: Register an error hook invoked when any registered callback
+    /// Register an error hook invoked when any registered callback
     /// throws. The hook receives the captured exception, the event kind,
     /// the key, and (for non-miss events) a pointer to the value. Pass
     /// an empty `error_callback_type` to clear. For sharded caches, the
@@ -8731,7 +8925,7 @@ public:
     /// async mode is active, otherwise the caller of flush_pending).
     /// Exceptions thrown by the hook itself are swallowed.
     void on_callback_error(error_callback_type callback) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.callbacks().on_callback_error(callback);
         if constexpr (requires { mm_.shard(0); }) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -8740,7 +8934,7 @@ public:
         }
     }
 
-    /// O6: Total callback failures observed across all shards since
+    /// Total callback failures observed across all shards since
     /// construction or the last reset. Aggregates sync + async dispatch
     /// failures. For sharded caches, sums counts across all shards.
     std::size_t callback_error_count() const {
@@ -8753,7 +8947,7 @@ public:
         return total;
     }
 
-    /// O6: Reset the callback failure counter across all shards.
+    /// Reset the callback failure counter across all shards.
     void reset_callback_error_count() {
         mm_.callbacks().reset_callback_error_count();
         if constexpr (requires { mm_.shard(0); }) {
@@ -8766,7 +8960,7 @@ public:
     /// Remove all registered callbacks and pending deferred events.
     /// For sharded caches, clears callbacks from all shards.
     void clear_callbacks() {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.callbacks().clear_all();
         if constexpr (requires { mm_.shard(0); }) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
@@ -8814,18 +9008,30 @@ public:
     // Memory policy
     // --------------------------------------------------------------------
 
+    /// Register a function reporting a key's real in-memory size, in bytes.
+    ///
+    /// Without one, the billed size is a compile-time constant per item, so
+    /// `max_memory` and the memory watermarks degrade into an item-count proxy.
+    /// See detail::deep_size for the common container types, or call
+    /// use_real_payload_sizes() to bill them automatically.
     void set_key_size_calculator(std::function<size_type(const Key&)> func) {
-        auto lock = acquire_write_lock();
+        // A sharded MM stores the calculator per shard, so the per-shard write
+        // locks are what protect it -- the stripe lock does not (same contract
+        // as set_defer_promotion). Taking only the stripe lock let this race a
+        // concurrent set() that reads shard.config().
+        auto shard_locks = acquire_write_lock_all_shards();
         mm_.set_key_size_calculator(std::move(func));
     }
 
+    /// Register a function reporting a value's real in-memory size, in bytes.
     void set_value_size_calculator(std::function<size_type(const Value&)> func) {
-        auto lock = acquire_write_lock();
+        auto shard_locks = acquire_write_lock_all_shards();
         mm_.set_value_size_calculator(std::move(func));
     }
 
+    /// Set the eviction predicate: returning false marks an item unevictable.
     void set_eviction_predicate(std::function<bool(const Key&, const Value&)> pred) {
-        auto lock = acquire_write_lock();
+        auto shard_locks = acquire_write_lock_all_shards();
         mm_.set_eviction_predicate(std::move(pred));
     }
 
@@ -8850,7 +9056,7 @@ public:
 
     /// Get a snapshot of memory monitor statistics.
     ///
-    /// P1-13: No lock — memory_monitor_.get_stats() reads its own atomic
+    /// No lock — memory_monitor_.get_stats() reads its own atomic
     /// counters, and mm_.current_memory() is a sum of per-shard atomic
     /// counters. The global read lock would shared-lock all 64 stripes
     /// for no correctness benefit (no shard state is read here).
@@ -8886,7 +9092,7 @@ public:
     /// table does not allocate separate node_type objects, so these functions
     /// are ignored.
     void set_hash_alloc_fns(void* (*alloc_fn)(std::size_t), void (*dealloc_fn)(void*)) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         mm_.set_hash_alloc_fns(alloc_fn, dealloc_fn);
     }
 
@@ -8901,7 +9107,7 @@ public:
     /// (lock-free Treiber stack per size class) and is suitable for
     /// read-heavy workloads where allocation/free patterns are stable.
     void enable_slab_allocator(const slab_allocator::config& cfg = slab_allocator::config{}) {
-        auto lock = acquire_write_lock();
+        auto lock = acquire_write_lock_all_shards();
         if (owned_allocator_) return;  // already enabled
         owned_allocator_ = std::make_unique<slab_allocator>(cfg);
         mm_.set_allocator(owned_allocator_.get());
@@ -8930,7 +9136,7 @@ public:
     // Event drain workers (P1-6: split into reclaim + callback workers)
     // --------------------------------------------------------------------
     //
-    // P1-6: The drain worker was previously a single thread that did both
+    // The drain worker was previously a single thread that did both
     //   (a) memory reclamation (hazptr/EBR pending drain, epoch advance,
     //       try_reclaim_now) and
     //   (b) user-visible side-effect dispatch (TLS access/callback ring
@@ -8976,7 +9182,7 @@ public:
     ///                  sensitive scenarios.
     void start_event_drain(std::chrono::milliseconds interval = std::chrono::seconds(1)) {
         if (reclaim_drain_worker_ || callback_drain_worker_) return;  // Already running
-        // P1-3: Mark the hazptr domain's drain worker as started so
+        // Mark the hazptr domain's drain worker as started so
         // retire_obj() stops emitting the one-shot stderr warning.
         // Without this, operators using hazptr-mode caches (any cache
         // that did not call set_ebr_domain()) would see the warning on
@@ -9013,7 +9219,7 @@ public:
                 for_each_ebr_domain([](detail::epoch_domain& dom) {
                     dom.maybe_time_advance();
                 });
-                // T-P2-3 (R-7): incremental reclaim — process at most
+                // incremental reclaim — process at most
                 // kIncrementalReclaimBatch objects per domain per tick
                 // to bound worst-case tick latency. If the backlog is
                 // large (pending > 4 * batch), process 4x the default
@@ -9026,7 +9232,7 @@ public:
                     batch = kIncrementalReclaimBatch * 4;
                 }
                 try_reclaim_now(batch);
-                // P1-7 (T2.6): Self-adjust interval based on active
+                // Self-adjust interval based on active
                 // handle count. When handles are alive, drop to the
                 // aggressive interval so items released by ~read_handle
                 // are reclaimed promptly; otherwise use the normal
@@ -9045,7 +9251,7 @@ public:
             [this, callback_normal, callback_aggressive] {
                 drain_access_ring();
                 tls_callback_ring<Key, Value>::flush_all_registered();
-                // P1-4 (T3.3): Force-flush dormant threads' TLS rings.
+                // Force-flush dormant threads' TLS rings.
                 // Threads that have not called record_access() in the
                 // last 2 seconds (R6: lowered from 5s) are considered
                 // dormant (e.g., blocked on I/O, descheduled by the OS,
@@ -9057,18 +9263,18 @@ public:
                 // which drain_access_ring() will pick up on the next
                 // iteration.
                 tls_access_ring<Key>::force_flush_dormant_threads();
-                // P2-4 (T2.4): Drain async overload-callback queue.
+                // Drain async overload-callback queue.
                 // When `set_async_overload_callback(true)` is enabled,
                 // the rehash hot path enqueues overload events instead
                 // of invoking the user callback inline. Draining them
                 // here keeps the callback off the rehash path while
                 // still dispatching it promptly (≤1s, 500ms aggressive).
                 drain_overload_callbacks();
-                // P-HIGH-2 (T-H1): Drain async OOM handler event queue.
+                // Drain async OOM handler event queue.
                 // Safe no-op when async mode is disabled or no event
                 // pending.
                 drain_oom_events();
-                // P1-12: drain the event tracker's TLS ring (if enabled)
+                // drain the event tracker's TLS ring (if enabled)
                 // AFTER tls_callback_ring flush, because callback dispatch
                 // may record events into the tracker's TLS ring. Using
                 // drain_all_threads() ensures all threads' events are
@@ -9081,7 +9287,7 @@ public:
                 if (tracker) {
                     tracker->drain_all_threads();
                 }
-                // P1-7 (T2.6): Self-adjust interval based on active
+                // Self-adjust interval based on active
                 // handle count. When handles are alive, drop to the
                 // aggressive interval so deferred promotions are
                 // applied sooner (reducing stale LRU ordering window);
@@ -9140,7 +9346,7 @@ public:
         return reclaim_drain_worker_ != nullptr || callback_drain_worker_ != nullptr;
     }
 
-    /// P1-6: Query whether the reclaim worker specifically is running.
+    /// Query whether the reclaim worker specifically is running.
     /// The reclaim worker drains hazptr/EBR pending lists and advances
     /// the EBR epoch. If this returns false but is_event_drain_running()
     /// returns true, only the callback worker is active and memory
@@ -9150,7 +9356,7 @@ public:
         return reclaim_drain_worker_ != nullptr;
     }
 
-    /// P1-6: Query whether the callback worker specifically is running.
+    /// Query whether the callback worker specifically is running.
     /// The callback worker drains TLS access/callback rings and
     /// dispatches async overload/OOM events. If this returns false but
     /// is_event_drain_running() returns true, only the reclaim worker
@@ -9175,7 +9381,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // P0-5 (T1.3): Background rehash balancer
+    // Background rehash balancer
     // --------------------------------------------------------------------
     //
     // The hot-path rehash_if_needed(hash) only touches the segment owning
@@ -9216,7 +9422,7 @@ public:
         }
         rehash_balancer_worker_ = std::make_unique<detail::periodic_worker>(
             [this] {
-                // T-B4 (P2-10): Refresh the diagnostics cache BEFORE
+                // Refresh the diagnostics cache BEFORE
                 // refresh_hash_stats() reads max_chain_length(). Without
                 // this ordering, refresh_hash_stats() would call
                 // max_chain_length() on a cold cache, triggering a live
@@ -9254,7 +9460,7 @@ public:
         return rehash_balancer_worker_ != nullptr;
     }
 
-    /// T-B4 (P2-10): Age of the diagnostics snapshot in milliseconds.
+    /// Age of the diagnostics snapshot in milliseconds.
     ///
     /// Returns the worst-case age across all shards. Returns
     /// `std::numeric_limits<std::uint64_t>::max()` if the cache has
@@ -9279,7 +9485,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // P1-12: Event tracker integration
+    // Event tracker integration
     // --------------------------------------------------------------------
     //
     // event_tracker records item lifecycle events (insert/hit/evict) into
@@ -9340,7 +9546,7 @@ public:
             event_tracker_.reset();
         }
         if (tracker) {
-            // P2-D: stop the drain worker, clear the event callback, and
+            // stop the drain worker, clear the event callback, and
             // gate all record_* methods to no-ops. Safe to call outside
             // the lock — disable() is thread-safe. Wrapped in try/catch
             // to preserve the noexcept guarantee.
@@ -9370,7 +9576,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // P0-1: hazptr / EBR reclamation control
+    // hazptr / EBR reclamation control
     // --------------------------------------------------------------------
     //
     // Hazard pointer and epoch-based reclamation defer the actual deletion
@@ -9401,7 +9607,7 @@ public:
         std::size_t reclaimed = 0;
         try {
             reclaimed += detail::hazptr_domain::default_domain().try_reclaim(batch_size);
-            // R9: reclaim every active EBR domain (global default, or each
+            // reclaim every active EBR domain (global default, or each
             // per-shard domain when per-shard EBR is enabled).
             for_each_ebr_domain([&](detail::epoch_domain& dom) {
                 reclaimed += dom.try_reclaim(batch_size);
@@ -9413,7 +9619,7 @@ public:
         // pending_count snapshots (best-effort, may change concurrently).
         per_cache_stats_.reclaim_total.fetch_add(reclaimed, std::memory_order_relaxed);
         per_cache_stats_.reclaim_invocation_count.fetch_add(1, std::memory_order_relaxed);
-        // P1-11: Estimate freed bytes as reclaimed * sizeof(item_type).
+        // Estimate freed bytes as reclaimed * sizeof(item_type).
         // The hazptr/EBR domain tracks only object counts, not per-object
         // sizes, so we approximate using the cache's item_type. This is
         // accurate for the common case (all retired objects are
@@ -9431,7 +9637,7 @@ public:
         return reclaimed;
     }
 
-    /// T-P2-3 (R-7): Default batch size for incremental reclaim used by
+    /// Default batch size for incremental reclaim used by
     /// the background event drain worker. Each tick processes at most
     /// this many objects per reclamation domain (hazptr + EBR), bounding
     /// tick latency. With 1024 objects per tick and a 500ms–1s tick
@@ -9443,7 +9649,7 @@ public:
     static constexpr std::size_t kIncrementalReclaimBatch = 1024;
 
     // --------------------------------------------------------------------
-    // P1-3 (T1.4): Auto-reclaim threshold
+    // Auto-reclaim threshold
     // --------------------------------------------------------------------
     //
     // Under bursty retire workloads, retired items accumulate in the
@@ -9467,7 +9673,7 @@ public:
     /// Set the auto-reclaim threshold on both default domains.
     void set_reclaim_threshold(std::size_t threshold) noexcept {
         detail::hazptr_domain::default_domain().set_reclaim_threshold(threshold);
-        // R9: propagate to every active EBR domain (global or per-shard).
+        // propagate to every active EBR domain (global or per-shard).
         for_each_ebr_domain([threshold](detail::epoch_domain& dom) {
             dom.set_reclaim_threshold(threshold);
         });
@@ -9477,7 +9683,7 @@ public:
     /// the effective bound on pending backlog before auto-reclaim fires).
     std::size_t reclaim_threshold() const noexcept {
         std::size_t h = detail::hazptr_domain::default_domain().reclaim_threshold();
-        // R9: per-shard domains are configured uniformly; sample the min.
+        // per-shard domains are configured uniformly; sample the min.
         std::size_t e = std::numeric_limits<std::size_t>::max();
         for_each_ebr_domain([&](detail::epoch_domain& dom) {
             e = std::min(e, dom.reclaim_threshold());
@@ -9492,7 +9698,7 @@ public:
     /// indicates the threshold is too low for the workload's retire rate.
     std::size_t reclaim_auto_triggered_count() const noexcept {
         std::size_t total = detail::hazptr_domain::default_domain().reclaim_auto_triggered_count();
-        // R9: aggregate across all active EBR domains.
+        // aggregate across all active EBR domains.
         for_each_ebr_domain([&](detail::epoch_domain& dom) {
             total += dom.reclaim_auto_triggered_count();
         });
@@ -9500,7 +9706,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // P0-2 (T2.1): EBR epoch force-advance timeout
+    // EBR epoch force-advance timeout
     // --------------------------------------------------------------------
     //
     // EBR uses a global epoch counter; reclamation is safe when retired
@@ -9519,34 +9725,34 @@ public:
 
     /// Set the EBR force-advance timeout on the default domain.
     void set_epoch_force_advance_timeout(std::chrono::nanoseconds timeout) noexcept {
-        // R9: propagate to every active EBR domain (global or per-shard).
+        // propagate to every active EBR domain (global or per-shard).
         for_each_ebr_domain([timeout](detail::epoch_domain& dom) {
             dom.set_epoch_force_advance_timeout(timeout);
         });
     }
 
-    /// P0-2: Alias for `set_epoch_force_advance_timeout` — shorter name
+    /// Alias for `set_epoch_force_advance_timeout` — shorter name
     /// aligned with the `force_advance_policy` API.
     void set_force_advance_timeout(std::chrono::nanoseconds timeout) noexcept {
         set_epoch_force_advance_timeout(timeout);
     }
 
-    /// P0-2: Select the EBR force-advance policy on the default domain.
+    /// Select the EBR force-advance policy on the default domain.
     /// See `lru::detail::force_advance_policy` for the semantics of each
     /// value. Default is `kForceAdvanceAfter5s` (preserves pre-P0-2
     /// behavior). Use `kFailAdvance` for memory-safety-sensitive
     /// scenarios where UAF risk is unacceptable; use `kNeverForceAdvance`
     /// only when the workload guarantees no long-running critical sections.
     void set_force_advance_policy(detail::force_advance_policy policy) noexcept {
-        // R9: propagate to every active EBR domain (global or per-shard).
+        // propagate to every active EBR domain (global or per-shard).
         for_each_ebr_domain([policy](detail::epoch_domain& dom) {
             dom.set_force_advance_policy(policy);
         });
     }
 
-    /// P0-2: Query the active EBR force-advance policy.
+    /// Query the active EBR force-advance policy.
     detail::force_advance_policy get_force_advance_policy() const noexcept {
-        // R9: domains are configured uniformly; read the first active one.
+        // domains are configured uniformly; read the first active one.
         detail::force_advance_policy result =
             detail::force_advance_policy::kFailAdvance;
         for_each_ebr_domain([&](detail::epoch_domain& dom) {
@@ -9597,7 +9803,7 @@ public:
         if (ttl_cleaner_worker_) {
             throw std::logic_error("start_ttl_cleaner: cleaner already running");
         }
-        // T-G17: Background cleaner uses round-robin (one shard per cycle)
+        // Background cleaner uses round-robin (one shard per cycle)
         // to amortize CPU across cycles. Callers wanting immediate full
         // eviction should use evict_expired_now() instead.
         ttl_cleaner_worker_ = std::make_unique<detail::periodic_worker>(
@@ -9620,7 +9826,7 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // T-G17: True per-shard round-robin TTL cleanup
+    // True per-shard round-robin TTL cleanup
     // ----------------------------------------------------------------
     //
     // The legacy `evict_expired_impl()` walks ALL shards on every cleaner
@@ -9646,7 +9852,7 @@ public:
     // added later as a drop-in optimization if sub-millisecond TTL
     // reaping becomes a requirement.
 
-    /// T-G17: Is per-shard round-robin TTL cleanup enabled? Default
+    /// Is per-shard round-robin TTL cleanup enabled? Default
     /// true for sharded caches (cuts cleaner CPU by ~1/num_shards).
     /// Set to false to restore legacy "scan all shards per cycle"
     /// behavior.
@@ -9654,12 +9860,12 @@ public:
         return ttl_cleaner_round_robin_.load(std::memory_order_relaxed);
     }
 
-    /// T-G17: Enable/disable per-shard round-robin TTL cleanup.
+    /// Enable/disable per-shard round-robin TTL cleanup.
     void set_ttl_cleaner_round_robin(bool enabled) noexcept {
         ttl_cleaner_round_robin_.store(enabled, std::memory_order_relaxed);
     }
 
-    /// T-G17: Return the shard index that the next cleaner cycle will
+    /// Return the shard index that the next cleaner cycle will
     /// process. Exposed for testing and diagnostics.
     std::size_t ttl_cleaner_next_shard() const noexcept {
         return ttl_cleaner_next_shard_.load(std::memory_order_relaxed);
@@ -9669,7 +9875,7 @@ public:
     /// This is the same operation performed by the background cleaner,
     /// but invoked manually (e.g., from a custom scheduler).
     ///
-    /// T-G17: Unlike the background cleaner (which uses round-robin to
+    /// Unlike the background cleaner (which uses round-robin to
     /// process ONE shard per cycle), `evict_expired_now()` processes ALL
     /// shards in a single call — callers explicitly invoke this when they
     /// want immediate full eviction, not the deferred round-robin behavior.
@@ -9698,7 +9904,7 @@ private:
     /// SFINAE-aware evict_expired implementation. Dispatches to the MM's
     /// evict_expired() if it exists; otherwise returns 0 (no-op).
     ///
-    /// P1-31 (fix.01): every eviction strategy now owns an item-level TTL
+    /// every eviction strategy now owns an item-level TTL
     /// index (`detail::mm_ttl_index_mixin`), and `ttl_cache` publishes its
     /// expiry to that index through `set_with_absolute_expiry()`. The previous
     /// T-G1 fallback — `evict_expired_via_ttl_entry_scan()`, which walked the
@@ -9711,7 +9917,26 @@ private:
     /// implementation uses try_lock to avoid blocking concurrent readers
     /// and limits eviction to `batch_size` items per shard/lock acquisition.
     /// Remaining expired items are processed in subsequent cleaner cycles.
+    /// Sweep expired items and dispatch the collected callbacks.
+    ///
+    /// The MM sweep batches on_expire / on_evict events into the callback
+    /// manager's ring; they are dispatched on flush. Flushing here is what makes
+    /// evict_expired_now() and the background TTL cleaner observable to the
+    /// user — without it a caller could reap thousands of items and see no
+    /// callback at all.
     std::size_t evict_expired_impl(bool round_robin = false) {
+        const std::size_t evicted = evict_expired_raw(round_robin);
+        if (evicted != 0) {
+            if constexpr (requires { mm_.flush_pending_all(); }) {
+                mm_.flush_pending_all();
+            } else {
+                mm_.callbacks().flush_pending();
+            }
+        }
+        return evicted;
+    }
+
+    std::size_t evict_expired_raw(bool round_robin) {
         if constexpr (is_striped) {
             std::size_t total = 0;
             if constexpr (requires { mm_.shard(0).evict_expired(); }) {
@@ -9724,7 +9949,7 @@ private:
                     return 0;
                 }();
 
-                // T-G17: True per-shard round-robin — process exactly ONE
+                // True per-shard round-robin — process exactly ONE
                 // shard per cleaner cycle when enabled (default for
                 // background cleaner). This cuts per-cycle work by
                 // ~1/num_shards. `evict_expired_now()` passes
@@ -9857,7 +10082,7 @@ public:
     /// Returns a locked range over the MM reverse iterator pair.
     /// The global read lock is held until the returned locked_range is destroyed.
     auto rbegin() {
-        // P-HIGH-1 (T-C3): For sharded_mm_lru, acquire per-shard read locks
+        // For sharded_mm_lru, acquire per-shard read locks
         // (the stripe lock does NOT protect MM data — see T3.4 bugfix).
         auto lock = acquire_read_lock_all_shards();
         if constexpr (requires { std::declval<mm_type&>().rbegin(); }) {
@@ -9912,7 +10137,7 @@ public:
     /// @param shard_id The shard index (0 to num_shards()-1)
     /// @throws std::out_of_range if shard_id is invalid
     auto shard_rbegin(std::size_t shard_id) {
-        // P-HIGH-1 (T-C3): For sharded_mm_lru, acquire the per-shard read
+        // For sharded_mm_lru, acquire the per-shard read
         // lock (NOT the stripe lock — stripe lock does not protect MM data).
         if constexpr (has_per_shard_lock_v<mm_type>) {
             if (shard_id >= mm_.num_shards()) {
@@ -10128,28 +10353,38 @@ public:
         // the hash too, so computing it up front removes a redundant hash AND
         // makes the per-shard attribution exact.
         //
-        // Why the histogram matters: `write_lock_wait_count` was already
-        // incremented on the slow path, but `write_lock_wait_latency` was
-        // declared, exported as `lru_cache_write_lock_wait_ns`, and never
-        // recorded anywhere — a count with no distribution, on the one
-        // contention signal an operator most wants percentiles for. The timer
-        // covers acquisition only (it is constructed before the lock and
-        // destroyed as the function returns), and is gated on
-        // latency_tracking_enabled exactly like the get/set timers.
+        // Both signals are recorded here, and they are recorded differently on
+        // purpose:
+        //   - `write_lock_wait_count` is a plain count of slow-path entries,
+        //     always on (see detail::lock_wait_counter). It used to be
+        //     declared, exported as `lru_cache_write_lock_wait_total`, and
+        //     never written by anything, so it read as a permanent zero.
+        //   - `write_lock_wait_latency` is the distribution, gated on
+        //     latency_tracking_enabled exactly like the get/set timers.
+        // The timer covers acquisition only (constructed before the lock,
+        // destroyed as the function returns).
         const auto hash = Hash{}(key);
         if constexpr (has_per_shard_lock_v<mm_type>) {
-            auto& st = mm_.shard(mm_.shard_for_hash(hash)).stats();
+            const std::size_t shard = mm_.shard_for_hash(hash);
+            auto& st = mm_.shard(shard).stats();
             detail::scope_latency_timer lock_timer(st.write_lock_wait_latency,
                 st.latency_tracking_enabled.load(std::memory_order_relaxed));
-            return mm_.acquire_shard_write_lock(mm_.shard_for_hash(hash));
+            detail::lock_wait_counter<detail::distributed_shared_mutex> waits(
+                st.write_lock_wait_count.value, mm_.shard_mutex(shard));
+            return mm_.acquire_shard_write_lock(shard);
         } else if constexpr (is_striped) {
+            const std::size_t stripe = striped_mutex_.stripe_for(hash);
             auto& st = mm_.shard(0).stats();
             detail::scope_latency_timer lock_timer(st.write_lock_wait_latency,
                 st.latency_tracking_enabled.load(std::memory_order_relaxed));
-            return striped_mutex_.make_unique_lock(striped_mutex_.stripe_for(hash));
+            detail::lock_wait_counter<detail::distributed_shared_mutex> waits(
+                st.write_lock_wait_count.value, &striped_mutex_.mutex_at(stripe));
+            return striped_mutex_.make_unique_lock(stripe);
         } else if constexpr (is_thread_safe) {
             detail::scope_latency_timer lock_timer(mm_.stats().write_lock_wait_latency,
                 mm_.stats().latency_tracking_enabled.load(std::memory_order_relaxed));
+            detail::lock_wait_counter<typename lock_policy::mutex_type> waits(
+                mm_.stats().write_lock_wait_count.value, &mutex_);
             return typename lock_policy::write_lock_type(mutex_);
         } else {
             return noop_lock{};
@@ -10165,25 +10400,33 @@ public:
         // acquire_write_lock_for_key() for the rationale.
         const auto hash = Hash{}(key);
         if constexpr (has_per_shard_lock_v<mm_type>) {
-            auto& st = mm_.shard(mm_.shard_for_hash(hash)).stats();
+            const std::size_t shard = mm_.shard_for_hash(hash);
+            auto& st = mm_.shard(shard).stats();
             detail::scope_latency_timer lock_timer(st.read_lock_wait_latency,
                 st.latency_tracking_enabled.load(std::memory_order_relaxed));
-            return mm_.acquire_shard_read_lock(mm_.shard_for_hash(hash));
+            detail::lock_wait_counter<detail::distributed_shared_mutex> waits(
+                st.read_lock_wait_count.value, mm_.shard_mutex(shard));
+            return mm_.acquire_shard_read_lock(shard);
         } else if constexpr (is_striped) {
+            const std::size_t stripe = striped_mutex_.stripe_for(hash);
             auto& st = mm_.shard(0).stats();
             detail::scope_latency_timer lock_timer(st.read_lock_wait_latency,
                 st.latency_tracking_enabled.load(std::memory_order_relaxed));
-            return striped_mutex_.make_shared_lock(striped_mutex_.stripe_for(hash));
+            detail::lock_wait_counter<detail::distributed_shared_mutex> waits(
+                st.read_lock_wait_count.value, &striped_mutex_.mutex_at(stripe));
+            return striped_mutex_.make_shared_lock(stripe);
         } else if constexpr (is_thread_safe) {
             detail::scope_latency_timer lock_timer(mm_.stats().read_lock_wait_latency,
                 mm_.stats().latency_tracking_enabled.load(std::memory_order_relaxed));
+            detail::lock_wait_counter<typename lock_policy::mutex_type> waits(
+                mm_.stats().read_lock_wait_count.value, &mutex_);
             return typename lock_policy::read_lock_type(mutex_);
         } else {
             return noop_lock{};
         }
     }
 
-    /// P2-1 / P-CRIT-2 (T-C2): Acquire a read lock for a specific shard index.
+    /// Acquire a read lock for a specific shard index.
     /// For sharded_mm_lru, uses the per-shard mutex (the stripe lock does
     /// NOT protect MM data — see T3.4 bugfix). For non-sharded MM with
     /// striped locking, uses the stripe lock keyed by shard_idx (modulo
@@ -10201,7 +10444,7 @@ public:
         }
     }
 
-    /// P-CRIT-2 (T-C2): Acquire a write lock for a specific shard index.
+    /// Acquire a write lock for a specific shard index.
     /// Used by load_per_shard() to rebuild a single shard under its
     /// per-shard write lock (the stripe lock does NOT protect MM data
     /// for sharded_mm_lru — see T3.4 bugfix comment in evict_expired_impl).
@@ -10217,7 +10460,7 @@ public:
         }
     }
 
-    /// P-CRIT-2 / P-HIGH-1 (T-C2/T-C3): Acquire read locks for ALL shards.
+    /// Acquire read locks for ALL shards.
     ///
     /// For sharded_mm_lru, the MM data is protected by per-shard mutexes,
     /// NOT by the stripe mutexes. Global operations that iterate the MM
@@ -10242,7 +10485,7 @@ public:
         }
     }
 
-    /// P-CRIT-2 (T-C2): Acquire write locks for ALL shards.
+    /// Acquire write locks for ALL shards.
     ///
     /// Used by load() to rebuild the entire MM under per-shard write locks.
     /// Returns a vector of unique_lock objects whose destructors release
@@ -10287,7 +10530,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // T16.2: Hash-reuse lock acquisition. Accepts a pre-computed hash so
+    // Hash-reuse lock acquisition. Accepts a pre-computed hash so
     // callers that already computed Hash{}(key) for shard dispatch can
     // reuse it for stripe selection, avoiding a second hash computation.
     // --------------------------------------------------------------------
@@ -10345,7 +10588,7 @@ public:
         }
     }
 
-    /// P1-30 (方案 B): the effective number of MM shards, i.e. the LRU /
+    /// the effective number of MM shards, i.e. the LRU /
     /// hash-table granularity. Equal to `num_stripes()` for
     /// `sharded_mm_lru`, and 1 for non-sharded strategies. Exposed so callers
     /// (and tests) can verify that a small cache is not laid out over more
@@ -10393,7 +10636,7 @@ private:
     /// Owned slab allocator (created by enable_slab_allocator()).
     std::unique_ptr<slab_allocator> owned_allocator_;
 
-    // R9 (per-shard EBR): Optional per-shard epoch domains. When enabled via
+    // Optional per-shard epoch domains. When enabled via
     // enable_per_shard_ebr(), each shard owns an independent epoch_domain so
     // reclamation on one shard is not blocked by readers on another. Off by
     // default: the global default_domain() is used, which keeps the per-thread
@@ -10410,7 +10653,7 @@ private:
 
     mm_type mm_;
     [[no_unique_address]] mutable mutex_storage mutex_;
-    // T-P3-5: striped_mutex_ uses lazy_striped_mutex (unique_ptr-based).
+    // striped_mutex_ uses lazy_striped_mutex (unique_ptr-based).
     // The per-stripe distributed_shared_mutex objects are NOT allocated at
     // construction — they are deferred until the first global operation
     // (lock_all/lock_shared_all/mutex_at/etc.) that actually needs them.
@@ -10420,7 +10663,7 @@ private:
     // size() are O(1) non-allocating (computed from stored num_stripes_).
     [[no_unique_address]] mutable striped_mutex_storage striped_mutex_;
 
-    // T14.1: Embedded compact_cache storage. Only present when
+    // Embedded compact_cache storage. Only present when
     // Trait::is_compact == true; otherwise this is an empty tuple (zero
     // overhead thanks to [[no_unique_address]]). When is_compact=true,
     // all storage operations (set/get/peek/remove/etc.) are delegated to
@@ -10432,7 +10675,7 @@ private:
     // that are only available here (not in cache_trait). So we use a
     // nested helper that only instantiates compact_cache when needed.
     //
-    // T14.3: Compile-time size check is enforced in the compact_cache
+    // Compile-time size check is enforced in the compact_cache
     // itself (compact_cache.hpp line 214-215) — instantiating
     // compact_cache<K,V,...> when sizeof(K)+sizeof(V) > 64 is a
     // compile error with a clear message.
@@ -10476,7 +10719,7 @@ private:
     using compact_storage = compact_storage_helper<Trait::is_compact>;
     [[no_unique_address]] compact_storage compact_storage_;
 
-    /// T14.1: Convenience accessor for the embedded compact_cache.
+    /// Convenience accessor for the embedded compact_cache.
     /// Only valid when Trait::is_compact == true; calling this on a
     /// non-compact cache is a compile error (guarded by the helper's
     /// static_assert).
@@ -10492,24 +10735,24 @@ private:
     }
 
     /// Optional value provider for get_or_fetch / operator[].
-    /// P1-45 (fix.01 方案 A): published through an RCU-style atomic shared_ptr
+    /// published through an RCU-style atomic shared_ptr
     /// so the miss path can take a snapshot without holding a lock (and without
     /// copying/allocating a std::function under the per-key lock).
     detail::atomic_shared_ptr<std::function<Value(const Key&)>> value_provider_;
 
-    /// O2: Slow query logger — invoked when get()/set() latency exceeds
+    /// Slow query logger — invoked when get()/set() latency exceeds
     /// `slow_query_threshold_ns_`. Stored as detail::atomic_shared_ptr
     /// (spinlock-based, since libc++ lacks std::atomic<std::shared_ptr<T>>).
     /// Set via set_slow_query_callback() — load() is the read path.
     /// When nullptr or threshold is 0, the slow-query check is a no-op
     /// (single relaxed load + branch on the fast path).
     detail::atomic_shared_ptr<slow_query_callback_type> slow_query_callback_{};
-    /// O2: Threshold in nanoseconds. 0 = disabled (default). Set via
+    /// Threshold in nanoseconds. 0 = disabled (default). Set via
     /// set_slow_query_threshold(). Aligned to its own cache line to
     /// avoid false sharing with the value_provider_ above (which is
     /// read on every get_or_fetch miss).
     alignas(64) std::atomic<std::uint64_t> slow_query_threshold_ns_{0};
-    /// O2: Cumulative count of slow operations detected since startup.
+    /// Cumulative count of slow operations detected since startup.
     /// Useful for alerting on tail-latency regressions. Padded to its
     /// own cache line because it's incremented on every slow op (which
     /// can happen concurrently from many threads). Mutable because
@@ -10518,7 +10761,7 @@ private:
     /// modifiable.
     alignas(64) mutable std::atomic<std::size_t> slow_query_count_{0};
 
-    /// O1: Trace callback — invoked at the end of every get()/set() when
+    /// Trace callback — invoked at the end of every get()/set() when
     /// registered. Stored as detail::atomic_shared_ptr for RCU-style
     /// lock-free reads on the hot path. Set via set_trace_callback().
     /// When nullptr, the trace check is a no-op (single relaxed load +
@@ -10526,13 +10769,13 @@ private:
     /// false sharing with the slow-query counter (which is incremented
     /// on a different code path).
     detail::atomic_shared_ptr<trace_callback_type> trace_callback_{};
-    /// O1: Cumulative count of trace events fired since startup. Useful
+    /// Cumulative count of trace events fired since startup. Useful
     /// for verifying tracing is active and monitoring sampling rates.
     /// Mutable because notify_trace() is const (called from trace_notifier
     /// which holds a const cache reference).
     alignas(64) mutable std::atomic<std::size_t> trace_count_{0};
 
-    /// T-M1: singleflight / cache stampede protection tracker.
+    /// singleflight / cache stampede protection tracker.
     ///
     /// Prevents thundering-herd provider calls when multiple threads
     /// concurrently miss the same key in get_or_fetch()/try_get_or_fetch().
@@ -10554,7 +10797,7 @@ private:
     detail::singleflight_tracker<Key, Value> singleflight_;
     std::atomic<bool> singleflight_enabled_{false};
 
-    /// T-D2 (P2-2): Per-cache TLS access ring config.
+    /// Per-cache TLS access ring config.
     ///
     /// Holds the per-cache overflow policy, auto-drain threshold, and
     /// flush callback that take precedence over the static
@@ -10576,7 +10819,7 @@ private:
     /// active_handle_count is isolated to this cache instance (rather than
     /// the global per-Value-type counter in read_handle<T>).
     ///
-    /// P2-1: This is now DEFAULT-ON. The per-T global counter in
+    /// This is now DEFAULT-ON. The per-T global counter in
     /// read_handle<T> is only maintained under `-DLRU_DEBUG=1` (it is
     /// a no-op in release builds to avoid cross-cache cache-line
     /// ping-pong under high read QPS). Production observability relies
@@ -10595,14 +10838,14 @@ private:
     double ttl_jitter_pct_ = 0.10;
     std::atomic<bool> ttl_jitter_enabled_{true};
 
-    /// P1-6: Optional reclaim drain worker (created by start_event_drain()).
+    /// Optional reclaim drain worker (created by start_event_drain()).
     /// Periodically drains hazptr/EBR pending lists and advances the EBR
     /// epoch so retired objects are reclaimed within bounded time. Runs
     /// at a short, fixed interval (default 250ms; 100ms when read
     /// handles are alive) independent of user-callback latency.
     std::unique_ptr<detail::periodic_worker> reclaim_drain_worker_;
 
-    /// P1-6: Optional callback drain worker (created by start_event_drain()).
+    /// Optional callback drain worker (created by start_event_drain()).
     /// Periodically drains TLS access/callback rings, async overload/OOM
     /// event queues, and the event tracker. Runs at the caller-supplied
     /// interval (default 1s; 500ms when read handles are alive). Slow
@@ -10610,7 +10853,7 @@ private:
     /// affecting reclamation (which runs on reclaim_drain_worker_).
     std::unique_ptr<detail::periodic_worker> callback_drain_worker_;
 
-    /// P0-5 (T1.3): Optional background rehash balancer. Periodically
+    /// Optional background rehash balancer. Periodically
     /// sweeps all hash-table segments to advance incremental rehash and
     /// trigger rehash_if_needed() on segments that aren't on the write
     /// hot path. Declared after the drain workers so it is destroyed
@@ -10618,7 +10861,7 @@ private:
     /// which must remain valid while the drain workers are still running).
     std::unique_ptr<detail::periodic_worker> rehash_balancer_worker_;
 
-    /// P1-12: Optional event tracker for item lifecycle analysis.
+    /// Optional event tracker for item lifecycle analysis.
     /// Created by enable_event_tracking(). Records insert/hit/evict events
     /// via callbacks registered on the cache's callback_manager. The
     /// callback_drain_worker_ periodically drains the tracker's TLS ring
@@ -10638,7 +10881,7 @@ private:
     /// TTL support, the cleaner runs but evict_expired() is a no-op.
     std::unique_ptr<detail::periodic_worker> ttl_cleaner_worker_;
 
-    /// T-G17: Round-robin counter for per-shard TTL cleanup. Each cleaner
+    /// Round-robin counter for per-shard TTL cleanup. Each cleaner
     /// cycle fetches the current value, processes the corresponding shard,
     /// and increments the counter. This spreads cleaner CPU across cycles
     /// (1/num_shards per cycle) instead of scanning all shards every cycle.
@@ -10646,7 +10889,7 @@ private:
     std::atomic<bool> ttl_cleaner_round_robin_{true};
     std::atomic<std::size_t> ttl_cleaner_next_shard_{0};
 
-    /// P2-E: Metrics cache fields. When `metrics_cache_enabled_` is true,
+    /// Metrics cache fields. When `metrics_cache_enabled_` is true,
     /// `stats_snapshot()` and `prometheus_text()` return the cached copy
     /// instead of rebuilding on every call. The cache is refreshed
     /// lazily by `refresh_metrics_cache()` (called periodically by
@@ -10670,7 +10913,7 @@ private:
     mutable std::mutex metrics_cache_lock_;
     std::unique_ptr<detail::periodic_worker> metrics_cache_worker_;
 
-    // T-G12: Short-time cache for diagnostics_text() / diagnostics_json().
+    // Short-time cache for diagnostics_text() / diagnostics_json().
     // The cache amortizes 10Hz+ polling (dashboards, log aggregators) —
     // rebuilding diagnostics_info is O(num_shards) and would otherwise
     // dominate CPU under fast polling. The snapshot is a shared_ptr so
@@ -10684,13 +10927,13 @@ private:
     mutable detail::atomic_shared_ptr<const diagnostics_info> diagnostics_snap_cache_;
     mutable std::mutex diagnostics_cache_lock_;
 
-    /// P2-4: When false (default), `prometheus_text()` emits only
+    /// When false (default), `prometheus_text()` emits only
     /// aggregate load-factor gauges (worst/avg/p95) — not the
     /// per-shard labelled series. Set to true via
     /// `set_prometheus_per_shard_detail(true)` for ad-hoc diagnosis.
     mutable std::atomic<bool> prometheus_per_shard_detail_{false};
 
-    /// P1-4: Scrape counter — incremented on every stats_snapshot() call.
+    /// Scrape counter — incremented on every stats_snapshot() call.
     /// Used by the destructor to detect high-frequency scraping without
     /// metrics cache enabled, and emit a one-time stderr hint suggesting
     /// the user call start_metrics_cache_worker() to avoid per-scrape
@@ -10702,11 +10945,11 @@ private:
     /// visible to all threads.
     std::atomic<bool> closed_{false};
 
-    /// T-G10: Notifier for shutdown_and_wait(). read_handle::release()
+    /// Notifier for shutdown_and_wait(). read_handle::release()
     /// calls notify_all() on this cv when the last handle is dropped
     /// during shutdown, so shutdown_and_wait() returns immediately
     /// instead of busy-polling. Wired in init_production_features().
-    /// P1-33 (fix.01 方案 A): process-lifetime handle-release notifier.
+    /// process-lifetime handle-release notifier.
     ///
     /// Deliberately a raw pointer that is allocated on first use and NEVER
     /// deleted: outstanding read_handles keep a reference to it so they can
@@ -10714,13 +10957,13 @@ private:
     /// the cache would reintroduce exactly the use-after-free this fixes.
     handle_release_notifier* active_handle_notifier_ = nullptr;
 
-    /// P1-40 (fix.01 方案 A): set while a transactional snapshot holds the cache
+    /// set while a transactional snapshot holds the cache
     /// quiesced (no writers, no outstanding handles). Unlike `closed_` it is
     /// reversible via resume().
     std::atomic<bool> quiesced_{false};
 
     // ----------------------------------------------------------------
-    // P1-3: Memory watermark and OOM protection
+    // Memory watermark and OOM protection
     // ----------------------------------------------------------------
     // Soft/critical watermarks as fractions of max_memory in [0.0, 1.0].
     // When current_memory exceeds the soft watermark, new insertions
@@ -10734,19 +10977,19 @@ private:
     std::atomic<double> memory_critical_watermark_{0.95};
     std::atomic<bool> memory_critical_mode_{false};
 
-    /// P1-3: OOM handler callback. Invoked when the cache enters
+    /// OOM handler callback. Invoked when the cache enters
     /// critical memory mode. The handler can log alerts, trigger
     /// external GC, or initiate graceful degradation. Must not throw
     /// or block — it is called from the set() hot path.
     std::function<void(size_type current, size_type max)> oom_handler_;
 
-    /// P-HIGH-2 (T-H1): When true, OOM events are enqueued on
+    /// When true, OOM events are enqueued on
     /// pending_oom_event_ and dispatched by the event drain worker
     /// (see drain_oom_events()). When false (default), the handler
     /// is invoked synchronously outside the write lock.
     std::atomic<bool> async_oom_handler_{false};
 
-    /// P-HIGH-2 (T-H1): Pending OOM event for async dispatch.
+    /// Pending OOM event for async dispatch.
     /// Protected by pending_oom_event_mutex_. At most one event is
     /// retained (coalesced) — see dispatch_oom_event() rationale.
     std::optional<oom_event> pending_oom_event_;
@@ -10922,7 +11165,7 @@ public:
     /// for small batches. The threshold of 64 matches the default TLS ring
     /// size, so a single full ring drains without dedup.
     void drain_access_ring() {
-        // P1-1: Track flush frequency for observability.
+        // Track flush frequency for observability.
         if constexpr (is_striped) {
             for (std::size_t i = 0; i < mm_.num_shards(); ++i) {
                 mm_.shard(i).stats().tls_ring_flush_count.fetch_add(
@@ -10972,7 +11215,7 @@ private:
     /// non-blocking write lock; if contended, re-records to the TLS
     /// ring for later retry. Shared by both backup-drain and TLS-drain.
     ///
-    /// P1-6: Bounded spin-then-yield backoff before re-recording. Without
+    /// Bounded spin-then-yield backoff before re-recording. Without
     /// backoff, a hot key under sustained write contention could be
     /// re-recorded on every drain attempt, causing:
     ///   - Promotion starvation (hot key never reaches MRU)
@@ -10984,14 +11227,14 @@ private:
     /// the backoff is bounded (≤ kMaxBackoffIters yields) so the drain
     /// path never blocks for long.
     void promote_keys(std::vector<Key>& keys) {
-        // P1-6: Bounded backoff iterations. Tuned for read-heavy-write-light
+        // Bounded backoff iterations. Tuned for read-heavy-write-light
         // workloads: enough to absorb brief lock hold times (typical write
         // critical section is <1µs), small enough to never stall the drain
         // path. Each iteration is a single yield(), so 8 iters ≈ 8 scheduler
         // quanta ≈ tens of microseconds worst case.
         constexpr int kMaxBackoffIters = 8;
 
-        // T-P2-2 (R-5): Dedup input keys to avoid retrying the same hot key
+        // Dedup input keys to avoid retrying the same hot key
         // multiple times in one drain cycle. Without dedup, a hot key
         // appearing K times in `keys` (because it was accessed K times
         // since the last drain) would cause:
@@ -11015,7 +11258,7 @@ private:
             keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
         }
 
-        // P1-C: Shard indices whose TLS callback ring was touched during
+        // Shard indices whose TLS callback ring was touched during
         // this drain cycle. `flush_pending()` may invoke user callbacks
         // (on_hit etc.) which can perform IO/logging — running them inside
         // the per-key write lock extends the critical section for no
@@ -11036,7 +11279,7 @@ private:
                         // Task B: cache shard_idx once per key (avoid double hash).
                         const std::size_t shard_idx = mm_.shard_for(key);
                         if (h) mm_.shard(shard_idx).callbacks().collect_hit(key, *h);
-                        // P1-C: do NOT flush_shard_pending() here — defer
+                        // do NOT flush_shard_pending() here — defer
                         // until after lock release. collect_hit() is a
                         // TLS ring push (no cross-thread sync), so it is
                         // safe and cheap to do under the lock; only the
@@ -11049,7 +11292,7 @@ private:
                     promoted = true;
                     break;
                 }
-                // P1-6: Backoff before retrying. Use yield() rather than
+                // Backoff before retrying. Use yield() rather than
                 // raw pause — promotes fairness across cores and lets the
                 // lock holder make progress on the same physical core.
                 std::this_thread::yield();
@@ -11060,14 +11303,14 @@ private:
                 // (promotion eventually happens once contention subsides)
                 // while bounding drain-path latency under heavy contention.
                 //
-                // T-P2-2 (R-5): Because input was dedup'd above, each
+                // Because input was dedup'd above, each
                 // unique failed key is re-recorded at most once per
                 // promote_keys call — no ring pollution.
                 record_access_in_ring(key);
             }
         }
 
-        // P1-C: Flush pending callbacks outside any write lock. User
+        // Flush pending callbacks outside any write lock. User
         // callbacks (on_hit) may perform IO or logging and must not extend
         // the per-key write critical section. Dedup the shard indices
         // first so we don't flush the same shard's TLS ring multiple
@@ -11098,7 +11341,7 @@ private:
     /// handles overflow). Must be called while holding the appropriate cache
     /// lock so that mm_.contains() and mm_.estimate_item_memory() are stable.
     ///
-    /// T-G2: Updates no longer bypass admission. Previously, an existing
+    /// Updates no longer bypass admission. Previously, an existing
     /// key could be updated with a much larger value without any memory
     /// check, causing `current_memory` to silently exceed
     /// `max_memory_bytes`. Now we conservatively check
@@ -11138,7 +11381,7 @@ private:
     }
 
     // --------------------------------------------------------------------
-    // P1-19 (fix.01 方案 B) + P1-23 (方案 B): the SINGLE admission gate
+    // The SINGLE admission gate.
     // --------------------------------------------------------------------
     //
     // Capacity enforcement used to be decided independently by every MM
@@ -11206,7 +11449,7 @@ private:
                 return mm_.stats();
             }
         }();
-        // P1-23 方案 B: report the failure. `note_eviction_rejected` bumps the
+        // Report the failure: `note_eviction_rejected` bumps the
         // `eviction_failed` counter when cache_stats carries it and always fires
         // the rejection callback, so a rejected insert is never silent.
         // The value itself is gone (the insert was rolled back), so a

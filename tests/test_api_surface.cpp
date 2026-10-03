@@ -51,11 +51,11 @@ void exercise_alias(std::size_t max_size = kSmall) {
     c->set(1, std::string("one"));
     EXPECT_TRUE(static_cast<bool>(c->get(1)));
 
-    // P0-2 (a): set_eviction_predicate() must be reachable on every alias.
+    // set_eviction_predicate() must be reachable on every alias.
     c->set_eviction_predicate([](const typename Cache::key_type&,
                                  const typename Cache::mapped_type&) { return true; });
 
-    // P0-2 (b): const and non-const iteration over the MM layer.
+    // const and non-const iteration over the MM layer.
     auto& mm = c->mm();
     for (auto it = mm.begin(); it != mm.end(); ++it) {
         (void)it;
@@ -71,7 +71,7 @@ void exercise_alias(std::size_t max_size = kSmall) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// P0-1: every striped alias must be constructible on every supported compiler
+// every striped alias must be constructible on every supported compiler
 // ---------------------------------------------------------------------------
 
 TEST(P0ApiSurface, StripedAliasesConstructAndOperate) {
@@ -150,7 +150,7 @@ TEST(P0ApiSurface, NonStripedAliasesStillConstruct) {
 }
 
 // ---------------------------------------------------------------------------
-// P0-2 (a): set_eviction_predicate must be reachable on every public alias
+// set_eviction_predicate must be reachable on every public alias
 // ---------------------------------------------------------------------------
 
 TEST(P0ApiSurface, SetEvictionPredicateOnEveryAlias) {
@@ -209,7 +209,7 @@ TEST(P0ApiSurface, ShardedEvictionPredicateIsForwardedToShards) {
 }
 
 // ---------------------------------------------------------------------------
-// P0-2 (b): const iteration over the MM layer
+// const iteration over the MM layer
 // ---------------------------------------------------------------------------
 
 TEST(P0ApiSurface, ConstAndNonConstIterationOverSingleShardMm) {

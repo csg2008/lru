@@ -2,8 +2,8 @@
 // Concurrent runtime mutex tests: fairness-mode switch and native wait ops.
 //
 // Covers spec gaps G5, G19 (P1/P2):
-//   G5:  set_fairness_mode() switch under load
-//   G19: native_wait_ops wait/wake under contention
+//   set_fairness_mode() switch under load
+//   native_wait_ops wait/wake under contention
 
 #include <gtest/gtest.h>
 
@@ -22,7 +22,7 @@ using namespace lru::detail;
 using namespace std::chrono_literals;
 
 // ============================================================================
-// TC-G5: SetFairnessModeSwitchUnderLoad
+// SetFairnessModeSwitchUnderLoad
 // Toggle fairness_mode while readers and writers are active. The switch
 // must not deadlock or lose wakeups.
 //
@@ -83,7 +83,7 @@ TEST(ConcurrentMutexRuntime, SetFairnessModeSwitchUnderLoad) {
 }
 
 // ============================================================================
-// TC-G5 (variant): FairnessSwitchQuiescent
+// FairnessSwitchQuiescent
 // Verify the fairness mode can be set when the mutex is quiescent.
 //
 // We test the distributed_shared_mutex directly (not through safe_cache)
@@ -109,7 +109,7 @@ TEST(ConcurrentMutexRuntime, FairnessSwitchQuiescent) {
 }
 
 // ============================================================================
-// TC-G19: NativeWaitOpsContention
+// NativeWaitOpsContention
 // 32 threads park on a 32-bit atomic; one thread wakes them all.
 // No thread should be left parked indefinitely (no lost wakeup).
 // ============================================================================

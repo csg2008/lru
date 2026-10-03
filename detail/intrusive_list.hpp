@@ -18,15 +18,16 @@
 #include <new>
 #include <type_traits>
 
+#include "hazptr.hpp"    // hazptr_obj_base, which cache_item derives from
 #include "refcount.hpp"
 
 namespace lru {
 class slab_allocator;
 }
 
-// B11: ASAN 毒化（条件编译，仅在 ASAN 启用且头文件可用时生效）
+// ASan poisoning, under conditional compilation: active only when ASan is
+// enabled and the sanitizer header is available.
 
-// B11: ASAN 毒化（条件编译，仅在 ASAN 启用且头文件可用时生效）
 #if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
 #if __has_include(<sanitizer/asan_interface.h>)
 #include <sanitizer/asan_interface.h>
@@ -34,7 +35,7 @@ class slab_allocator;
 #endif
 #endif
 
-// B12: TSan 注解（条件编译）
+// TSan annotations, under conditional compilation.
 #if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
 #if __has_include(<sanitizer/tsan_interface.h>)
 #include <sanitizer/tsan_interface.h>
@@ -53,14 +54,15 @@ namespace lru::detail {
 struct hazptr_obj_base;
 
 // ============================================================================
-// Hook Pointer Traits - 桥接 raw 指针钩子和压缩指针钩子的统一接口
+// Hook Pointer Traits - one interface over raw and compressed pointer hooks.
 // ============================================================================
 
 struct intrusive_hook;
 
-/// 默认的 raw 指针钩子特质（使用 intrusive_hook）。
-/// compressed_intrusive_hook 的特化在 compressed_ptr.hpp 中定义。
-/// set_prev/set_next/get_prev/get_next 都忽略 base 参数（raw 指针不需要基地址）。
+/// Default raw-pointer hook traits (uses intrusive_hook).
+/// The compressed_intrusive_hook specialisation is defined in compressed_ptr.hpp.
+/// set_prev/set_next/get_prev/get_next ignore the base argument: a raw pointer
+/// needs no base address.
 template <typename Hook>
 struct hook_pointer_traits {
     static void set_prev(Hook& h, void* p, void*) noexcept { h.prev = p; }
@@ -69,9 +71,9 @@ struct hook_pointer_traits {
     static void* get_next(Hook& h, void*) noexcept { return h.next; }
     static const void* get_prev(const Hook& h, void*) noexcept { return h.prev; }
     static const void* get_next(const Hook& h, void*) noexcept { return h.next; }
-    /// prev 为空 → 此节点是链表头
+    /// prev == nullptr -> this node is the list head.
     static bool is_end_prev(const Hook& h) noexcept { return h.prev == nullptr; }
-    /// next 为空 → 此节点是链表尾
+    /// next == nullptr -> this node is the list tail.
     static bool is_end_next(const Hook& h) noexcept { return h.next == nullptr; }
 };
 
@@ -86,7 +88,7 @@ struct intrusive_hook {
     static constexpr uint8_t kTailFlag     = 1 << 0;  // Item is in tail section (insertion point tracking)
     static constexpr uint8_t kAccessedFlag = 1 << 1;  // Item has been accessed since insertion
     static constexpr uint8_t kLinkedFlag   = 1 << 2;  // Item is currently linked in a list
-    // P0-3: pre-computed clear masks. `flags &= ~kXxxFlag` performs the ~ on a
+    // pre-computed clear masks. `flags &= ~kXxxFlag` performs the ~ on a
     // promoted int, producing a negative constant that -Wsign-conversion flags
     // when masked back into a uint8_t. Using a uint8_t mask keeps the compound
     // assignment value-preserving and warning-free.
@@ -118,7 +120,7 @@ struct intrusive_hook {
     void set_linked() noexcept { flags |= kLinkedFlag; }
     void clear_linked() noexcept { flags &= kLinkedClearMask; }
 
-    // B12: TSan-safe update_time 读取（对齐 CacheLib DList.h:69-75）
+    // TSan-safe update_time read (mirrors CacheLib DList.h:69-75).
     uint32_t get_update_time() const noexcept {
 #if defined(LRU_HAS_TSAN)
         AnnotateIgnoreReadsBegin(__FILE__, __LINE__);
@@ -147,7 +149,7 @@ struct cache_item : hazptr_obj_base {
     // Queue ID for multi-queue strategies (2Q, TinyLFU, W-TinyLFU)
     uint8_t queue_id = 0;
 
-    // P1-1: Native TTL support.
+    // Native TTL support.
     // 0 means "no TTL" (item never expires). Otherwise, this is the absolute
     // expiry time as nanoseconds since the steady_clock epoch. We use a packed
     // uint64 instead of std::optional<time_point> to keep the per-item overhead
@@ -173,7 +175,7 @@ struct cache_item : hazptr_obj_base {
     /// Whether this item has a TTL set at all.
     bool has_ttl() const noexcept { return expiry_ns != 0; }
 
-    // H0: CAS-lockfree reference counting with embedded flags (CacheLib-style)
+    // CAS-lockfree reference counting with embedded flags (CacheLib-style)
     // Tracks access references + admin bits (kLinked, kAccessible, kExclusive)
     // and user flags in a single atomic word.
     refcount_with_flags refcount;
@@ -221,7 +223,7 @@ struct cache_item : hazptr_obj_base {
     static void operator delete(void* p, std::size_t sz, slab_allocator* alloc);
     static void operator delete(void* p, slab_allocator* alloc);
 
-    // D5: 节点存活性查询（对齐 CacheLib isInMMContainer）
+    // Node liveness query (mirrors CacheLib isInMMContainer).
     // Both the hook's linked flag (used by intrusive_list internally) and the
     // refcount's kLinked bit (used by markForEviction/markMoving) are kept in
     // sync. is_in_container() queries the refcount since that is the canonical
@@ -230,7 +232,7 @@ struct cache_item : hazptr_obj_base {
     void mark_in_container() noexcept { hook.set_linked(); refcount.markInMMContainer(); }
     void unmark_in_container() noexcept { hook.clear_linked(); refcount.unmarkInMMContainer(); }
 
-    // H0: 句柄计数操作 (via refcount_with_flags)
+    // Handle refcount operations, via refcount_with_flags.
     bool has_active_handle() const noexcept { return refcount.getAccessRef() > 0; }
 
     // Access the hook
@@ -257,11 +259,12 @@ const auto& default_get_hook(const T& item) noexcept { return item.get_hook(); }
 /// Items are NOT allocated by the list; they must already exist
 /// and have a hook embedded in them.
 ///
-/// 设计特点（相对于使用哨兵节点的传统实现）：
-///   - Null-terminated: 头项 prev=nullptr, 尾项 next=nullptr
-///   - 使用 hook_pointer_traits<Hook> 抽象所有指鈭操作
-///   - 支持 intrusive_hook（raw void*）和 compressed_intrusive_hook（uint32_t offset）
-///   - 当使用压缩指针时，base_ 提供基地址用于偏移解析
+/// Design notes, relative to the traditional sentinel-node implementation:
+///   - Null-terminated: the head's prev is nullptr, the tail's next is nullptr.
+///   - hook_pointer_traits<Hook> abstracts every pointer operation.
+///   - Supports intrusive_hook (raw void*) and compressed_intrusive_hook
+///     (uint32_t offset).
+///   - With compressed pointers, base_ supplies the base address for decoding.
 ///
 /// @tparam T           Item type (must have get_hook() or provide GetHook)
 /// @tparam Hook        Hook type (intrusive_hook or compressed_intrusive_hook)
@@ -289,7 +292,7 @@ public:
         using pointer = ItemT*;
         using reference = ItemT&;
 
-        // B9: 方向枚举（对齐 CacheLib DList.h:185）
+        // Direction enum (mirrors CacheLib DList.h:185).
         enum class Direction { FROM_HEAD, FROM_TAIL };
 
         iterator_impl() : node_(nullptr), list_(nullptr) {}
@@ -301,11 +304,13 @@ public:
 
         iterator_impl& operator++() {
             if (node_ && list_) {
-                // 通过 hook_traits 解析 next 指针（raw 直接取值，compressed 需要 decode）
+                // Resolve the next pointer through hook_traits: raw reads it directly,
+                // compressed decodes it.
                 auto& hook = list_->get_hook_const(*node_);
                 auto* next_ptr = static_cast<ItemT*>(hook_traits::get_next(const_cast<Hook&>(hook), list_->base_));
-                // B13: 预取下一个节点（对齐 CacheLib AllocationClass.h 预取优化）
-                // 在遍历大缓存时减少 cache miss 延迟
+                // Prefetch the next node (mirrors the prefetch optimisation in
+                // CacheLib AllocationClass.h) to cut cache-miss latency when
+                // walking a large cache.
 #if defined(__GNUC__) || defined(__clang__)
                 if (next_ptr) {
                     __builtin_prefetch(next_ptr, 0, 1);
@@ -347,7 +352,7 @@ public:
 
         ItemT* node() const { return node_; }
 
-        // D5: reset/resetToBegin（对齐 CacheLib DList.h:221-226）
+        // reset / resetToBegin (mirrors CacheLib DList.h:221-226).
         void reset() {
             node_ = nullptr;
         }
@@ -368,8 +373,9 @@ public:
     using iterator = iterator_impl<T>;
     using const_iterator = iterator_impl<const T>;
 
-    /// 反向迭代器：++ 向 head 方向（get_prev），-- 向 tail 方向（get_next）。
-    /// 不从 std::reverse_iterator 派生——因为 end() = nullptr 无法前置递减。
+    /// Reverse iterator: ++ moves toward the head (get_prev), -- toward the tail
+    /// (get_next). It does not derive from std::reverse_iterator because end()
+    /// is nullptr, which cannot be pre-decremented.
     template <typename ItemT>
     class reverse_iterator_impl : public iterator_impl<ItemT> {
         using base = iterator_impl<ItemT>;
@@ -377,14 +383,14 @@ public:
         reverse_iterator_impl() : base() {}
         reverse_iterator_impl(ItemT* node, const intrusive_list* list) : base(node, list) {}
 
-        // ++ 反向 → 向 head 移动（与 base 的 -- 相同）
+        // ++ on the reverse iterator moves toward the head (base's --).
         reverse_iterator_impl& operator++() {
             base::operator--();
             return *this;
         }
         reverse_iterator_impl operator++(int) { auto t = *this; ++*this; return t; }
 
-        // -- 反向 → 向 tail 移动（与 base 的 ++ 相同）
+        // -- on the reverse iterator moves toward the tail (base's ++).
         reverse_iterator_impl& operator--() {
             base::operator++();
             return *this;
@@ -409,7 +415,8 @@ public:
     intrusive_list(const intrusive_list&) = delete;
     intrusive_list& operator=(const intrusive_list&) = delete;
 
-    /// 设置压缩指针基地址（仅对 compressed_intrusive_hook 有效，raw 指针忽略）。
+    /// Set the compressed-pointer base address (compressed_intrusive_hook only;
+    /// ignored for raw pointers).
     void set_base(void* base) noexcept { base_ = base; }
     void* base() const noexcept { return base_; }
 
@@ -424,16 +431,13 @@ public:
 #endif
         auto& hook = GetHook(item);
         assert(!hook.is_linked() && "intrusive_list::link_at_head: item is already linked");
-        // 新项的 prev=nullptr（头标记），next=当前头节点
         hook_traits::set_prev(hook, nullptr, base_);
         hook_traits::set_next(hook, head_ptr_, base_);
 
-        // 原头节点的 prev 指向新节点
         if (head_ptr_) {
             auto& head_hook = GetHook(*static_cast<T*>(head_ptr_));
             hook_traits::set_prev(head_hook, &item, base_);
         } else {
-            // 空链表，新节点同时也是尾节点
             tail_ptr_ = &item;
         }
         head_ptr_ = &item;
@@ -448,16 +452,13 @@ public:
 #endif
         auto& hook = GetHook(item);
         assert(!hook.is_linked() && "intrusive_list::link_at_tail: item is already linked");
-        // 新项的 next=nullptr（尾标记），prev=当前尾节点
         hook_traits::set_next(hook, nullptr, base_);
         hook_traits::set_prev(hook, tail_ptr_, base_);
 
-        // 原尾节点的 next 指向新节点
         if (tail_ptr_) {
             auto& tail_hook = GetHook(*static_cast<T*>(tail_ptr_));
             hook_traits::set_next(tail_hook, &item, base_);
         } else {
-            // 空链表，新节点同时也是头节点
             head_ptr_ = &item;
         }
         tail_ptr_ = &item;
@@ -476,22 +477,19 @@ public:
         assert(!item_hook.is_linked() && "intrusive_list::insert_before: item is already linked");
         assert(next_hook.is_linked() && "intrusive_list::insert_before: next_node is not linked");
 
-        // 获取 next_node 的前驱
+        // The predecessor of next_node.
         auto* prev_ptr = hook_traits::get_prev(next_hook, base_);
 
-        // 将 item 链接在 prev_ptr 与 next_node 之间
+        // Link `item` between prev_ptr and next_node.
         hook_traits::set_prev(item_hook, prev_ptr, base_);
         hook_traits::set_next(item_hook, &next_node, base_);
 
-        // 更新前驱的 next
         if (prev_ptr) {
             auto& prev_hook = GetHook(*static_cast<T*>(prev_ptr));
             hook_traits::set_next(prev_hook, &item, base_);
         } else {
-            // 插入到链表头
             head_ptr_ = &item;
         }
-        // 更新 next_node 的 prev
         hook_traits::set_prev(next_hook, &item, base_);
 
         item_hook.set_linked();
@@ -509,7 +507,6 @@ public:
             auto& prev_hook = GetHook(*static_cast<T*>(prev_ptr));
             hook_traits::set_next(prev_hook, next_ptr, base_);
         } else {
-            // 被移除的是头节点
             head_ptr_ = next_ptr;
         }
 
@@ -517,7 +514,6 @@ public:
             auto& next_hook = GetHook(*static_cast<T*>(next_ptr));
             hook_traits::set_prev(next_hook, prev_ptr, base_);
         } else {
-            // 被移除的是尾节点
             tail_ptr_ = prev_ptr;
         }
 
@@ -594,18 +590,15 @@ public:
         auto* prev_ptr = hook_traits::get_prev(old_hook, base_);
         auto* next_ptr = hook_traits::get_next(old_hook, base_);
 
-        // 新节点继承位置
         hook_traits::set_prev(new_hook, prev_ptr, base_);
         hook_traits::set_next(new_hook, next_ptr, base_);
 
-        // 更新前驱的 next
         if (prev_ptr) {
             auto& prev_hook = GetHook(*static_cast<T*>(prev_ptr));
             hook_traits::set_next(prev_hook, &new_node, base_);
         } else {
             head_ptr_ = &new_node;
         }
-        // 更新后继的 prev
         if (next_ptr) {
             auto& next_hook = GetHook(*static_cast<T*>(next_ptr));
             hook_traits::set_prev(next_hook, &new_node, base_);
@@ -613,7 +606,6 @@ public:
             tail_ptr_ = &new_node;
         }
 
-        // 清除旧节点
         hook_traits::set_prev(old_hook, nullptr, base_);
         hook_traits::set_next(old_hook, nullptr, base_);
         old_hook.clear_linked();
@@ -654,7 +646,7 @@ public:
     const_iterator begin() const { return const_iterator(static_cast<const T*>(head_ptr_), this); }
     const_iterator end() const   { return const_iterator(nullptr, this); }
 
-    /// Reverse iterator starting from tail (++ 向 head 方向移动)
+    /// Reverse iterator starting at the tail (++ moves toward the head).
     reverse_iterator rbegin() { return reverse_iterator(static_cast<T*>(tail_ptr_), this); }
     reverse_iterator rend()   { return reverse_iterator(nullptr, this); }
     const_reverse_iterator rbegin() const {
@@ -716,9 +708,9 @@ private:
         return GetHook(const_cast<T&>(item));
     }
 
-    void* head_ptr_ = nullptr;  // 指向第一个 item，空表时为 nullptr
-    void* tail_ptr_ = nullptr;  // 指向最后一个 item，空表时为 nullptr
-    void* base_     = nullptr;  // 压缩指针基地址（raw 指针时忽略）
+    void* head_ptr_ = nullptr;  // First item; nullptr when empty.
+    void* tail_ptr_ = nullptr;  // Last item; nullptr when empty.
+    void* base_     = nullptr;  // Compressed-pointer base (ignored for raw).
     size_type size_;
 };
 

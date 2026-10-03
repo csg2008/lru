@@ -62,7 +62,7 @@ struct pool_config {
     /// When provided, overrides the global default config.
     /// Only meaningful when the underlying MM type supports per-instance config.
     ///
-    /// P0-3: the member carries a default member initializer so that callers can
+    /// the member carries a default member initializer so that callers can
     /// write the natural designated-initializer form
     /// `{.name = ..., .max_size = ..., .priority = ...}` without tripping
     /// -Wmissing-designated-field-initializers / -Wmissing-field-initializers
@@ -168,7 +168,7 @@ struct pool_entry {
     uint32_t priority;
     std::unique_ptr<CacheType> cache;  // The underlying cache instance (owns items)
 
-    // T6.1: Per-pool mutex. When the underlying cache is thread-safe,
+    // Per-pool mutex. When the underlying cache is thread-safe,
     // this mutex is only acquired in shared mode by readers and in
     // exclusive mode by writers/cross-pool-eviction — concurrent ops
     // on *different* pools proceed without contending on the same
@@ -429,7 +429,7 @@ public:
     // --------------------------------------------------------------------
 
     /// Insert or update an item in the specified pool.
-    /// T6.1/T6.2: Uses shared_lock on global mutex_ (for pool lookup)
+    /// Uses shared_lock on global mutex_ (for pool lookup)
     /// + unique_lock on per-pool mutex (for write serialization).
     /// For thread-safe underlying caches, concurrent sets on DIFFERENT
     /// pools proceed in parallel; concurrent sets on the SAME pool
@@ -451,7 +451,7 @@ public:
         auto lock = maybe_unique_lock();
         ensure_capacity_locked();
         auto& entry = get_pool(pool_name);
-        // T6.1: per-pool write lock. For single-threaded underlying
+        // per-pool write lock. For single-threaded underlying
         // caches, maybe_unique_lock() already holds the global mutex
         // exclusively so this is a no-op (recursive lock not needed
         // because we use a single global lock). For thread-safe
@@ -485,6 +485,7 @@ public:
         // the TOCTOU window where concurrent set()s on different pools both
         // passed the pre-set ensure_capacity_locked() seeing a stale total.
         ensure_capacity_locked();
+        global_stats_.register_insertion();
         update_global_stats_after_write();
     }
 
@@ -521,8 +522,8 @@ public:
     }
 
     /// Get an item from the specified pool.
-    /// 若底层 cache 非线程安全，则降级为独占锁，避免多个读线程同时操作
-    /// 单线程底层 cache 导致的数据竞争。
+    /// Falls back to an exclusive lock when the underlying cache is not
+    /// thread-safe, so concurrent readers cannot race the single-threaded cache.
     read_handle<mapped_type>
     get(std::string_view pool_name, const key_type& key) {
         auto lock = maybe_unique_lock();
@@ -554,7 +555,7 @@ public:
     }
 
     /// Delete an item from the specified pool.
-    /// T6.1: Uses shared_lock on global mutex_ + unique_lock on per-pool
+    /// Uses shared_lock on global mutex_ + unique_lock on per-pool
     /// mutex. For thread-safe underlying caches, concurrent dels on
     /// DIFFERENT pools proceed in parallel.
     bool del(std::string_view pool_name, const key_type& key) {
@@ -580,6 +581,9 @@ public:
         }
         update_totals_for_pool_delta(entry, before_size, before_memory,
                                      after_size, after_memory);
+        if (result) {
+            global_stats_.register_insertion();
+        }
         update_global_stats_after_write();
         return result;
     }
@@ -597,7 +601,7 @@ public:
 
     /// Get an item by searching all pools (in order).
     /// Returns an empty handle if not found in any pool.
-    /// T6.4: Uses a cached first_non_empty_pool_ hint to skip the
+    /// Uses a cached first_non_empty_pool_ hint to skip the
     /// common case where the first few pools are empty (e.g., cold
     /// tier drained by rebalancer). The hint is invalidated on
     /// pool structure changes.
@@ -609,7 +613,10 @@ public:
             auto& entry = pools_[static_cast<std::size_t>(hint)];
             if (!entry->cache->empty()) {
                 auto result = entry->cache->get(key);
-                if (result) return result;
+                if (result) {
+                    global_stats_.register_hit();
+                    return result;
+                }
             }
         }
         // Hint miss or pool empty — full scan, update hint.
@@ -620,6 +627,7 @@ public:
             if (result) {
                 first_non_empty_pool_.store(static_cast<std::ptrdiff_t>(i),
                                             std::memory_order_release);
+                global_stats_.register_hit();
                 return result;
             }
         }
@@ -633,7 +641,10 @@ public:
         auto lock = maybe_unique_lock();
         for (const auto& entry : pools_) {
             auto result = entry->cache->peek(key);
-            if (result) return result;
+            if (result) {
+                global_stats_.register_hit();
+                return result;
+            }
         }
         global_stats_.register_miss();
         return {};
@@ -655,7 +666,7 @@ public:
             std::size_t before_size = entry->cache->size();
             std::size_t before_memory = entry->cache->current_memory();
             if (entry->cache->del(key)) {
-                // P-FIX: del_any previously did not update total_size_ /
+                // del_any previously did not update total_size_ /
                 // total_memory_, causing the atomic counters to drift
                 // upward whenever items were removed via del_any. Under
                 // mixed set/del_any workloads the counter exceeded
@@ -680,7 +691,7 @@ public:
     // --------------------------------------------------------------------
 
     /// Total items across all pools.
-    /// T6.2: O(1) via atomic counter.
+    /// O(1) via atomic counter.
     size_type size() const noexcept {
         return total_size_.load(std::memory_order_acquire);
     }
@@ -692,7 +703,7 @@ public:
     size_type max_memory() const noexcept { return global_max_memory_; }
 
     /// Total memory across all pools.
-    /// T6.2: O(1) via atomic counter.
+    /// O(1) via atomic counter.
     size_type current_memory() const noexcept {
         return total_memory_.load(std::memory_order_acquire);
     }
@@ -702,7 +713,7 @@ public:
         std::unique_lock lock(mutex_);
         global_max_size_ = new_max;
         global_stats_.max_size.store(new_max);
-        // T6.2: should_evict_global() now uses atomic counters, so the
+        // should_evict_global() now uses atomic counters, so the
         // loop is O(1) per check; evict_global() iterates pools.
         while (should_evict_global()) {
             if (!evict_global()) break;
@@ -725,13 +736,20 @@ public:
     // Eviction — cross-pool victim selection by priority
     // --------------------------------------------------------------------
 
+private:
     /// Evict a single item from the lowest-priority pool that has items.
     /// Returns true if an item was evicted.
-    /// 使用懒更新排序：仅在 pool 结构变更时重新排序，避免每次淘汰都 O(P log P)。
-    /// T6.3: Uses per-pool try_lock to avoid blocking other ops. If a
+    /// Lazily maintained ordering: re-sorted only when the pool set changes,
+    /// Uses per-pool try_lock to avoid blocking other ops. If a
     /// pool's mutex is held (another thread is writing to it), we skip
     /// it and try the next pool. This avoids deadlock and reduces
     /// contention on the cross-pool eviction path.
+    ///
+    /// PRECONDITION (enforced by visibility, not by an assert): the caller
+    /// holds a shared or exclusive lock on mutex_. rebuild_eviction_order()
+    /// requires it, and every caller here takes it via maybe_unique_lock().
+    /// This helper used to be public, which let an external caller invoke it
+    /// without the lock and race the eviction-order rebuild.
     bool evict_global() {
         rebuild_eviction_order();
 
@@ -748,7 +766,7 @@ public:
             auto& entry = pools_[idx];
             if (entry->cache->empty()) continue;
 
-            // T6.3: try-lock the per-pool mutex. If another thread is
+            // try-lock the per-pool mutex. If another thread is
             // writing to this pool, skip it and try the next one.
             // For single-threaded underlying caches, the caller already
             // holds the global mutex exclusively so this is unnecessary
@@ -773,9 +791,10 @@ public:
         return false;
     }
 
+public:
     /// Evict up to `count` items across pools. Returns actual count evicted.
     size_type evict_batch(size_type count) {
-        // T6.3: use shared_lock on global mutex_ (not unique) so
+        // use shared_lock on global mutex_ (not unique) so
         // concurrent reads/writes on individual pools can proceed.
         // Per-pool try_lock inside evict_global() prevents deadlock.
         std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -942,7 +961,7 @@ private:
         }
     }
 
-    /// T6.2: O(1) capacity check using atomic counters. Returns true if
+    /// O(1) capacity check using atomic counters. Returns true if
     /// the global capacity is exceeded and eviction is needed.
     /// Safe to call without holding any lock.
     bool should_evict_global() const {
@@ -961,7 +980,7 @@ private:
     /// if the global capacity is exceeded. Safe to call from outside
     /// any pooled_cache operation.
     void ensure_capacity() {
-        // T6.2: fast atomic check first; only iterate pools if we need to evict.
+        // fast atomic check first; only iterate pools if we need to evict.
         if (!should_evict_global()) return;
         auto lock = maybe_unique_lock();
         ensure_capacity_locked();
@@ -990,9 +1009,10 @@ private:
         }
     }
 
-    /// 重建淘汰顺序索引（按淘汰优先级升序排列）。
-    /// 仅在脏标志被设置时重建，利用 eviction_gen_ 避免重复计算。
-    /// T6.3: protected by eviction_order_mutex_ so concurrent
+    /// Rebuild the eviction-order index, ascending by eviction priority.
+    /// Rebuilt only when eviction_dirty_ is set, so repeated evictions in
+    /// one round do not re-sort the pools each time.
+    /// protected by eviction_order_mutex_ so concurrent
     /// evict_global() calls don't race on eviction_order_.
     /// Caller must hold either shared or exclusive lock on mutex_.
     void rebuild_eviction_order() {
@@ -1005,11 +1025,11 @@ private:
         eviction_order_.resize(pools_.size());
         std::iota(eviction_order_.begin(), eviction_order_.end(), size_t(0));
         std::sort(eviction_order_.begin(), eviction_order_.end(), [this](size_t a, size_t b) {
-            // 优先级低的优先淘汰
+            // Lower priority is evicted first.
             if (pools_[a]->priority != pools_[b]->priority) {
                 return pools_[a]->priority < pools_[b]->priority;
             }
-            // 平局：淘汰更大 pool（比例公平）
+            // Tie-break on the larger pool, which keeps the split proportional.
             return pools_[a]->cache->size() > pools_[b]->cache->size();
         });
     }
@@ -1021,7 +1041,7 @@ private:
         first_non_empty_pool_.store(-1, std::memory_order_release);
     }
 
-    /// T6.2: Update atomic total_size_ / total_memory_ counters based
+    /// Update atomic total_size_ / total_memory_ counters based
     /// on the size/memory delta of a single pool's operation.
     /// Called by set/add/del after the underlying cache op completes.
     ///
@@ -1050,7 +1070,7 @@ private:
         }
     }
 
-    /// T6.2: Recompute total_size_ / total_memory_ from scratch by
+    /// Recompute total_size_ / total_memory_ from scratch by
     /// iterating all pools. Used after structural changes (add/remove
     /// pool) and on first access. Caller must hold shared or exclusive
     /// lock on mutex_.
@@ -1066,7 +1086,7 @@ private:
     }
 
     void update_global_stats_after_write() {
-        // T6.2: use atomic counters instead of iterating pools.
+        // use atomic counters instead of iterating pools.
         global_stats_.current_size.store(
             total_size_.load(std::memory_order_acquire), std::memory_order_release);
         global_stats_.current_memory.store(
@@ -1085,20 +1105,20 @@ private:
     config_type default_config_;
     mutable stats_type global_stats_;
 
-    /// 淘汰顺序索引缓存（懒更新，由 eviction_dirty_ 控制刷新）。
-    /// T6.3: protected by eviction_order_mutex_ so that concurrent
+    /// Cached eviction-order index, refreshed only when eviction_dirty_ is set.
+    /// protected by eviction_order_mutex_ so that concurrent
     /// evict_global() calls from multiple set() paths can rebuild
     /// safely without holding the global mutex_ exclusively.
     std::vector<std::size_t> eviction_order_;
     std::atomic<bool> eviction_dirty_{false};
     mutable std::mutex eviction_order_mutex_;
 
-    /// T6.4: Cached index of the first non-empty pool (for get_any).
+    /// Cached index of the first non-empty pool (for get_any).
     /// Updated lazily; -1 means "needs rescan". This avoids an O(P)
     /// scan on every get_any() call when most pools are empty.
     std::atomic<std::ptrdiff_t> first_non_empty_pool_{-1};
 
-    /// T6.2: Atomic global capacity counters. Maintained as a delta
+    /// Atomic global capacity counters. Maintained as a delta
     /// from per-op before/after size reads. Used by should_evict_global()
     /// for an O(1) capacity check without iterating pools.
     alignas(64) std::atomic<std::size_t> total_size_{0};

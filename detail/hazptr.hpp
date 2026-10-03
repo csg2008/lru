@@ -33,7 +33,7 @@ namespace lru::detail {
 // heap allocation. Objects inheriting from this class use the zero-alloc
 // retirement path: the embedded next_ pointer forms the retire list chain.
 //
-// P1-6 (T2.3): Embedded epoch field for EBR. Previously, epoch_domain
+// Embedded epoch field for EBR. Previously, epoch_domain
 // allocated a separate `retired_node` wrapper per retired object to
 // carry the epoch tag — this added a heap allocation + free to every
 // retire path, doubling allocator pressure under high eviction rates.
@@ -50,7 +50,7 @@ namespace lru::detail {
 // `reclaim_`). An object is retired via either hazptr OR EBR, never
 // both simultaneously, so there is no aliasing concern.
 //
-// P1-7 (T2.6 bugfix): `retired_` atomic flag for idempotent retire.
+// `retired_` atomic flag for idempotent retire.
 // Under high-concurrency eviction workloads, the same cache_item can
 // be observed by two threads racing on `evict_lru()`: Thread A wins
 // `markForEviction()` and proceeds to retire, but `evict_lru()` calls
@@ -69,13 +69,13 @@ namespace lru::detail {
 struct hazptr_obj_base {
     void (*reclaim_)(hazptr_obj_base* obj) = nullptr;
     hazptr_obj_base* next_ = nullptr;
-    /// P1-6 (T2.3): Epoch tag assigned by epoch_domain::retire_obj().
+    /// Epoch tag assigned by epoch_domain::retire_obj().
     /// 0 means "not retired via EBR" (default). Read by
     /// epoch_domain::try_reclaim() to decide if the object is safe
     /// to reclaim (epoch < min_epoch). Set exactly once at retire
     /// time, never mutated afterward.
     std::uint64_t epoch_ = 0;
-    /// P1-7 (T2.6 bugfix): Idempotent retire guard. Set atomically
+    /// Idempotent retire guard. Set atomically
     /// via CAS (false → true) inside `hazptr_domain::retire_obj()` and
     /// `epoch_domain::retire_obj()` before pushing to the TLS buffer.
     /// If already true, retire_obj() is a no-op — preventing the
@@ -124,7 +124,7 @@ public:
     static constexpr std::size_t kBatchSize  = 128;
     static constexpr std::size_t kMaxBatches = 64;  // Up to 8192 slots
 
-    // T-O1: Bounded retry policy for acquire_slot() when all 8192 slots
+    // Bounded retry policy for acquire_slot() when all 8192 slots
     // are exhausted. Previously the loop yielded forever (silent
     // deadlock under 10K+ live handles). Now:
     //   - kMaxSpinRetries: yield-and-retry attempts before falling back
@@ -141,14 +141,14 @@ public:
     static constexpr std::size_t kMaxSpinRetries  = 1024;
     static constexpr std::size_t kMaxSyncFallbacks = 64;
 
-    // P0-3: Sentinel value returned by acquire_slot() when all slots
+    // Sentinel value returned by acquire_slot() when all slots
     // are exhausted and the bounded retry budget is spent. Callers
     // must check the return value against `npos` and degrade
     // gracefully — typically by producing an empty read_handle so the
     // caller sees a cache miss instead of a program termination.
     static constexpr std::size_t npos = static_cast<std::size_t>(-1);
 
-    // P0-3: Upper bound on the number of slot batches. Defaults to
+    // Upper bound on the number of slot batches. Defaults to
     // `kMaxBatches` (64 batches × 128 slots = 8192 slots) but can be
     // raised at runtime via `set_max_slots()` up to `kAbsoluteMaxBatches`
     // (512 batches × 128 slots = 65536 slots) for workloads with
@@ -256,19 +256,19 @@ public:
         if (initial_batches == 0) initial_batches = 1;
         if (initial_batches > kAbsoluteMaxBatches) initial_batches = kAbsoluteMaxBatches;
 
-        // P0-3: Reserve capacity for the absolute max so add_batch_unchecked()
+        // Reserve capacity for the absolute max so add_batch_unchecked()
         // never needs to grow the vectors (which would invalidate references
         // held by concurrent readers on the slow path).
         slot_batches_.reserve(kAbsoluteMaxBatches);
         used_batches_.reserve(kAbsoluteMaxBatches);
-        // G16: reserve for the free-list "next" link batches (same lifetime
+        // reserve for the free-list "next" link batches (same lifetime
         // as slot_batches_/used_batches_; never reallocated after this).
         next_free_batches_.reserve(kAbsoluteMaxBatches);
         for (std::size_t b = 0; b < initial_batches; ++b) {
             add_batch_unchecked();
         }
         num_batches_.store(initial_batches, std::memory_order_release);
-        // P0-3: default batch limit preserves pre-P0-3 capacity (8192 slots).
+        // default batch limit preserves pre-P0-3 capacity (8192 slots).
         max_batches_limit_.store(kMaxBatches, std::memory_order_release);
     }
 
@@ -290,7 +290,7 @@ public:
     /// Fast path: check the thread-local slot cache for O(1) acquisition.
     /// Slow path: linear scan of all slots, then domain expansion.
     ///
-    /// T-O1: When all 8192 slots are exhausted, the loop is now bounded:
+    /// When all 8192 slots are exhausted, the loop is now bounded:
     /// after kMaxSpinRetries (1024) yield-and-retry cycles, it falls back
     /// to a synchronous try_reclaim() to drain pending retired objects
     /// (bumps hazptr_sync_fallback_count_). After kMaxSyncFallbacks (64)
@@ -316,7 +316,7 @@ public:
         }
         cache.owner = this;
 
-        // T-O1: bounded retry counters for the slot-exhaustion path.
+        // bounded retry counters for the slot-exhaustion path.
         std::size_t spin_retries  = 0;
         std::size_t sync_fallbacks = 0;
 
@@ -324,7 +324,7 @@ public:
         // The loop retries the free-list on every iteration because a
         // concurrent release may push a slot between iterations.
         while (true) {
-            // G16: Try the lock-free free-list first. This is O(1) and
+            // Try the lock-free free-list first. This is O(1) and
             // avoids the O(N) linear scan when slots have been previously
             // released (the common case after warmup). Only when the
             // free-list is empty do we fall through to the linear scan
@@ -345,7 +345,7 @@ public:
                 bool expected = false;
                 if (used_batches_[batch][offset].compare_exchange_strong(
                         expected, true, std::memory_order_acquire)) {
-                    // R4: track active slot count for try_reclaim() fast-path
+                    // track active slot count for try_reclaim() fast-path
                     active_slot_count_.fetch_add(1, std::memory_order_relaxed);
                     return i;
                 }
@@ -363,7 +363,7 @@ public:
                 bool expected = false;
                 if (used_batches_[batch][offset].compare_exchange_strong(
                         expected, true, std::memory_order_acquire)) {
-                    // R4: track active slot count for try_reclaim() fast-path
+                    // track active slot count for try_reclaim() fast-path
                     active_slot_count_.fetch_add(1, std::memory_order_relaxed);
                     return i;
                 }
@@ -373,18 +373,18 @@ public:
                 // All slots exhausted — extreme scenario.
                 slot_exhaustion_count_.fetch_add(1, std::memory_order_relaxed);
                 if (++spin_retries <= kMaxSpinRetries) {
-                    // P0-7 (T-A2): bounded yield-and-retry.
+                    // bounded yield-and-retry.
                     std::this_thread::yield();
                     continue;
                 }
-                // T-O1: exceeded spin budget — fall back to synchronous
+                // exceeded spin budget — fall back to synchronous
                 // reclaim to drain pending retired objects. This frees
                 // memory pressure and may indirectly release slots held
                 // by reclaim-related paths. Bump the fallback metric so
                 // operators can detect sustained slot exhaustion.
                 sync_fallback_count_.fetch_add(1, std::memory_order_relaxed);
                 if (++sync_fallbacks > kMaxSyncFallbacks) {
-                    // P0-3: Hard cap reached — 8192+ genuinely-live handles
+                    // Hard cap reached — 8192+ genuinely-live handles
                     // for an extended period. Return `npos` instead of
                     // throwing so the caller (e.g. hazptr_holder →
                     // read_handle ctor, which is noexcept) can degrade
@@ -394,7 +394,7 @@ public:
                     return npos;
                 }
                 (void)try_reclaim();
-                // P1-12/P1-5 (measured defect): do NOT re-grant the spin budget
+                // do NOT re-grant the spin budget
                 // here. Resetting `spin_retries` to 0 after every sync fallback
                 // let the loop run kMaxSpinRetries full-table scans *per*
                 // fallback round, i.e. ~1024 x 64 = 65,536 scans of the whole
@@ -436,11 +436,11 @@ public:
         }
 
         // TLS cache full or different owner — release globally.
-        // G16: push the slot index onto the lock-free free-list so the
+        // push the slot index onto the lock-free free-list so the
         // next acquire_slot() (from any thread) can find it in O(1)
         // instead of doing the O(N) linear scan.
         used_batches_[batch][offset].store(false, std::memory_order_release);
-        // R4: track active slot count for try_reclaim() fast-path
+        // track active slot count for try_reclaim() fast-path
         active_slot_count_.fetch_sub(1, std::memory_order_relaxed);
         free_list_push(slot);
     }
@@ -451,9 +451,9 @@ public:
         std::size_t offset = slot % kBatchSize;
         slot_batches_[batch][offset].store(nullptr, std::memory_order_release);
         used_batches_[batch][offset].store(false, std::memory_order_release);
-        // R4: track active slot count for try_reclaim() fast-path
+        // track active slot count for try_reclaim() fast-path
         active_slot_count_.fetch_sub(1, std::memory_order_relaxed);
-        // G16: push onto the lock-free free-list for O(1) re-acquisition
+        // push onto the lock-free free-list for O(1) re-acquisition
         // by any thread (used by TLS-cache destructor on thread exit and
         // invalidate_tls_cache()).
         free_list_push(slot);
@@ -478,7 +478,7 @@ public:
         return num_batches_.load(std::memory_order_acquire) * kBatchSize;
     }
 
-    /// P0-3: Number of currently-acquired (live) hazard pointer slots.
+    /// Number of currently-acquired (live) hazard pointer slots.
     /// Useful for monitoring slot pressure — when this approaches
     /// `max_slot_count()`, operators should either call `set_max_slots()`
     /// to expand capacity or investigate the cause of handle retention
@@ -487,7 +487,7 @@ public:
         return active_slot_count_.load(std::memory_order_acquire);
     }
 
-    /// P0-3: Maximum number of slots the domain can hold. Defaults to
+    /// Maximum number of slots the domain can hold. Defaults to
     /// `kMaxBatches * kBatchSize` (8192) but can be raised at runtime
     /// via `set_max_slots()` up to `kAbsoluteMaxBatches * kBatchSize`
     /// (65536).
@@ -495,7 +495,7 @@ public:
         return max_batches_limit_.load(std::memory_order_acquire) * kBatchSize;
     }
 
-    /// P0-3: Runtime capacity expansion. Raises the maximum number of
+    /// Runtime capacity expansion. Raises the maximum number of
     /// slots from the default 8192 up to 65536 (512 batches × 128 slots).
     /// Existing slots and active handles are unaffected — only the upper
     /// bound is raised, allowing `acquire_slot()` to allocate new batches
@@ -512,7 +512,7 @@ public:
         max_batches_limit_.store(batches, std::memory_order_release);
     }
 
-    /// P0-3: Current slot usage ratio (0.0 .. 1.0). When this exceeds
+    /// Current slot usage ratio (0.0 .. 1.0). When this exceeds
     /// 0.9, operators should either raise the limit via `set_max_slots()`
     /// or reduce reader fan-out — sustained high usage risks
     /// `acquire_slot()` returning `npos`, which degrades reads to cache
@@ -525,7 +525,7 @@ public:
                                   static_cast<double>(cap));
     }
 
-    /// P0-7 (T-A2): Number of times acquire_slot() exhausted all 8192
+    /// Number of times acquire_slot() exhausted all 8192
     /// slots and had to yield. Non-zero indicates the workload has
     /// 8000+ simultaneous live hazard pointers — likely a runaway
     /// reader-heavy workload or a thread/fiber leak. Previously this
@@ -535,7 +535,7 @@ public:
         return slot_exhaustion_count_.load(std::memory_order_acquire);
     }
 
-    /// T-O1: Number of times acquire_slot() exceeded the spin budget
+    /// Number of times acquire_slot() exceeded the spin budget
     /// (kMaxSpinRetries) and fell back to a synchronous try_reclaim()
     /// to drain pending retired objects. Sustained non-zero growth
     /// means the workload has 8192+ live handles for extended periods
@@ -555,7 +555,7 @@ public:
     /// The object's embedded next_ pointer is used as the list link.
     /// The reclaim_ function pointer must be set before calling retire.
     ///
-    /// P1-7 (T2.6 bugfix): Idempotent via the `retired_` atomic flag.
+    /// Idempotent via the `retired_` atomic flag.
     /// `test_and_set` is atomic and ensures only one caller wins the
     /// race; subsequent callers become no-ops. This is the primary
     /// defense against double-retire under high-concurrency eviction
@@ -569,7 +569,7 @@ public:
 
     /// Retire an object whose deleter is supplied here.
     ///
-    /// P1-9 (fix.01 方案 A): the deleter is stored into `obj->reclaim_` ONLY by
+    /// the deleter is stored into `obj->reclaim_` ONLY by
     /// the thread that wins the `retired_` claim. Previously `retire<T>()`
     /// wrote `obj->reclaim_` *before* calling `retire_obj()`, so a second
     /// (stale-pointer) retire could overwrite the winner's deleter with a
@@ -586,7 +586,7 @@ public:
         push_retired(obj);
     }
 
-    /// P1-3: Mark the drain worker as started. Called by
+    /// Mark the drain worker as started. Called by
     /// `unified_cache::start_event_drain()` so that subsequent
     /// `retire_obj()` calls no longer emit the stderr warning. Has no
     /// effect on correctness — only suppresses the warning.
@@ -594,7 +594,7 @@ public:
         drain_started_.store(started, std::memory_order_release);
     }
 
-    /// P1-3: Query whether the drain worker has been started. Used by
+    /// Query whether the drain worker has been started. Used by
     /// `unified_cache::is_drain_worker_started()` and diagnostics to
     /// surface the state to operators.
     bool is_drain_started() const noexcept {
@@ -611,7 +611,7 @@ public:
 
         if constexpr (is_hazptr_obj_v<T>) {
             // Zero-allocation path: T inherits from hazptr_obj_base.
-            // P1-9: the deleter is handed to retire_obj() so it is stored only
+            // the deleter is handed to retire_obj() so it is stored only
             // after this caller wins the `retired_` claim.
             retire_obj(static_cast<hazptr_obj_base*>(ptr),
                        [](hazptr_obj_base* p) { delete static_cast<T*>(p); });
@@ -636,7 +636,7 @@ public:
     /// Flush the TLS retire buffer to the global pending list.
     /// Links all buffered entries into a chain and pushes via CAS.
     ///
-    /// P1-7 (T2.6 bugfix): `buf.clear()` MUST run BEFORE `push_pending()`.
+    /// `buf.clear()` MUST run BEFORE `push_pending()`.
     /// `push_pending()` → `maybe_auto_reclaim()` → `try_reclaim()` →
     /// `flush_tls_buffer()` is recursive. If `buf` is not yet cleared when
     /// the recursive call enters, the recursive call re-chains the SAME
@@ -693,7 +693,7 @@ public:
         hazptr_obj_base* head = pending_head_.exchange(nullptr, std::memory_order_acq_rel);
         if (!head) return 0;
 
-        // T-P2-3 (R-7): For incremental reclaim (batch_size > 0), reverse
+        // For incremental reclaim (batch_size > 0), reverse
         // the list so we process oldest objects first. The pending list is
         // LIFO (push_pending prepends), so without reversal the newest
         // objects would be inspected first and oldest objects could starve
@@ -703,7 +703,7 @@ public:
             head = reverse_pending_list(head);
         }
 
-        // R4: Fast-path — if no hazard pointers are active, all pending
+        // Fast-path — if no hazard pointers are active, all pending
         // objects are safe to reclaim. Skip the expensive slot scan and
         // protected-vector build entirely. In read-heavy-write-light
         // workloads, reclaims often happen when no readers hold handles
@@ -724,7 +724,7 @@ public:
 
         hazptr_obj_base* curr = head;
         while (curr) {
-            // T-P2-3 (R-7): Stop after inspecting batch_size objects.
+            // Stop after inspecting batch_size objects.
             // The unprocessed tail (newest objects when batch_size > 0,
             // since we reversed) is pushed back to the pending list.
             if (batch_size > 0 && processed >= batch_size) {
@@ -734,7 +734,7 @@ public:
             hazptr_obj_base* next = curr->next_;
             curr->next_ = nullptr;
 
-            // R4: If protected_vec is null (fast-path), all objects are safe.
+            // If protected_vec is null (fast-path), all objects are safe.
             if (protected_vec == nullptr ||
                 !is_in_protected_vector(*protected_vec, curr)) {
                 // Reclaim this object
@@ -756,7 +756,7 @@ public:
             ++processed;
         }
 
-        // T-P2-3 (R-7): Re-chain any unprocessed objects (the `curr`
+        // Re-chain any unprocessed objects (the `curr`
         // pointer is at the first unprocessed object, or null if we
         // processed the entire list). Append them to the re-chained
         // protected entries so a single push_pending() call returns
@@ -813,7 +813,7 @@ public:
     /// Return the current number of pending (unreclaimed) retired objects.
     /// This is a snapshot — the actual count may change concurrently.
     ///
-    /// P1-10 (fix.01 方案 C): the ledger is sharded, and each shard stores a
+    /// the ledger is sharded, and each shard stores a
     /// signed DELTA (pushes add, reclaims subtract) rather than a count. That is
     /// what makes sharding safe: the thread that reclaims is generally not the
     /// thread that pushed, so an individual shard can legitimately be negative.
@@ -837,7 +837,7 @@ public:
         return reclaim_total_.load(std::memory_order_acquire);
     }
 
-    /// P1-3 (T1.4): Return the current auto-reclaim threshold. When
+    /// Return the current auto-reclaim threshold. When
     /// `pending_count()` exceeds this value, the next `retire()` /
     /// `push_pending()` call synchronously invokes `try_reclaim()` to
     /// drain the pending list. Default is 65536 — high enough to avoid
@@ -847,7 +847,7 @@ public:
         return reclaim_threshold_.load(std::memory_order_acquire);
     }
 
-    /// P1-3 (T1.4): Set the auto-reclaim threshold. Set to
+    /// Set the auto-reclaim threshold. Set to
     /// `std::numeric_limits<std::size_t>::max()` to effectively disable
     /// auto-reclaim (only background / explicit reclaims will run).
     /// Thread-safe: may be called concurrently with retire().
@@ -855,7 +855,7 @@ public:
         reclaim_threshold_.store(threshold, std::memory_order_release);
     }
 
-    /// P1-3 (T1.4): Number of times auto-reclaim was triggered because
+    /// Number of times auto-reclaim was triggered because
     /// `pending_count` exceeded the threshold. Useful for sizing the
     /// threshold against actual retire pressure.
     std::size_t reclaim_auto_triggered_count() const noexcept {
@@ -864,7 +864,7 @@ public:
 
     /// Obtain the default global hazard pointer domain.
     ///
-    /// P1-11 (fix.01 方案 A): the default domain is intentionally NEVER
+    /// the default domain is intentionally NEVER
     /// destroyed — it is leaked at process exit on purpose.
     ///
     /// Rationale: the domain owns the global pending list, TLS retire buffers
@@ -890,7 +890,7 @@ public:
 
 private:
     // ----------------------------------------------------------------
-    // G16: Lock-free free-list (Treiber stack) for O(1) slot reuse.
+    // Lock-free free-list (Treiber stack) for O(1) slot reuse.
     //
     // Problem: acquire_slot()'s TLS cache miss path linearly scanned up
     // to 8192 slots (kMaxBatches * kBatchSize). Under high concurrency
@@ -1016,7 +1016,7 @@ private:
     void add_batch_unchecked() {
         auto slots = std::make_unique<std::atomic<void*>[]>(kBatchSize);
         auto used  = std::make_unique<std::atomic<bool>[]>(kBatchSize);
-        // G16: Per-slot "next" link for the lock-free free-list.
+        // Per-slot "next" link for the lock-free free-list.
         // Initialized to kFreeSlotNil (end-of-list sentinel); only
         // written by free_list_push when the slot is released.
         auto next_free = std::make_unique<std::atomic<std::uint32_t>[]>(kBatchSize);
@@ -1035,7 +1035,7 @@ private:
     /// Replaces the old std::unordered_set — avoids hash computation and
     /// per-bucket heap allocation. Binary search gives O(log n) lookups.
     ///
-    /// R4: Uses a thread_local cached vector to avoid heap allocation on
+    /// Uses a thread_local cached vector to avoid heap allocation on
     /// every try_reclaim() call. The vector's capacity is reused across
     /// calls — only the size changes. This eliminates the malloc/free
     /// pair per reclaim under high eviction rates.
@@ -1065,7 +1065,7 @@ private:
 
     // ---- Lock-free pending list -------------------------------------------
 
-    /// T-P2-3 (R-7): Reverse a singly-linked pending list in place.
+    /// Reverse a singly-linked pending list in place.
     /// Used by incremental try_reclaim(batch_size > 0) so that oldest
     /// objects (at the tail of the LIFO pending list) are processed
     /// first, preventing starvation under continuous retire pressure.
@@ -1104,7 +1104,7 @@ private:
 
         pending_add(chain_len);
 
-        // P1-3 (T1.4): Auto-reclaim when pending_count exceeds threshold.
+        // Auto-reclaim when pending_count exceeds threshold.
         // The check is on every push_pending() (called from flush_tls_buffer
         // when a TLS retire buffer fills, or from explicit retire_obj
         // chains) — it bounds worst-case pending backlog under bursty
@@ -1132,13 +1132,13 @@ private:
         }
         if (reclaimed > 0) {
             reclaim_total_.fetch_add(reclaimed, std::memory_order_relaxed);
-            // P1-10: release what was actually removed rather than zeroing the
+            // release what was actually removed rather than zeroing the
             // ledger (producers may still be pushing concurrently).
             pending_release(reclaimed);
         }
     }
 
-    /// P1-3 (T1.4): If pending_count exceeds the configured threshold,
+    /// If pending_count exceeds the configured threshold,
     /// synchronously trigger try_reclaim() to drain the pending list.
     /// Uses a CAS flag to prevent stampede — at most one thread performs
     /// the synchronous reclaim; concurrent push_pending() calls observe
@@ -1169,7 +1169,7 @@ private:
 
     // ---- Retire internals -------------------------------------------------
 
-    /// P1-7: Idempotent-retire claim. CAS on `retired_` from false → true; the
+    /// Idempotent-retire claim. CAS on `retired_` from false → true; the
     /// first caller wins and every later caller becomes a no-op (a second push
     /// would corrupt the pending chain through `next_`).
     ///
@@ -1191,7 +1191,7 @@ private:
     /// Push an already-claimed object onto this domain's TLS retire buffer.
     /// Extracted from retire_obj() so both retire entry points share it.
     void push_retired(hazptr_obj_base* obj) {
-        // P1-3: Warn once if the drain worker has not been started.
+        // Warn once if the drain worker has not been started.
         // Without the background drain worker, retired objects
         // accumulate in the global pending list and are only reclaimed
         // when maybe_auto_reclaim() fires (after pending_count exceeds
@@ -1225,7 +1225,7 @@ private:
     // Hazard pointer slots (batch-based)
     std::vector<std::unique_ptr<std::atomic<void*>[]>> slot_batches_;
     std::vector<std::unique_ptr<std::atomic<bool>[]>>  used_batches_;
-    // G16: Per-slot "next" link for the lock-free free-list (Treiber
+    // Per-slot "next" link for the lock-free free-list (Treiber
     // stack), organized in batches alongside slot_batches_/used_batches_.
     // next_free_batches_[b][o] holds the next free slot index in the
     // stack chain (kFreeSlotNil = end of list). Only meaningful while
@@ -1234,26 +1234,26 @@ private:
     std::atomic<std::size_t> num_batches_{0};
     std::mutex expand_mutex_;  // Only used for batch expansion
 
-    // G16: Head of the lock-free free-list (Treiber stack). Packs a
+    // Head of the lock-free free-list (Treiber stack). Packs a
     // 32-bit ABA tag (high word) with a 32-bit slot index (low word).
     // kFreeSlotNil in the low bits means the list is empty. The tag is
     // incremented on every successful push/pop, eliminating ABA without
     // double-word CAS. Initialized to (tag=0, slot=kFreeSlotNil) = empty.
     alignas(64) std::atomic<std::uint64_t> free_list_head_{kFreeSlotNil};
 
-    // P0-3: Runtime-configurable upper bound on the number of batches.
+    // Runtime-configurable upper bound on the number of batches.
     // Defaults to `kMaxBatches` (64 → 8192 slots) and can be raised via
     // `set_max_slots()` up to `kAbsoluteMaxBatches` (512 → 65536 slots).
     // Stored as atomic so `acquire_slot()` can read it lock-free on the
     // slow path; updates happen at startup or during quiescent periods.
     alignas(64) std::atomic<std::size_t> max_batches_limit_{kMaxBatches};
 
-    // P0-7 (T-A2): bumped each time acquire_slot() exhausts all 8192
+    // bumped each time acquire_slot() exhausts all 8192
     // slots. Distinct from reclaim counters — this measures slot
     // pressure, not retire pressure.
     alignas(64) std::atomic<std::size_t> slot_exhaustion_count_{0};
 
-    // R4: Active hazard pointer count. Incremented on acquire_slot(),
+    // Active hazard pointer count. Incremented on acquire_slot(),
     // decremented on release. When 0, try_reclaim() can skip the
     // expensive slot scan and protected-vector build — all pending
     // objects are guaranteed safe to reclaim. Uses relaxed atomics
@@ -1261,7 +1261,7 @@ private:
     // correctness constraint).
     alignas(64) std::atomic<std::size_t> active_slot_count_{0};
 
-    // T-O1: bumped each time acquire_slot() exceeds kMaxSpinRetries and
+    // bumped each time acquire_slot() exceeds kMaxSpinRetries and
     // falls back to a synchronous try_reclaim(). Distinct from
     // slot_exhaustion_count_ (which counts every exhausted retry) — this
     // only counts the sync-reclaim fallback invocations, giving operators
@@ -1273,7 +1273,7 @@ private:
 
     // Statistics counters (alignas to avoid false sharing with pending_head_)
     //
-    // P1-10 (fix.01 方案 C): the pending backlog is a sharded reservation
+    // the pending backlog is a sharded reservation
     // ledger rather than one counter that was overwritten with a recomputed
     // remainder. The old `pending_count_.store(remaining_count)` both discarded
     // concurrent push_pending() increments and never subtracted the objects it
@@ -1315,7 +1315,7 @@ private:
 
     alignas(64) std::atomic<std::size_t> reclaim_total_{0};
 
-    // P1-3 (T1.4): Auto-reclaim threshold and stampede guard.
+    // Auto-reclaim threshold and stampede guard.
     // When `pending_count()` exceeds `reclaim_threshold_`, the next
     // push_pending() synchronously invokes try_reclaim(). The
     // `reclaim_in_progress_` CAS flag ensures at most one thread at a
@@ -1330,7 +1330,7 @@ private:
     alignas(64) std::atomic<std::size_t> reclaim_auto_triggered_count_{0};
     alignas(64) std::atomic<bool> reclaim_in_progress_{false};
 
-    // P1-3: Drain worker started flag. Set by
+    // Drain worker started flag. Set by
     // `unified_cache::start_event_drain()` so that `retire_obj()` can
     // detect the missing-worker condition and warn operators once.
     // Without the worker, retired objects accumulate until auto-reclaim
@@ -1338,7 +1338,7 @@ private:
     // read-heavy-write-light workloads.
     alignas(64) std::atomic<bool> drain_started_{false};
 
-    /// P1-3: Emit a one-shot stderr warning when `retire_obj()` is
+    /// Emit a one-shot stderr warning when `retire_obj()` is
     /// called before `set_drain_started(true)`. Uses a CAS flag so the
     /// warning fires at most once per domain lifetime — operators see
     /// the message, start the worker, and subsequent retires are silent.
@@ -1357,7 +1357,7 @@ private:
         }
     }
 
-    // P1-3: CAS flag ensuring the drain-not-started warning fires at
+    // CAS flag ensuring the drain-not-started warning fires at
     // most once per domain. Stored separately from `drain_started_` so
     // that a later `set_drain_started(false)` (e.g. on shutdown) does
     // not re-arm the warning. No in-tree caller resets it today, but
@@ -1372,7 +1372,7 @@ private:
 class hazptr_holder {
 public:
     /// Acquire a slot from the default domain.
-    /// P0-3: If acquire_slot() returns `npos` (all slots exhausted), the
+    /// If acquire_slot() returns `npos` (all slots exhausted), the
     /// holder enters an empty state (`valid() == false`). Callers that
     /// need a valid holder must check `valid()` and degrade gracefully
     /// (e.g. produce an empty read_handle). This matches the refcount-
@@ -1383,14 +1383,14 @@ public:
     {}
 
     /// Acquire a slot from a specific domain.
-    /// P0-3: Same npos-handling as the default-domain constructor.
+    /// Same npos-handling as the default-domain constructor.
     explicit hazptr_holder(hazptr_domain& domain)
         : domain_(domain)
         , slot_(domain_.acquire_slot())
     {}
 
     /// Release the slot on destruction.
-    /// P0-3: Only release if the slot is valid (not npos). An empty
+    /// Only release if the slot is valid (not npos). An empty
     /// holder (acquire failed) has no slot to release.
     ~hazptr_holder() {
         if (valid()) {
@@ -1446,7 +1446,7 @@ public:
     /// It is deliberately NOT marked [[deprecated]]: every existing call site
     /// implements a re-validation that is *stronger* than the atomic form, and
     /// forcing a rewrite to a weaker primitive would be a regression. See
-    /// §P1-4 in spec/fix.01.md.
+    /// General "cannot be skipped" form of the protect-and-reload idiom.
     template <typename T>
     void protect(T* ptr) {
         if (!valid()) return;
@@ -1466,7 +1466,7 @@ public:
     /// Publish `ptr`, then re-read the source through `reload` and only accept
     /// the protection once the re-read agrees.
     ///
-    /// P1-4 (fix.01 方案 A): this is the general "cannot be skipped" form of the
+    /// this is the general "cannot be skipped" form of the
     /// hazard-pointer protocol. `reload()` must return the pointer that its data
     /// structure currently considers valid for the same logical position (for a
     /// plain atomic that is `src.load(acquire)`; for a slot+version layout it is
@@ -1505,7 +1505,7 @@ public:
     }
 
     /// Clear the protected pointer (e.g. when the iterator moves away).
-    /// P0-3: No-op if the holder is empty.
+    /// No-op if the holder is empty.
     void clear() {
         if (!valid()) return;
         domain_.store_slot(slot_, nullptr);
@@ -1518,7 +1518,7 @@ public:
     }
 
     /// Whether this holder owns a valid slot.
-    /// P0-3: Returns false if the slot acquisition failed (npos). Callers
+    /// Returns false if the slot acquisition failed (npos). Callers
     /// must check this before relying on protection.
     bool valid() const noexcept {
         return slot_ != hazptr_domain::npos;
@@ -1528,7 +1528,7 @@ public:
     /// Used by hazptr linked-list traversal: one holder protects curr,
     /// the other protects next; after advancing, swap them so the
     /// former-curr holder now protects next (the new curr).
-    /// P0-3: No-op if either holder is empty.
+    /// No-op if either holder is empty.
     void swap(hazptr_holder& other) noexcept {
         if (!valid() || !other.valid()) return;
         // Both holders must be from the same domain

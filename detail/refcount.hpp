@@ -37,7 +37,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-// T-P2-2: CPU pause macro for CAS backoff. Reduces cache-line contention
+// CPU pause macro for CAS backoff. Reduces cache-line contention
 // by inserting a hint that the CPU is in a spin-wait loop, allowing the
 // hyper-threaded sibling to use more execution resources.
 #if defined(_MSC_VER)
@@ -106,7 +106,7 @@ inline void refcount_cas_backoff(uint32_t& spin_count) {
         ++spin_count;
         return;
     }
-    // P3-2: Clamp the shift exponent to avoid undefined behavior.
+    // Clamp the shift exponent to avoid undefined behavior.
     // `1u << n` is UB when n >= width(unsigned int) (typically 32). Under
     // sustained contention spin_count can grow without bound (the only thing
     // that resets it is a successful CAS), so eventually the shift would
@@ -141,14 +141,14 @@ enum class IncResult {
     kIncFailedMoving,    // item is being moved (kExclusive + access_ref > 0)
     kIncFailedEviction,  // item is being evicted (kExclusive + access_ref == 0)
     kIncFailedOverflow,  // access_ref would overflow (saturated at max)
-    // P1-22 (fix.01 方案 A): the item is not in the MM container (kLinked
+    // the item is not in the MM container (kLinked
     // clear). Appended at the END so the numeric values of the existing
     // enumerators are unchanged. See incRef() for why this is a pin barrier.
     kIncFailedUnlinked,
 };
 
 // ============================================================================
-// T-G11: thread-local last-incRef result + overflow diagnostics
+// thread-local last-incRef result + overflow diagnostics
 // ============================================================================
 //
 // `incRef()` sets this thread-local on every call so callers can inspect
@@ -168,20 +168,20 @@ inline IncResult& tls_last_incRef_result() {
     return r;
 }
 
-/// T-G11: convenience accessor — was the most recent incRef on this
+/// convenience accessor — was the most recent incRef on this
 /// thread an overflow?
 inline bool tls_last_incRef_was_overflow() noexcept {
     return tls_last_incRef_result() == IncResult::kIncFailedOverflow;
 }
 
-/// T-G11: Reset the thread-local overflow flag. Call before a lookup
+/// Reset the thread-local overflow flag. Call before a lookup
 /// if you intend to check `tls_last_incRef_was_overflow()` afterwards
 /// and want to avoid stale positives from prior calls.
 inline void tls_clear_incRef_overflow_flag() noexcept {
     tls_last_incRef_result() = IncResult::kIncOk;
 }
 
-/// T-G11: Process-wide cumulative overflow counter. Bumped by
+/// Process-wide cumulative overflow counter. Bumped by
 /// `incRef()` on every kIncFailedOverflow. Per-cache counters are
 /// maintained in `cache_stats::incRef_overflow_count`, but this global
 /// is exposed for runtime monitoring (e.g. crash dump attribution)
@@ -207,7 +207,7 @@ public:
     refcount_with_flags& operator=(const refcount_with_flags&) = delete;
 
     // ----------------------------------------------------------------
-    // G19: overflow diagnostics
+    // overflow diagnostics
     // ----------------------------------------------------------------
     // `incRef()` returns kIncFailedOverflow when access_ref saturates at
     // kAccessRefMax. Callers (e.g. read_handle ctor, try_get) produce an
@@ -223,14 +223,14 @@ public:
     // single global counter is the right granularity for diagnostics.
     // Per-cache counters live in cache_stats::incRef_overflow_count.
 
-    /// G19: Cumulative count of incRef() overflow failures across all
+    /// Cumulative count of incRef() overflow failures across all
     /// instances. Monotonically increasing; use reset_overflow_count()
     /// to zero it (testing only).
     static uint64_t overflow_count() noexcept {
         return overflow_count_.load(std::memory_order_relaxed);
     }
 
-    /// G19: Reset the overflow counter to zero. Intended for tests that
+    /// Reset the overflow counter to zero. Intended for tests that
     /// need a clean baseline; not for production use.
     static void reset_overflow_count() noexcept {
         overflow_count_.store(0, std::memory_order_relaxed);
@@ -248,7 +248,7 @@ public:
     /// - If kExclusive + access_ref > 0: returns kIncFailedMoving.
     /// - If access_ref >= kAccessRefMax: returns kIncFailedOverflow (saturated, no increment).
     ///
-    /// P1-22 (fix.01 方案 A): kLinked is the pin barrier.
+    /// kLinked is the pin barrier.
     ///
     /// Every eviction path is `markForEviction() → map_.erase() →
     /// remove_from_list() → unmarkForEviction() → retire()`. Before this
@@ -271,7 +271,7 @@ public:
     /// item into the map only AFTER `markInMMContainer()` + list link, so a
     /// reachable node always has kLinked set.
     IncResult incRef() {
-        // G23: relaxed initial load — the CAS failure case below already
+        // relaxed initial load — the CAS failure case below already
         // uses memory_order_acquire, which provides the required acquire
         // semantics on every retry. The initial load only seeds the loop
         // value, so acquire here is redundant (matters on ARM where acquire
@@ -285,21 +285,21 @@ public:
                 Value access = old & kAccessRefMask;
                 IncResult r = (access == 0) ? IncResult::kIncFailedEviction
                                             : IncResult::kIncFailedMoving;
-                // T-G11: record result for caller inspection.
+                // record result for caller inspection.
                 tls_last_incRef_result() = r;
                 return r;
             }
-            // P1-22: kLinked must be set — see the barrier note above.
+            // kLinked must be set — see the barrier note above.
             if (((old >> kLinkedBit) & 1ULL) == 0ULL) {
                 tls_last_incRef_result() = IncResult::kIncFailedUnlinked;
                 return IncResult::kIncFailedUnlinked;
             }
             Value access = old & kAccessRefMask;
             if (access >= kAccessRefMax) {
-                // T-G11: record overflow + bump process-wide counter.
+                // record overflow + bump process-wide counter.
                 tls_last_incRef_result() = IncResult::kIncFailedOverflow;
                 global_incRef_overflow_count().fetch_add(1, std::memory_order_relaxed);
-                // G19: bump class-level overflow counter so callers can
+                // bump class-level overflow counter so callers can
                 // disambiguate overflow-induced empty handles (which look
                 // like a miss) from genuine misses — preventing thundering-
                 // herd back-source storms. Exposed via overflow_count().
@@ -309,11 +309,11 @@ public:
             Value desired = old + 1ULL;
             if (value_.compare_exchange_weak(old, desired,
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
-                // T-G11: record success for caller inspection.
+                // record success for caller inspection.
                 tls_last_incRef_result() = IncResult::kIncOk;
                 return IncResult::kIncOk;
             }
-            // T-P2-2: backoff to reduce cache-line ping-pong on hot keys
+            // backoff to reduce cache-line ping-pong on hot keys
             refcount_cas_backoff(spins);
         }
     }
@@ -348,7 +348,7 @@ public:
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
                 return desired;
             }
-            // T-P2-2: backoff to reduce cache-line ping-pong on hot keys
+            // backoff to reduce cache-line ping-pong on hot keys
             refcount_cas_backoff(spins);
         }
     }
@@ -600,7 +600,7 @@ private:
     // budget in the header comment actually true.
     std::atomic<Value> value_;
 
-    // G19: class-wide overflow counter. Bumped on every kIncFailedOverflow
+    // class-wide overflow counter. Bumped on every kIncFailedOverflow
     // return from incRef(), exposed via overflow_count() / reset_overflow_count().
     // Uses C++17 inline static so no separate out-of-class definition is needed.
     // Relaxed atomic is sufficient: the counter is a diagnostic best-effort

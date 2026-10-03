@@ -1,4 +1,4 @@
-# fix.01 §4.4: libFuzzer targets.
+# libFuzzer targets.
 #
 # These exist because the deserializers are untrusted-input boundaries — a
 # snapshot can arrive corrupt, truncated, or hostile — and had no fuzz coverage

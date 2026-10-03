@@ -83,7 +83,7 @@ TEST(LatencyHistogram, SumAccuracy) {
 }
 
 // ============================================================================
-// P2-2: log-linear histogram precision.
+// log-linear histogram precision.
 // 512 buckets, 16 sub-buckets per power-of-2 octave. Within-bucket width is
 // 1/16 of the octave lower bound (for L ≥ 128 ns), so the worst-case relative
 // error of percentile() (which returns the bucket lower bound) is ≤ 6.25%.
@@ -195,7 +195,7 @@ TEST(ProductionPrometheus, ContainsLatencyHistogram) {
     EXPECT_NE(text.find("lru_cache_set_latency_ns"), std::string::npos);
 }
 
-// T13.4: Prometheus export for hash load factor and overload metrics.
+// Prometheus export for hash load factor and overload metrics.
 TEST(ProductionPrometheus, ContainsHashLoadFactorMetrics) {
     cache<int, std::string> c(100);
     c.set(1, "a");
@@ -206,7 +206,7 @@ TEST(ProductionPrometheus, ContainsHashLoadFactorMetrics) {
     EXPECT_NE(text.find("lru_hash_overload_events_total"), std::string::npos);
 }
 
-// P2-E: Metrics cache — verify that enabling the cache returns the same
+// Metrics cache — verify that enabling the cache returns the same
 // snapshot and Prometheus text as the uncached path, and that the
 // background worker refreshes it.
 TEST(ProductionMetricsCache, DisabledByDefault) {
@@ -284,7 +284,7 @@ TEST(ProductionMetricsCache, BackgroundWorkerRefreshes) {
     EXPECT_FALSE(c.metrics_cache_worker_running());
 }
 
-// T13.1: set_hash_overload_threshold() configures the threshold.
+// set_hash_overload_threshold() configures the threshold.
 //
 // The default is DERIVED from max_load_factor_, not an independent constant:
 // rehash_if_needed() rehashes when either threshold is crossed, so a lower
@@ -318,7 +318,7 @@ TEST(HashOverloadThreshold, ZeroThresholdFallsBackToDefault) {
     EXPECT_FLOAT_EQ(snap.hash_overload_threshold.load(), 2.0f);
 }
 
-// T13.2: set_overload_callback() — the callback fires when load_factor
+// set_overload_callback() — the callback fires when load_factor
 // exceeds the threshold. We use a very small threshold and a single-shard
 // cache to make the test deterministic.
 TEST(HashOverloadCallback, CallbackFiresOnOverload) {
@@ -351,7 +351,7 @@ TEST(HashOverloadCallback, CallbackExceptionIsSwallowed) {
     SUCCEED();
 }
 
-// T13.3: Overload events counter increments when threshold is exceeded.
+// Overload events counter increments when threshold is exceeded.
 TEST(HashOverloadEvents, CounterIncrementsOnOverload) {
     safe_cache<int, int> c(1000);
     c.set_hash_overload_threshold(0.01f);
@@ -367,7 +367,7 @@ TEST(HashOverloadEvents, CounterIncrementsOnOverload) {
 // ============================================================================
 // Task 6: active_handle_count
 //
-// P2-1/P2-2: per-T global counter (sharded across 64 cache lines) is
+// per-T global counter (sharded across 64 cache lines) is
 // only maintained under -DLRU_DEBUG=1 (or when global tracking is
 // explicitly enabled). In release builds, read_handle<T>::active_count()
 // is 0 and observability is sourced from per-cache active_handle_count()
@@ -390,7 +390,7 @@ TEST(ProductionActiveHandle, BasicCount) {
 }
 
 TEST(ProductionActiveHandle, CacheMethodMatchesStatic) {
-    // P2-1: in release builds, read_handle<T>::active_count() is always 0
+    // in release builds, read_handle<T>::active_count() is always 0
     // (the per-T global counter is only maintained under LRU_DEBUG). The
     // per-cache c.active_handle_count() is the authoritative source in
     // production. Under LRU_DEBUG the per-T global counter is maintained
@@ -417,7 +417,7 @@ TEST(ProductionActiveHandle, CacheMethodMatchesStatic) {
 #endif
 }
 
-// M-4-B: Per-cache sharded handle counter is maintained and exposed in
+// Per-cache sharded handle counter is maintained and exposed in
 // RELEASE builds (not just -DLRU_DEBUG=1). This guards against regressions
 // where the per-cache counter accidentally becomes DEBUG-only, which would
 // make production observability (stats_snapshot / prometheus_text) lose
@@ -482,7 +482,7 @@ TEST(ProductionIncrementalRehash, DefaultDisabled) {
     EXPECT_FALSE(c.incremental_rehash_enabled());
 }
 
-// T-P3: safe_cache / striped_cache now default to incremental rehash enabled
+// safe_cache / striped_cache now default to incremental rehash enabled
 // via safe_lru_trait / safe_sharded_lru_trait. This avoids global write stalls
 // when the hash table grows past its load factor.
 TEST(ProductionIncrementalRehash, SafeCacheDefaultEnabled) {
@@ -642,7 +642,7 @@ TEST(ProductionDiagnostics, TextOutputContainsFields) {
     EXPECT_NE(text.find("=== end diagnostics ==="), std::string::npos);
 }
 
-// T-M4: Verify the new cross-thread TLS backlog aggregate and per-shard
+// Verify the new cross-thread TLS backlog aggregate and per-shard
 // retire_pending fields are populated and exposed through diagnostics(),
 // diagnostics_text(), and prometheus_text(). These are the metrics
 // operators actually need to detect drain-worker starvation (a non-zero
@@ -694,14 +694,14 @@ TEST(ProductionDiagnostics, ActiveHandleCountReflected) {
 // ============================================================================
 // Task C: per-cache handle tracking
 //
-// P2-1: per_cache_handle_tracking_ now defaults to true. The per-T global
+// per_cache_handle_tracking_ now defaults to true. The per-T global
 // counter (sharded across 64 cache lines via P2-2) is only maintained
 // under LRU_DEBUG; in release builds the per-cache counter is the sole
 // source of active_handle_count.
 // ============================================================================
 TEST(ProductionPerCacheHandleTracking, DefaultOn) {
     cache<int, std::string> c(100);
-    // P2-1: default is now true (production behavior).
+    // default is now true (production behavior).
     EXPECT_TRUE(c.is_per_cache_handle_tracking_enabled());
 }
 
@@ -734,11 +734,11 @@ TEST(ProductionPerCacheHandleTracking, SnapshotReflectsPerCacheCount) {
 }
 
 // ============================================================================
-// P2-3: Streaming hot-key detection (Space-Saving algorithm)
+// Streaming hot-key detection (Space-Saving algorithm)
 //
-// Acceptance criteria from spec.md:
-//   1. top-100 hot Key 召回率 > 95% (recall > 95%)
-//   2. 查询耗时 < 1ms (query latency < 1ms)
+// Acceptance criteria:
+//   1. top-100 hot-key recall > 95%
+//   2. query latency < 1ms
 // ============================================================================
 TEST(ProductionStreamingHotKeys, TopKRecallHighSkew) {
     // Single-threaded deterministic workload with a clear hot-key

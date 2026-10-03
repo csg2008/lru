@@ -38,9 +38,11 @@
 #include <type_traits>
 #include <vector>
 
+#include "detail/intrusive_list.hpp"  // cache_item, used by the allocator below
+
 namespace lru {
 
-// 前向声明：detail 命名空间中的 intrusive_hook 用于 traits 特化
+// Forward declaration: detail::intrusive_hook is used by the traits specialisations.
 namespace detail { struct intrusive_hook; }
 
 // ============================================================================
@@ -141,8 +143,8 @@ private:
 /// Total size: 14 bytes (prev:4 + next:4 + update_time:4 + flags:1 + queue_id:1)
 /// vs. original intrusive_hook: 24 bytes (prev:8 + next:8 + update_time:4 + flags:1 + pad:3)
 ///
-/// 配合 intrusive_list 使用时需指定 Hook=compressed_intrusive_hook，
-/// 并将 intrustive_list 的 base 设为 compressed_region::base()。
+/// To use it with intrusive_list, set Hook = compressed_intrusive_hook and point
+/// intrusive_list's base at compressed_region::base().
 struct alignas(8) compressed_intrusive_hook {
     // Marker used by has_compressed_hook trait detection.
     static constexpr bool hook_is_compressed = true;
@@ -151,7 +153,7 @@ struct alignas(8) compressed_intrusive_hook {
     static constexpr uint8_t kTailFlag     = 1 << 0;
     static constexpr uint8_t kAccessedFlag = 1 << 1;
     static constexpr uint8_t kLinkedFlag   = 1 << 2;
-    // P0-3: pre-computed clear masks — see the note in detail/intrusive_list.hpp.
+    // pre-computed clear masks — see the note in detail/intrusive_list.hpp.
     static constexpr uint8_t kTailClearMask     = static_cast<uint8_t>(~kTailFlag);
     static constexpr uint8_t kAccessedClearMask = static_cast<uint8_t>(~kAccessedFlag);
     static constexpr uint8_t kLinkedClearMask   = static_cast<uint8_t>(~kLinkedFlag);
@@ -271,7 +273,7 @@ struct alignas(8) compressed_intrusive_hook {
 };
 
 // ============================================================================
-// hook_pointer_traits<compressed_intrusive_hook> 特化
+// Specialisation of hook_pointer_traits for compressed_intrusive_hook.
 // ============================================================================
 
 namespace detail {
@@ -281,9 +283,9 @@ struct hook_pointer_traits;
 
 } // namespace detail
 
-/// hook_pointer_traits 的压缩指针特化。
-/// 所有指针操作都通过 encode/decode 转换为 base 偏移。
-/// 当 is_end_prev/is_end_next 为 true 时，表示节点在链表边界。
+/// Compressed-pointer specialisation of hook_pointer_traits:
+/// every pointer operation goes through encode/decode to a base-relative offset.
+/// is_end_prev / is_end_next true means the node sits at a list boundary.
 template <>
 struct detail::hook_pointer_traits<compressed_intrusive_hook> {
     static void set_prev(compressed_intrusive_hook& h, void* p, void* base) {
@@ -329,20 +331,20 @@ struct trivial_destructor {
     }
 };
 
-/// 连续内存分配器，预分配一个大块连续空间，记录 base 地址供压缩指针使用。
+/// Contiguous-memory allocator: reserves one large block and records its base
 ///
-/// 把 `compressed_region` 与 `intrusive_list` 的 base 设为同一地址，
-/// 即可使 `compressed_intrusive_hook` 的偏移量解析正确：
+/// address for the compressed pointers. Giving `compressed_region` and
+/// `intrusive_list` the same base is what makes `compressed_intrusive_hook`'s
 ///
 ///   compressed_region region(num_items, sizeof(my_item));
 ///   intrusive_list<my_item, compressed_intrusive_hook> list(region.base());
 ///
-/// 约束：所有 item 必须通过 region.allocate() 分配（在预分配的连续块内）。
-/// 默认的 `new` 分配不保证地址连续性，无法配合压缩指针使用。
+/// Constraint: every item must be allocated by region.allocate(), i.e. inside the
+/// reserved block. Plain `new` gives no contiguity guarantee and cannot be used.
 class compressed_region {
 public:
-    /// @param item_count  预期的 item 数量
-    /// @param item_size   单个 item 的大小（sizeof(ItemType)）
+    /// @param item_count  Expected number of items.
+    /// @param item_size   Size of one item (sizeof(ItemType)).
     compressed_region(std::size_t item_count, std::size_t item_size)
         : item_size_(item_size), capacity_(item_count) {
         if (item_size_ == 0) {
@@ -370,12 +372,12 @@ public:
     compressed_region(const compressed_region&) = delete;
     compressed_region& operator=(const compressed_region&) = delete;
 
-    /// 返回基地址（所有 allocate 返回的 item 都在 [base, base + total_bytes) 范围内）。
+    /// Base address; every allocate() result lies in [base, base + total_bytes).
     void* base() const noexcept { return base_; }
 
-    /// 在预分配区域内 placement-new 构造一个 T 类型的 item。
-    /// 返回值指针在 [base, base + total_bytes) 内，可编码为 uint32_t 偏移。
-    /// 如果超出预分配空间，返回 nullptr。
+    /// Placement-new a T inside the reserved region.
+    /// The returned pointer lies in [base, base + total_bytes) and is encodable
+    /// as a uint32_t offset. Returns nullptr if the region is exhausted.
     template <typename T, typename... Args>
     T* allocate(Args&&... args) {
         std::lock_guard<std::mutex> lock(allocate_mutex_);
@@ -394,13 +396,13 @@ public:
         return ptr;
     }
 
-    /// 已使用的字节数。
+    /// Bytes currently in use.
     std::size_t used() const noexcept { return used_; }
 
-    /// 总字节数。
+    /// Total bytes available.
     std::size_t capacity() const noexcept { return capacity_ * item_size_; }
 
-    /// 剩余字节数。
+    /// Bytes still available.
     std::size_t remaining() const noexcept { return capacity_ * item_size_ - used_; }
 
 private:

@@ -32,7 +32,7 @@ namespace {
 using namespace std::chrono_literals;
 
 // ---------------------------------------------------------------------------
-// P1-9: only the winning retire may publish a deleter
+// only the winning retire may publish a deleter
 // ---------------------------------------------------------------------------
 
 struct DeleterProbe : lru::detail::hazptr_obj_base {
@@ -89,7 +89,7 @@ TEST(P1Reclaim, EbrDomainHasTheSameDeleterContract) {
 }
 
 // ---------------------------------------------------------------------------
-// P1-4: publish-then-reread
+// publish-then-reread
 // ---------------------------------------------------------------------------
 
 TEST(P1Reclaim, ProtectAndReloadConfirmsThePublishedValue) {
@@ -123,7 +123,7 @@ TEST(P1Reclaim, ProtectAndReloadRetriesUntilTheReloadAgrees) {
 }
 
 // ---------------------------------------------------------------------------
-// P1-7: the seqlock reader must not sleep waiting for a writer
+// the seqlock reader must not sleep waiting for a writer
 // ---------------------------------------------------------------------------
 
 TEST(P1Reclaim, SeqlockReadBeginDoesNotBlockOnAnActiveWriter) {
@@ -181,7 +181,7 @@ TEST(P1Reclaim, SeqlockSnapshotStaysConsistentUnderAConcurrentWriter) {
 }
 
 // ---------------------------------------------------------------------------
-// P1-10: the pending ledger tracks the real backlog
+// the pending ledger tracks the real backlog
 // ---------------------------------------------------------------------------
 
 TEST(P1Reclaim, PendingLedgerTracksRetireAndReclaim) {
@@ -209,11 +209,11 @@ TEST(P1Reclaim, PendingLedgerTracksRetireAndReclaim) {
 }
 
 // ---------------------------------------------------------------------------
-// P1-11 / P1-12: process-lifetime domains and one sentinel contract
+// process-lifetime domains and one sentinel contract
 // ---------------------------------------------------------------------------
 
 TEST(P1Reclaim, DomainsAreProcessLifetimeAndShareTheSentinel) {
-    // P1-11: the accessor returns a stable reference that is never destroyed, so
+    // the accessor returns a stable reference that is never destroyed, so
     // repeated calls must yield the same object (a leaked, process-lifetime
     // domain rather than a function-local static that a late thread could see
     // being torn down).
@@ -222,7 +222,7 @@ TEST(P1Reclaim, DomainsAreProcessLifetimeAndShareTheSentinel) {
     EXPECT_EQ(&lru::detail::epoch_domain::default_domain(),
               &lru::detail::epoch_domain::default_domain());
 
-    // P1-12: both domains expose the SAME sentinel contract, so a noexcept
+    // both domains expose the SAME sentinel contract, so a noexcept
     // caller has exactly one degradation path to handle.
     static_assert(lru::detail::hazptr_domain::npos ==
                   lru::detail::epoch_domain::npos);
@@ -230,7 +230,7 @@ TEST(P1Reclaim, DomainsAreProcessLifetimeAndShareTheSentinel) {
 }
 
 // ---------------------------------------------------------------------------
-// P1-36: reset() must not discard concurrent updates
+// reset() must not discard concurrent updates
 // ---------------------------------------------------------------------------
 
 TEST(P1Reclaim, ShardedCounterResetDoesNotLoseConcurrentUpdates) {
@@ -265,7 +265,7 @@ TEST(P1Reclaim, ShardedCounterResetDoesNotLoseConcurrentUpdates) {
 }
 
 // ---------------------------------------------------------------------------
-// P1-39: set_interval() must not run the task spuriously
+// set_interval() must not run the task spuriously
 // ---------------------------------------------------------------------------
 
 TEST(P1Reclaim, PeriodicWorkerIntervalChangeDoesNotRunTheTaskEarly) {
@@ -295,7 +295,7 @@ TEST(P1Reclaim, PeriodicWorkerIntervalChangeDoesNotRunTheTaskEarly) {
 }
 
 // ---------------------------------------------------------------------------
-// P1-35: kReject must deliver every event exactly once
+// kReject must deliver every event exactly once
 // ---------------------------------------------------------------------------
 
 TEST(P1Reclaim, AsyncRejectPolicyDispatchesEachEventExactlyOnce) {
@@ -340,7 +340,7 @@ TEST(P1Reclaim, AsyncRejectPolicyDispatchesEachEventExactlyOnce) {
     EXPECT_EQ(seen_keys.size(), static_cast<std::size_t>(kEvents));
 }
 
-// P1-33 (fix.01 方案 A): a handle may outlive its cache; releasing it must be safe.
+// A handle may outlive its cache; releasing it must be safe.
 //
 // These two tests are compiled ONLY when assertions are disabled. In an
 // assert-enabled build `~unified_cache()` deliberately fails with

@@ -232,7 +232,7 @@ TEST(LatencyHistogramSum, ConcurrentRecordProducesExactSum) {
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     for (int t = 0; t < num_threads; ++t) {
-        // P0-3: per_thread is a constant expression, so capturing it is
+        // per_thread is a constant expression, so capturing it is
         // unnecessary (-Wunused-lambda-capture).
         threads.emplace_back([&h]() {
             for (int i = 1; i <= per_thread; ++i) {
@@ -249,7 +249,7 @@ TEST(LatencyHistogramSum, ConcurrentRecordProducesExactSum) {
 }
 
 // ============================================================================
-// T12.1 / T12.2: set_latency_sample_rate() — deterministic sampling
+// set_latency_sample_rate() — deterministic sampling
 // ============================================================================
 TEST(LatencyHistogramSampleRate, DefaultRateIsOne) {
     latency_histogram h;
@@ -295,7 +295,7 @@ TEST(LatencyHistogramSampleRate, MinMaxStillAccurateUnderSampling) {
 }
 
 // ============================================================================
-// T12.3: release_memory() — clear all data on disable
+// release_memory() — clear all data on disable
 // ============================================================================
 TEST(LatencyHistogramReleaseMemory, ClearsAllCounters) {
     latency_histogram h;
@@ -355,7 +355,7 @@ TEST(LatencyHistogramSum, ConcurrentRecordDistinctValuesExactSum) {
     const uint64_t tri = static_cast<uint64_t>(per_thread) * (per_thread + 1) / 2;
     uint64_t expected_sum = 0;
     for (int t = 0; t < num_threads; ++t) {
-        // P0-3: (base * t) needs an explicit unsigned conversion — base is
+        // (base * t) needs an explicit unsigned conversion — base is
         // uint64_t while t is int, and this project builds with
         // -Wsign-conversion.
         expected_sum += static_cast<uint64_t>(per_thread) *
@@ -367,7 +367,7 @@ TEST(LatencyHistogramSum, ConcurrentRecordDistinctValuesExactSum) {
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     for (int t = 0; t < num_threads; ++t) {
-        // P0-3: base is a constant expression and per_thread is unused inside
+        // base is a constant expression and per_thread is unused inside
         // the lambda body -> neither needs capturing.
         threads.emplace_back([&h, t]() {
             for (int i = 1; i <= per_thread; ++i) {

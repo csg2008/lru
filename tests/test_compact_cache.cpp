@@ -488,7 +488,7 @@ TEST(CompactCacheAliasTest, CompactCacheWithPolicyIsThreadSafe) {
 }
 
 // ============================================================================
-// T14: Production-grade API integration tests
+// Production-grade API integration tests
 //
 // Verifies that compact_cache exposes the same observability/controllability
 // surface as unified_cache: stats_snapshot, prometheus_text, diagnostics,
@@ -681,7 +681,7 @@ TEST(CompactCacheProductionApi, SingleThreadedSetFairnessModeIsNoOp) {
 }
 
 // ============================================================================
-// T14: striped_compact_cache alias verification
+// striped_compact_cache alias verification
 // ============================================================================
 
 TEST(StripedCompactCacheAliasTest, IsThreadSafe) {

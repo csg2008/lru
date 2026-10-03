@@ -1,4 +1,4 @@
-// T15: Compressed pointer cache integration tests
+// Compressed pointer cache integration tests
 //
 // Verifies:
 //   - compressed_lru_trait correctly sets Hook = compressed_intrusive_hook
@@ -18,7 +18,7 @@
 using namespace lru;
 
 // ============================================================================
-// T15.1: cache_trait Hook template parameter
+// cache_trait Hook template parameter
 // ============================================================================
 
 TEST(CompressedCacheTraitTest, DefaultHookIsIntrusiveHook) {
@@ -48,7 +48,7 @@ TEST(CompressedCacheTraitTest, CompressedTraitPreservesOtherDefaults) {
 }
 
 // ============================================================================
-// T15.2: compressed_cache / safe_compressed_cache / striped_compressed_cache
+// compressed_cache / safe_compressed_cache / striped_compressed_cache
 // ============================================================================
 
 TEST(CompressedCacheAliasTest, CompressedCacheCompilesAndOperates) {
@@ -91,7 +91,7 @@ TEST(CompressedCacheAliasTest, TraitReportsCompressedHook) {
 }
 
 // ============================================================================
-// T15.4: Memory savings estimation helpers
+// Memory savings estimation helpers
 //
 // Note: per-item savings depend on struct layout and padding. For small K/V
 // types like int/int, padding can absorb the hook savings at the cache_item

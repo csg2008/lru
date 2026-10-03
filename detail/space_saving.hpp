@@ -88,7 +88,7 @@ public:
             return;
         }
         // Capacity full: find the true minimum via lazy deletion.
-        // T-P2-4 (R-8): replaced O(K) std::min_element scan with O(log K)
+        // replaced O(K) std::min_element scan with O(log K)
         // amortized min-heap pop. Stale entries (where the key's count in
         // map_ has increased since it was pushed) are filtered out by
         // comparing heap count to map count. Each stale entry is refreshed
@@ -145,7 +145,7 @@ public:
         map_.emplace(key, new_count);
         heap_.push(Entry{new_count, key});
 
-        // T-P2-4 (R-8): Bound heap growth. Each add() that triggers
+        // Bound heap growth. Each add() that triggers
         // eviction pushes at most 2 entries (1 refresh + 1 new). Over
         // many operations, the heap could grow to O(updates) if we
         // never trimmed. When heap size exceeds 4x capacity, rebuild

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// T-G14: EBR force-advance UAF scenario test.
+// EBR force-advance UAF scenario test.
 //
 // Verifies that the default kFailAdvance policy does NOT cause UAF
 // when an EBR slot is stuck (thread parked indefinitely). Under the

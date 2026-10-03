@@ -34,9 +34,8 @@ endif()
 lru_add_internal_executable(lru_cache_test
     test_cache.cpp
     test_cache_stats.cpp
-    # P0 regression: API-surface instantiation. Keeps P0-1 (striped-alias
-    # constructibility on GCC) and P0-2 (formerly uncompilable public API
-    # methods) from silently regressing.
+    # API-surface instantiation. Keeps striped-alias constructibility on GCC
+    # and the formerly uncompilable public API methods from regressing.
     test_api_surface.cpp
     test_compact_cache.cpp
     test_lfu_cache.cpp
@@ -46,7 +45,7 @@ lru_add_internal_executable(lru_cache_test
     test_eviction.cpp
     test_stress.cpp
     test_slab_memory.cpp
-    # spec/fix.01.md §3.3 (P1-13 … P1-18): slab allocator + memory monitor
+    # Slab allocator and memory monitor:
     # regression tests (ABA tag, wrong-size deallocation, NUMA owner routing,
     # gauge accounting, hard memory cap, per-class live/peak/failure counters).
     test_memory_p1.cpp
@@ -66,7 +65,7 @@ lru_add_internal_executable(lru_cache_test
     test_f14_diagnostics.cpp
     test_tls_event_backup.cpp
     test_ebr_integration.cpp
-    # Concurrency test supplement (specs/concurrency-tests/spec.md)
+    # Concurrency test supplement.
     test_concurrent_edge.cpp
     test_concurrent_callback.cpp
     test_concurrent_rehash.cpp
@@ -83,32 +82,37 @@ lru_add_internal_executable(lru_cache_test
     test_max_size_strict.cpp
     test_save_atomic.cpp
     test_prometheus_per_shard_detail.cpp
-    # T-G14: production-read-heavy-eval test coverage
+    # production-read-heavy-eval test coverage
     test_128_threads_soak.cpp
     test_ttl_cache_concurrent_cleanup.cpp
     test_ebr_force_advance_uaf.cpp
-    # G22: regression tests for G1 (TTL lazy delete), G7 (async kReject),
-    # and pooled_cache basic functionality.
+    # TTL lazy delete, the async rejection policy, and pooled_cache basics.
     test_ttl_lazy_delete.cpp
     test_async_callback_reject_policy.cpp
     test_pooled_cache.cpp
-    # fix.01 §3.4/§3.5 regression batch (P1-19 … P1-44): single admission gate,
-    # record_access guards, replace_node coherence, W-TinyLFU window/main swap,
-    # strict capacity, eviction-cursor LRU order, pop_lru accounting, TTL.
+    # Admission and capacity regressions: the single admission gate, the
+    # record_access guards, replace_node coherence, the W-TinyLFU window/main
+    # swap, strict capacity, eviction-cursor LRU order, pop_lru accounting, TTL.
     test_mm_p1.cpp
-    # fix.01 §3.1/§3.2 regression batch: reclamation, seqlock and background
-    # worker contracts (P1-1, P1-4, P1-7, P1-9 … P1-12, P1-35, P1-36, P1-39).
+    # Reclamation, seqlock and background-worker contracts.
     test_reclaim_p1.cpp
-    # fix.01 §3.4 regression batch: CountMinSketch sizing from capacity and
-    # whole-table decay with a geometrically shrinking window (P1-25, P1-26).
+    # CountMinSketch sizing from capacity, and whole-table decay with a
+    # geometrically shrinking window.
     test_cms_p1.cpp
-    # fix.01 §3.5 regression batch: the strategy-agnostic TTL expiry index used
-    # by P1-31 (detail::ttl_heap) — sweep/budget/stale/pinned-deferral contracts.
+    # The strategy-agnostic TTL expiry index (detail::ttl_heap): sweep, budget,
+    # stale-entry and pinned-deferral contracts.
     test_ttl_heap_p1.cpp
-    # fix.01 §3.4/§3.6 completion batch: item-level TTL for EVERY eviction
-    # strategy with a single O(log n) sweep path (P1-31), and the 2Q A1out ghost
-    # queue (P1-28).
+    # Item-level TTL for EVERY eviction strategy through one O(log n) sweep, and
+    # the 2Q A1out ghost queue.
     test_mm_2q_ghost_p1.cpp
+    # The per-bucket shared_spinlock wake protocol: a parked reader MUST be
+    # released by the writer's unlock(). Dropping that wake (which an earlier
+    # revision did when the state word showed no waiter) strands every queued
+    # reader, and this lock guards every hash bucket.
+    test_spinlock_wakeup.cpp
+    # Asynchronous write-back must not replay an evicted value after the caller
+    # has set()/del()ed that key.
+    test_tiered_writeback.cpp
 )
 target_link_libraries(lru_cache_test PRIVATE GTest::gtest_main)
 

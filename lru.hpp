@@ -24,7 +24,7 @@
 // Internal utilities (utils + periodic_worker + striped_mutex)
 #include "detail/foundation.hpp"
 
-// P0-A: well-mixed default hash.
+// well-mixed default hash.
 // ankerl::unordered_dense::hash provides high-quality mixing for integer keys
 // (splitmix64-based), eliminating the "identity hash + no shard mixing" hot
 // shard problem documented in P0-A. It is already a hard dependency of the
@@ -160,7 +160,7 @@ using fifo_cache_raw = mm_fifo<Key, Value, Hash, KeyEqual>;
 // ============================================================================
 
 /// Single-threaded LRU cache (unified_cache + lru_trait).
-/// 用法：lru::cache<int, std::string> c(100);
+/// Usage: lru::cache<int, std::string> c(100);
 template <typename Key, typename Value,
           typename Hash = default_hash<Key>,
           typename KeyEqual = std::equal_to<Key>>
@@ -172,7 +172,7 @@ using cache = unified_cache<lru_trait<single_threaded_policy>, Key, Value, Hash,
 /// concurrent reads. For production read-heavy workloads, prefer
 /// production_cache, striped_cache, or segmented_striped_cache.
 ///
-/// T-P3 (R-1 / R-2): This alias now defaults to production-safe settings:
+/// This alias now defaults to production-safe settings:
 ///   - `reader_preferred` fairness (max read throughput, may starve writers
 ///     under sustained read load — acceptable for read-heavy-write-light,
 ///     the documented target of this library). Call
@@ -186,7 +186,7 @@ using cache = unified_cache<lru_trait<single_threaded_policy>, Key, Value, Hash,
 /// defaults can instantiate
 /// `lru::unified_cache<lru::lru_trait<lru::thread_safe_policy>, K, V>` directly.
 ///
-/// 用法：lru::safe_cache<int, std::string> c(100);
+/// Usage: lru::safe_cache<int, std::string> c(100);
 template <typename Key, typename Value,
           typename Hash = default_hash<Key>,
           typename KeyEqual = std::equal_to<Key>>
@@ -195,7 +195,7 @@ using safe_cache = unified_cache<safe_lru_trait<thread_safe_policy>, Key, Value,
 /// Striped thread-safe LRU cache (unified_cache + safe_sharded_lru_trait + striped_thread_safe_policy<>).
 /// Uses sharded_mm_lru with per-shard striped locking for high concurrency.
 ///
-/// T-P3 (R-1 / R-2): This alias now defaults to production-safe settings:
+/// This alias now defaults to production-safe settings:
 ///   - `reader_preferred` fairness (max read throughput, may starve writers
 ///     under sustained read load — acceptable for read-heavy-write-light).
 ///     Call `c.set_fairness_mode(lru::detail::fairness_mode::writer_fair)`
@@ -392,7 +392,7 @@ using segmented_striped_cache = unified_cache<segmented_sharded_lru_trait<stripe
 ///   - Striped locking: 64-stripe mutex allows concurrent reads to different keys.
 ///   - Lock-free read path: get() uses find_and_pin() with optimistic read fallback.
 ///
-/// R2: EmbeddedChain enforcement. production_cache uses EmbeddedChain=true
+/// EmbeddedChain enforcement. production_cache uses EmbeddedChain=true
 /// (compile-time asserted in mm.hpp). This is a hard requirement for
 /// lock-free reads — non-EmbeddedChain mode degrades to shared_lock reads
 /// (use-after-free prevention), killing throughput under 32+ thread read
@@ -404,7 +404,7 @@ template <typename Key, typename Value,
           typename KeyEqual = std::equal_to<Key>>
 using production_cache = unified_cache<production_sharded_lru_trait<striped_thread_safe_policy<>>, Key, Value, Hash, KeyEqual>;
 
-/// T-G16: Production cache with slab allocator enabled.
+/// Production cache with slab allocator enabled.
 ///
 /// Same as production_cache but additionally enables the slab allocator
 /// for item allocation. Reduces memory overhead for caches with many
@@ -427,7 +427,7 @@ using production_cache_with_slab = unified_cache<production_with_slab_sharded_lr
 // Read-heavy convenience aliases
 // ============================================================================
 //
-// R-3: These aliases now use the dedicated `read_heavy_*_trait` types
+// These aliases now use the dedicated `read_heavy_*_trait` types
 // (defined in cache_trait.hpp), which opt in to:
 //   - defer_promotion=true (TLS-batched LRU promotion, no write-lock on hit)
 //   - auto_enable_ebr=true (LRU/sharded variants only — faster read path
@@ -472,7 +472,7 @@ template <typename Key, typename Value,
 using read_heavy_w_tiny_lfu = unified_cache<read_heavy_w_tiny_lfu_trait<thread_safe_policy>, Key, Value, Hash, KeyEqual>;
 
 // ============================================================================
-// R-1 / R-4: Removed factory functions
+// Removed factory functions
 // ============================================================================
 //
 // The following factory functions have been removed because their behavior
@@ -525,7 +525,7 @@ using segmented_fifo_cache = unified_cache<segmented_fifo_trait<single_threaded_
 // ============================================================================
 
 /// Single-threaded compact cache for small key-value pairs.
-/// 用法：lru::compact_cache<int, int> c(10000);
+/// Usage: lru::compact_cache<int, int> c(10000);
 template <typename Key, typename Value,
           typename Hash = default_hash<Key>,
           typename KeyEqual = std::equal_to<Key>,
@@ -534,15 +534,15 @@ using compact_cache_default = compact_cache<Key, Value, Hash, KeyEqual, kMaxItem
 
 /// Thread-safe compact cache — alias defined in compact_cache.hpp.
 /// Includes kSlotAlignment parameter for full customization.
-/// 用法：lru::safe_compact_cache<int, int> c(10000);
+/// Usage: lru::safe_compact_cache<int, int> c(10000);
 
-/// T14: Striped thread-safe compact cache — alias defined in compact_cache.hpp.
+/// Striped thread-safe compact cache — alias defined in compact_cache.hpp.
 /// API-symmetric with lru::striped_cache for code that swaps between
 /// unified_cache and compact_cache behind a common interface.
-/// 用法：lru::striped_compact_cache<int, int> c(10000);
+/// Usage: lru::striped_compact_cache<int, int> c(10000);
 
 // ============================================================================
-// T15: Compressed pointer cache convenience aliases
+// Compressed pointer cache convenience aliases
 // ============================================================================
 //
 // compressed_cache uses the compressed_lru_trait, which sets
@@ -576,7 +576,7 @@ template <typename Key, typename Value,
 using striped_compressed_cache = unified_cache<compressed_sharded_lru_trait<striped_thread_safe_policy<>>, Key, Value, Hash, KeyEqual>;
 
 // ============================================================================
-// T14.2: Unified compact cache aliases
+// Unified compact cache aliases
 // ============================================================================
 //
 // These aliases instantiate unified_cache with the compact_unified_*_trait,
@@ -701,55 +701,163 @@ struct config {
     }
 };
 
+/// Outcome of apply_config(): which knobs were pushed onto the cache, which the
+/// target does not support, and which it refused.
+///
+/// This report is the mechanism that makes "declared but inert" configuration
+/// impossible to hide. A field the cache cannot honour lands in `skipped` or
+/// `rejected` instead of being silently dropped, so a deployment can assert
+/// `all_applied()` at startup and an operator reading diagnostics can see why a
+/// knob did not take effect.
+struct apply_report {
+    std::vector<std::string> applied;
+    std::vector<std::string> skipped;   ///< the target cache does not implement this knob
+    std::vector<std::string> rejected;  ///< the target cannot change it post-construction
+
+    bool all_applied() const noexcept { return skipped.empty() && rejected.empty(); }
+
+    std::string to_string() const {
+        auto join = [](const std::vector<std::string>& v) {
+            std::string s;
+            for (const auto& e : v) {
+                if (!s.empty()) s += ", ";
+                s += e;
+            }
+            return s.empty() ? std::string("-") : s;
+        };
+        return "apply_report{applied=[" + join(applied) +
+               "] skipped=[" + join(skipped) +
+               "] rejected=[" + join(rejected) + "]}";
+    }
+};
+
 /// Push a `lru::config` onto an existing cache.
 ///
-/// Call after construction (the cache's own constructor still owns capacity
-/// sizing). Every step is guarded, so passing a cache that does not implement
-/// a knob is a no-op for that knob rather than a compile error.
+/// Call after construction. `max_size` / `max_memory` are applied when the
+/// cache supports them; the stripe and shard counts size arrays allocated by
+/// the constructor, so they are reported rather than silently ignored. Returns
+/// an `apply_report` naming every field's fate — see apply_report.
 template <typename Cache>
-void apply_config(Cache& c, const config& cfg) {
+apply_report apply_config(Cache& c, const config& cfg) {
     cfg.validate();
+    apply_report report;
 
-    if (cfg.max_size != unlimited) c.max_size(cfg.max_size);
+    auto ok = [&report](const char* name) { report.applied.emplace_back(name); };
+    auto skip = [&report](const char* name) { report.skipped.emplace_back(name); };
+    auto reject = [&report](const char* name, std::string why) {
+        report.rejected.emplace_back(std::string(name) + " (" + std::move(why) + ")");
+    };
+
+    // --- capacity / memory -------------------------------------------
+    if constexpr (requires { c.max_size(cfg.max_size); }) {
+        if (cfg.max_size != unlimited) c.max_size(cfg.max_size);
+        ok("max_size");
+    } else {
+        skip("max_size");
+    }
     if constexpr (requires { c.max_memory(cfg.max_memory); }) {
         if (cfg.max_memory != unlimited) c.max_memory(cfg.max_memory);
-    }
-    if constexpr (requires { c.set_defer_promotion(true); }) {
-        c.set_defer_promotion(cfg.defer_promotion);
-    }
-    if constexpr (requires { c.set_incremental_rehash(true); }) {
-        c.set_incremental_rehash(cfg.incremental_rehash);
-    }
-    if constexpr (requires { c.set_fairness_mode(cfg.fairness); }) {
-        c.set_fairness_mode(cfg.fairness);
+        ok("max_memory");
+    } else {
+        skip("max_memory");
     }
     if constexpr (requires { c.set_memory_watermarks(0.0, 0.0); }) {
         c.set_memory_watermarks(cfg.memory_soft_watermark, cfg.memory_critical_watermark);
+        ok("memory_watermarks");
+    } else {
+        skip("memory_watermarks");
     }
-    if constexpr (requires { c.set_ttl_jitter_enabled(true); }) {
-        c.set_ttl_jitter_enabled(cfg.ttl_jitter_enabled);
-        c.set_ttl_jitter_pct(cfg.ttl_jitter_pct);
+
+    // --- construction-only: stripes and shards -----------------------
+    // These size fixed arrays allocated by the cache constructor, so they
+    // cannot be changed afterwards. Report the truth: either the live cache
+    // already matches, or the caller must pass the value to the constructor.
+    if constexpr (requires { c.num_stripes(); }) {
+        if (c.num_stripes() == cfg.num_stripes) ok("num_stripes");
+        else reject("num_stripes", "construction-only; pass it to the cache constructor");
+    } else {
+        skip("num_stripes");
     }
-    if constexpr (requires { c.set_ttl_cleaner_round_robin(true); }) {
-        c.set_ttl_cleaner_round_robin(cfg.ttl_cleaner_round_robin);
+    if constexpr (requires { c.num_shards(); }) {
+        if (c.num_shards() == cfg.num_shards) ok("num_shards");
+        else reject("num_shards", "construction-only; pass it to the cache constructor");
+    } else {
+        skip("num_shards");
     }
-    if constexpr (requires { c.set_async_callbacks(true); }) {
-        c.set_async_callbacks(cfg.async_callbacks);
+
+    // --- concurrency --------------------------------------------------
+    if constexpr (requires { c.set_incremental_rehash(true); }) {
+        c.set_incremental_rehash(cfg.incremental_rehash);
+        ok("incremental_rehash");
+    } else {
+        skip("incremental_rehash");
     }
-    if constexpr (requires { c.set_latency_tracking(true); }) {
-        c.set_latency_tracking(cfg.latency_tracking);
+    if constexpr (requires { c.set_defer_promotion(true); }) {
+        c.set_defer_promotion(cfg.defer_promotion);
+        ok("defer_promotion");
+    } else {
+        skip("defer_promotion");
+    }
+    if constexpr (requires { c.set_fairness_mode(cfg.fairness); }) {
+        c.set_fairness_mode(cfg.fairness);
+        ok("fairness");
+    } else {
+        skip("fairness");
     }
     if constexpr (requires { c.set_ebr_domain(&detail::epoch_domain::default_domain()); }) {
         if (cfg.ebr) {
             // Guarded no-op for strategies that do not support EBR.
             c.set_ebr_domain(&detail::epoch_domain::default_domain());
         }
+        ok("ebr");
+    } else {
+        skip("ebr");
+    }
+
+    // --- TTL ----------------------------------------------------------
+    if constexpr (requires { c.set_ttl_jitter_enabled(true); }) {
+        c.set_ttl_jitter_enabled(cfg.ttl_jitter_enabled);
+        c.set_ttl_jitter_pct(cfg.ttl_jitter_pct);
+        ok("ttl_jitter");
+    } else {
+        skip("ttl_jitter");
+    }
+    if constexpr (requires { c.set_ttl_cleaner_round_robin(true); }) {
+        c.set_ttl_cleaner_round_robin(cfg.ttl_cleaner_round_robin);
+        ok("ttl_cleaner_round_robin");
+    } else {
+        skip("ttl_cleaner_round_robin");
+    }
+    if constexpr (requires { c.set_ttl_evict_batch_size(std::size_t{1}); }) {
+        c.set_ttl_evict_batch_size(cfg.ttl_evict_batch_size);
+        ok("ttl_evict_batch_size");
+    } else {
+        skip("ttl_evict_batch_size");
     }
     if constexpr (requires { c.start_ttl_cleaner(std::chrono::milliseconds{1}); }) {
         if (cfg.ttl_cleaner_interval.count() > 0) {
             c.start_ttl_cleaner(cfg.ttl_cleaner_interval);
         }
+        ok("ttl_cleaner_interval");
+    } else {
+        skip("ttl_cleaner_interval");
     }
+
+    // --- observability / callbacks ------------------------------------
+    if constexpr (requires { c.set_async_callbacks(true); }) {
+        c.set_async_callbacks(cfg.async_callbacks);
+        ok("async_callbacks");
+    } else {
+        skip("async_callbacks");
+    }
+    if constexpr (requires { c.set_latency_tracking(true); }) {
+        c.set_latency_tracking(cfg.latency_tracking);
+        ok("latency_tracking");
+    } else {
+        skip("latency_tracking");
+    }
+
+    return report;
 }
 
 // Out-of-line definitions for unified_cache::save() / load()
@@ -813,7 +921,7 @@ auto collect_snapshot(const MM& mm) {
         const auto& c = mm.config();
         snap.config.lru_refresh_time = mm.refresh_time();
         snap.config.lru_refresh_ratio = c.lru_refresh_ratio;
-        // P1-25: serialized_mm_config carries the CacheLib CMS sizing trio
+        // serialized_mm_config carries the CacheLib CMS sizing trio
         // (window_multiplier / error_threshold / hash_count), not the removed
         // `cms_error_rate`. Without these three the restored sketch would have
         // a dimension that disagrees with the restored counters.
@@ -1004,7 +1112,7 @@ unified_cache<Trait, Key, Value, Hash, KeyEqual>::load(
         // Sharded: parse all shard data without lock, then rebuild under lock
         auto shard_parsed = detail::parse_sharded_serialized_data<Key, Value>(data);
         flush_guard fg{mm_};
-        // P-CRIT-2 (T-C2): For sharded_mm_lru, acquire per-shard write locks
+        // For sharded_mm_lru, acquire per-shard write locks
         // (the stripe lock does NOT protect MM data — see T3.4 bugfix).
         auto lock = acquire_write_lock_all_shards();
         detail::rebuild_sharded_from_parsed(mm_, shard_parsed);
@@ -1036,7 +1144,7 @@ unified_cache<Trait, Key, Value, Hash, KeyEqual>::save_per_shard() {
         // Per-shard: lock each shard in shared mode, snapshot, release.
         // This allows writes to other shards to proceed.
         //
-        // P-CRIT-2 (T-C2): For sharded_mm_lru, acquire the per-shard read
+        // For sharded_mm_lru, acquire the per-shard read
         // lock (NOT the stripe lock — stripe lock does not protect MM data,
         // see T3.4 bugfix). For non-sharded MM with striped locking,
         // acquire_read_lock_for_shard() falls back to the stripe lock.
@@ -1094,7 +1202,7 @@ unified_cache<Trait, Key, Value, Hash, KeyEqual>::load_per_shard(
             throw std::runtime_error("load_per_shard: num_shards mismatch");
         }
         // Phase 2: rebuild each shard under only that shard's write lock.
-        // P-CRIT-2 (T-C2): For sharded_mm_lru, acquire the per-shard write
+        // For sharded_mm_lru, acquire the per-shard write
         // lock (NOT the stripe lock — see T3.4 bugfix). For non-sharded MM
         // with striped locking, acquire_write_lock_for_shard() falls back
         // to the stripe lock.
@@ -1109,7 +1217,7 @@ unified_cache<Trait, Key, Value, Hash, KeyEqual>::load_per_shard(
 }
 
 // ============================================================================
-// P2-3: save_atomic — strictly-atomic cross-shard snapshot
+// save_atomic — strictly-atomic cross-shard snapshot
 // ============================================================================
 
 template <typename Trait, typename Key, typename Value,
@@ -1125,7 +1233,7 @@ unified_cache<Trait, Key, Value, Hash, KeyEqual>::save_atomic(
         // would add cost without strengthening the guarantee.
         return save();
     } else {
-        // P2-3: Strictly-atomic cross-shard snapshot.
+        // Strictly-atomic cross-shard snapshot.
         //
         // 1. shutdown_and_wait() — rejects new operations and waits for
         //    outstanding read_handles to be released. Without this, a
@@ -1134,7 +1242,7 @@ unified_cache<Trait, Key, Value, Hash, KeyEqual>::save_atomic(
         //    snapshot would not be safely reproducible and continuing
         //    could deadlock if the handle holder is blocked on this
         //    thread.
-        // P1-40 (fix.01 方案 A): QUIESCE, do not shut down.
+        // QUIESCE, do not shut down.
         //
         // This used to call shutdown_and_wait(), which sets `closed_`
         // permanently — so one backup job silently took the cache out of service
@@ -1201,7 +1309,7 @@ unified_cache<Trait, Key, Value, Hash, KeyEqual>::save_atomic(
 }
 
 // ============================================================================
-// T-G15: save_atomic_or_per_shard — atomic-or-per-shard with degradation
+// save_atomic_or_per_shard — atomic-or-per-shard with degradation
 // ============================================================================
 
 template <typename Trait, typename Key, typename Value,

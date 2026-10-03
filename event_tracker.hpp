@@ -103,7 +103,7 @@ public:
         /// Record promote/demote events.
         bool record_movements = true;
 
-        /// P2-3: Capacity of the streaming Space-Saving top-k summary used
+        /// Capacity of the streaming Space-Saving top-k summary used
         /// for hot-key detection. Larger capacity → better recall and
         /// tighter error bound, more memory. Set to 0 to disable streaming
         /// hot-key tracking (top_keys() will fall back to the O(N) scan).
@@ -129,7 +129,7 @@ public:
 
     ~event_tracker() {
         stop_drain_worker();
-        // P2-D: callback storage is now a shared_ptr — its refcount-based
+        // callback storage is now a shared_ptr — its refcount-based
         // cleanup handles deferred deletion automatically. No manual
         // pending_callbacks_ vector to drain.
     }
@@ -215,7 +215,7 @@ public:
     /// Writes to the per-thread TLS ring buffer (lock-free).
     /// No-op when the tracker is disabled (`disable()` was called).
     void record(const key_type& key, event_type type, uint8_t queue_id = 0) {
-        // P2-D: fast-path early return when disabled. Relaxed load is
+        // fast-path early return when disabled. Relaxed load is
         // safe — a stale `true` just records one extra event before the
         // disable takes effect, which is benign for an idempotent
         // monitoring ring.
@@ -249,7 +249,7 @@ public:
         process_events(stolen.entries, src_start, stolen.count(), kMask);
     }
 
-    /// P2-3: Drain ALL threads' TLS event rings for this tracker.
+    /// Drain ALL threads' TLS event rings for this tracker.
     ///
     /// Unlike `drain_tls()` (which only drains the calling thread), this
     /// method walks the global per-thread ring registry and drains every
@@ -447,7 +447,7 @@ public:
     // "Hot Keys" Analysis (P2-3: streaming via Space-Saving)
     // --------------------------------------------------------------------
 
-    /// P2-3: Set a callback to convert a key hash back to a human-readable
+    /// Set a callback to convert a key hash back to a human-readable
     /// key name. This enables `top_keys_with_names()` to return readable
     /// key identifiers instead of raw 64-bit hashes.
     ///
@@ -462,12 +462,12 @@ public:
 
     /// Top-K most frequently accessed keys (from hit events only).
     ///
-    /// P2-3: Now uses the streaming Space-Saving algorithm for O(1) amortized
+    /// Now uses the streaming Space-Saving algorithm for O(1) amortized
     /// update and O(K log K) query, replacing the previous O(N) batch scan.
     /// Drains ALL threads' TLS buffers first (via `drain_all_threads()`) to
     /// ensure the result reflects every thread's hit activity.
     ///
-    /// P2-9 (double buffering): The query path is now lock-free — it loads
+    /// The query path is now lock-free — it loads
     /// an atomic `shared_ptr` to the active Space-Saving instance and reads
     /// from it without taking any mutex. This ensures `top_keys()` is never
     /// blocked by a concurrent drain operation (which writes to a separate
@@ -477,7 +477,7 @@ public:
     /// The estimated count is an upper bound; the true count is >= estimated
     /// count - error_bound() (see `hot_keys_stats()`).
     std::vector<std::pair<uint64_t, std::size_t>> top_keys(std::size_t k = 10) const {
-        // P2-9: Read from the active instance via atomic shared_ptr load.
+        // Read from the active instance via atomic shared_ptr load.
         // No mutex is acquired — queries are never blocked by drain operations.
         // Callers wanting the freshest data should call `drain_all_threads()`
         // (or rely on the background drain worker) before querying.
@@ -491,13 +491,13 @@ public:
         return ptr->top_k(k);
     }
 
-    /// P2-3: Top-K hot keys with human-readable names (via `set_key_to_string`).
+    /// Top-K hot keys with human-readable names (via `set_key_to_string`).
     ///
     /// Returns key_name → estimated hit count pairs, sorted by count descending.
     /// If no `key_to_string_cb_` callback is set, the key name is the hash
     /// formatted as a hexadecimal string.
     ///
-    /// P2-9: The top-K query is lock-free (reads from the active instance
+    /// The top-K query is lock-free (reads from the active instance
     /// via atomic shared_ptr). The callback is copied under the drain mutex
     /// (brief — only during configuration changes), so this method is
     /// effectively non-blocking during drain.
@@ -526,7 +526,7 @@ public:
         return result;
     }
 
-    /// P2-3: Streaming hot-keys summary statistics.
+    /// Streaming hot-keys summary statistics.
     struct hot_keys_stats {
         std::size_t capacity = 0;       ///< Max distinct keys tracked
         std::size_t tracked = 0;        ///< Current tracked key count
@@ -534,9 +534,9 @@ public:
         std::size_t error_bound = 0;    ///< Max count error for tracked items
     };
 
-    /// P2-3: Return current streaming hot-keys summary statistics.
+    /// Return current streaming hot-keys summary statistics.
     ///
-    /// P2-9: Now lock-free — reads from the active instance via atomic
+    /// Now lock-free — reads from the active instance via atomic
     /// shared_ptr load. Not blocked by concurrent drain operations.
     hot_keys_stats hot_keys_summary() const {
         hot_keys_stats s;
@@ -552,9 +552,9 @@ public:
         return s;
     }
 
-    /// P2-3: Reset the streaming hot-keys summary (does not clear the event ring).
+    /// Reset the streaming hot-keys summary (does not clear the event ring).
     ///
-    /// P2-9: Creates a fresh empty instance and atomically swaps it in,
+    /// Creates a fresh empty instance and atomically swaps it in,
     /// replacing the active instance. Concurrent readers holding the old
     /// shared_ptr continue safely until they finish.
     void reset_hot_keys() {
@@ -580,8 +580,8 @@ public:
         for (std::size_t i = 0; i < config_.max_events; ++i) {
             slot_seq_[i].store(0, std::memory_order_relaxed);
         }
-        // P2-3: Also reset the streaming hot-keys summary.
-        // P2-9: Use double-buffer swap — create fresh instance and atomically
+        // Also reset the streaming hot-keys summary.
+        // Use double-buffer swap — create fresh instance and atomically
         // publish it so concurrent top_keys() readers are not blocked.
         {
             std::lock_guard<std::mutex> hk_lock(hot_keys_drain_mutex_);
@@ -623,8 +623,8 @@ public:
             slot_seq_ = std::move(new_seq);
             slot_seq_size_ = cfg.max_events;
         }
-        // P2-3: Reallocate hot-keys summary if capacity changed.
-        // P2-9: Use double-buffer swap — create a new instance with the
+        // Reallocate hot-keys summary if capacity changed.
+        // Use double-buffer swap — create a new instance with the
         // updated capacity and atomically publish it. Concurrent readers
         // continue using the old instance until they release their
         // shared_ptr reference.
@@ -646,7 +646,7 @@ public:
     /// Register a custom callback for each event (useful for real-time streaming).
     /// Pass an empty/empty function to clear the callback.
     ///
-    /// P2-D: The callback is stored in a `detail::atomic_shared_ptr`, which
+    /// The callback is stored in a `detail::atomic_shared_ptr`, which
     /// provides atomic load/store via a brief spinlock. Drain operations
     /// (`process_events`) load the shared_ptr (incrementing its refcount)
     /// and call through it outside the lock — the callback remains alive
@@ -705,7 +705,7 @@ private:
         return result;
     }
 
-    /// P2-3: Process a batch of drained TLS events.
+    /// Process a batch of drained TLS events.
     ///
     /// Writes the events to the main ring buffer (lock-free slot claiming),
     /// fires the event callback for each entry, and updates the streaming
@@ -754,8 +754,8 @@ private:
             }
         }
 
-        // P2-3: Update streaming hot-keys summary with hit events.
-        // P2-9 (double buffering): Instead of mutating the active instance
+        // Update streaming hot-keys summary with hit events.
+        // Instead of mutating the active instance
         // under a shared mutex (which blocks top_keys() queries), the drain
         // path copies the current active instance, applies the new hit
         // events to the copy, and atomically publishes it. Queries
@@ -804,7 +804,7 @@ private:
     }
 
     uint64_t now_ms() const {
-        // R6: Use steady_clock for monotonic timestamps. The event_tracker
+        // Use steady_clock for monotonic timestamps. The event_tracker
         // calculates TTL as (evict_timestamp - insert_timestamp); with
         // system_clock, an NTP adjustment between insert and evict can
         // produce negative or wildly incorrect TTL values. steady_clock
@@ -843,7 +843,7 @@ private:
     /// writes. NOT used by drain_tls() — the drain path is lock-free.
     mutable std::mutex config_mutex_;
 
-    /// P2-D: Event callback stored as a shared_ptr behind a spinlock-based
+    /// Event callback stored as a shared_ptr behind a spinlock-based
     /// atomic wrapper. Drain operations load it (bumping the refcount) and
     /// call through it without holding any mutex; `on_event()` swaps in a
     /// new shared_ptr atomically. The old callback auto-deletes when its
@@ -852,7 +852,7 @@ private:
     /// design, which leaked memory when `on_event()` was called many times.
     lru::detail::atomic_shared_ptr<std::function<void(const event_record&)>> event_callback_;
 
-    /// P2-D: Global enable/disable flag. When false, all `record_*` methods
+    /// Global enable/disable flag. When false, all `record_*` methods
     /// become no-ops (fast-path relaxed load + early return). `disable()`
     /// also stops the drain worker and clears the event callback.
     std::atomic<bool> enabled_{true};
@@ -865,8 +865,8 @@ private:
     std::atomic<bool> drain_active_{false};
 
     // --------------------------------------------------------------------
-    // P2-3: Streaming hot-keys summary (Space-Saving top-k)
-    // P2-9: Double-buffered via atomic shared_ptr
+    // Streaming hot-keys summary (Space-Saving top-k)
+    // Double-buffered via atomic shared_ptr
     // --------------------------------------------------------------------
     //
     // The active Space-Saving instance is stored as an atomic shared_ptr.

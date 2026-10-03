@@ -1,6 +1,6 @@
 // P1-31 regression tests for detail::ttl_heap — the strategy-agnostic TTL index.
 //
-// The component is the mechanism P1-31 方案 A relies on: one O(log n) expiry
+// The component is the mechanism option A relies on: one O(log n) expiry
 // index shared by every eviction strategy, instead of an LRU-only heap plus an
 // O(n) full-cache scan for everybody else. These tests pin the component's
 // contracts directly, so the strategies that adopt it cannot silently regress

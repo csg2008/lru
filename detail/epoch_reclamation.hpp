@@ -39,7 +39,7 @@ namespace lru::detail {
 
 
 
-// P0-2: Force-advance policy for handling "stuck" critical sections
+// Force-advance policy for handling "stuck" critical sections
 // (threads descheduled by the OS, GC pauses, long-running operations).
 //
 // When a slot's entry_time_ns is older than the configured timeout,
@@ -102,7 +102,7 @@ enum class force_advance_policy {
 //   - When a thread enters a critical section, it caches its assigned slot
 //     index in TLS so subsequent enter/exit from the same thread is O(1)
 //
-// P0-6 (T-A1): Previously slots_ was a fixed std::array<epoch_slot, 128>.
+// Previously slots_ was a fixed std::array<epoch_slot, 128>.
 // Under 4K+ thread workloads (large HTTP servers, fiber runtimes), all 128
 // slots could be occupied simultaneously, causing acquire_slot() to spin-wait
 // indefinitely — a silent deadlock. The slot array now grows dynamically in
@@ -121,7 +121,7 @@ public:
     static constexpr std::size_t kMaxSlots = kMaxBatches * kBatchSize;
     static constexpr uint64_t kInactiveEpoch = std::numeric_limits<uint64_t>::max();
 
-    /// P1-12 (fix.01 方案 A): sentinel returned by acquire_slot() when no slot
+    /// sentinel returned by acquire_slot() when no slot
     /// can be obtained. Matches hazptr_domain::npos. The previous contract was
     /// mutually exclusive with hazptr's — hazptr returns a sentinel while EBR
     /// threw std::runtime_error — and EBR's caller (`read_handle`'s constructor)
@@ -139,7 +139,7 @@ public:
     // Hard cap on synchronize_epoch() fallbacks before degrading. Mirrors
     // hazptr's kMaxSyncFallbacks — beyond this the workload genuinely has
     // too many concurrent critical sections and the caller must degrade.
-    // P1-12: "degrade" means acquire_slot() returns npos (not throw).
+    // "degrade" means acquire_slot() returns npos (not throw).
     static constexpr std::size_t kMaxSyncFallbacks = 64;
 
     // ----------------------------------------------------------------
@@ -148,7 +148,7 @@ public:
 
     /// Each slot holds the epoch observed by the owning thread, or
     /// kInactiveEpoch if the thread is not in a critical section.
-    /// P0-2 (T2.1): also tracks `entry_time_ns` — the steady-clock
+    /// also tracks `entry_time_ns` — the steady-clock
     /// timestamp (ns since epoch) when the slot entered its current
     /// critical section. Used by `compute_min_epoch()` to detect
     /// "stuck" threads (long-running CS) and force-advance the epoch
@@ -157,7 +157,7 @@ public:
     struct alignas(64) epoch_slot {
         std::atomic<uint64_t> local_epoch{kInactiveEpoch};
         std::atomic<bool> occupied{false};
-        /// P0-2 (T2.1): Steady-clock nanoseconds when the slot entered
+        /// Steady-clock nanoseconds when the slot entered
         /// its current critical section. 0 means "not in CS".
         /// Read by compute_min_epoch() to detect stuck slots.
         std::atomic<uint64_t> entry_time_ns{0};
@@ -200,7 +200,7 @@ public:
     // ----------------------------------------------------------------
 
     struct tls_retire_buffer {
-        // R1-3: Reduced from 64 to 16. In read-heavy-write-light workloads,
+        // Reduced from 64 to 16. In read-heavy-write-light workloads,
         // writes are sparse so the 64-entry buffer rarely fills, meaning
         // flush_tls_buffer() (and the epoch advance it triggers) almost never
         // fires from the retire path. With 16 entries, the buffer fills 4x
@@ -210,7 +210,7 @@ public:
         // negligible because the global push is lock-free and batched.
         static constexpr std::size_t kCapacity = 16;
 
-        /// P1-6 (T2.3): retired_entry no longer carries the epoch — it
+        /// retired_entry no longer carries the epoch — it
         /// is stored on the object itself (hazptr_obj_base::epoch_).
         /// This shrinks the entry from 16 bytes (obj + epoch) to 8
         /// bytes (obj only), halving the TLS buffer's memory footprint
@@ -315,7 +315,7 @@ public:
     // Constructor / Destructor
     // ----------------------------------------------------------------
 
-    /// P0-6 (T-A1): Default constructor pre-allocates one batch (128 slots)
+    /// Default constructor pre-allocates one batch (128 slots)
     /// to keep the common low-thread-count case zero-overhead. Additional
     /// batches are added on demand by acquire_slot() when all existing
     /// slots are occupied.
@@ -342,7 +342,7 @@ public:
     /// Enter a critical section: atomically load the global epoch and
     /// record it in the calling thread's epoch slot.
     /// Returns the observed epoch value.
-    /// P0-2 (T2.1): also records the entry time so that stuck slots
+    /// also records the entry time so that stuck slots
     /// (long-running CS) can be detected and skipped by compute_min_epoch().
     uint64_t enter_critical() {
         auto& cache = tls_cache();
@@ -364,7 +364,7 @@ public:
             std::size_t offset = idx % kBatchSize;
             uint64_t observed = global_epoch_.load(std::memory_order_acquire);
             slot_batches_[batch][offset].local_epoch.store(observed, std::memory_order_release);
-            // P0-2 (T2.1): record entry time after epoch so the
+            // record entry time after epoch so the
             // force-advance check sees a consistent (epoch, time) pair.
             slot_batches_[batch][offset].entry_time_ns.store(now_ns, std::memory_order_release);
             cache.cs_depth = 1;
@@ -391,7 +391,7 @@ public:
         std::size_t idx = acquire_slot();
         cache.slot_index = idx;
         if (idx == npos) {
-            // P1-12: degraded critical section — no slot could be acquired, so
+            // degraded critical section — no slot could be acquired, so
             // this thread registers no epoch and any reclaimed object may not
             // observe it. Leave slot_index at npos and cs_depth at 0 so
             // exit_critical() is a no-op, and let the caller fall back to the
@@ -413,9 +413,9 @@ public:
     }
 
     /// Exit a critical section: mark the calling thread's epoch slot as inactive.
-    /// P0-2 (T2.1): also clears entry_time_ns so the slot is no longer
+    /// also clears entry_time_ns so the slot is no longer
     /// considered "stuck" if it gets reused.
-    /// P0-2 (T-B1): notifies any thread blocked in synchronize_epoch().
+    /// notifies any thread blocked in synchronize_epoch().
     void exit_critical() {
         auto& cache = tls_cache();
         if (cache.owner == this && cache.slot_index != static_cast<std::size_t>(-1)) {
@@ -462,11 +462,11 @@ public:
     /// the object itself via hazptr_obj_base::epoch_, see T2.3) and
     /// buffered in TLS.
     ///
-    /// P1-6 (T2.3): Previously this method allocated a retired_node
+    /// Previously this method allocated a retired_node
     /// wrapper per retire to carry the epoch tag. Now the epoch is
     /// stored directly on the object, eliminating the allocation.
     ///
-    /// P1-7 (T2.6 bugfix): Idempotent via the `retired_` atomic flag
+    /// Idempotent via the `retired_` atomic flag
     /// on hazptr_obj_base. Same defense as hazptr_domain::retire_obj().
     void retire_obj(hazptr_obj_base* obj) {
         if (!obj) return;
@@ -476,7 +476,7 @@ public:
 
     /// Retire an object whose deleter is supplied here.
     ///
-    /// P1-9 (fix.01 方案 A): the deleter is written into `obj->reclaim_` only by
+    /// the deleter is written into `obj->reclaim_` only by
     /// the thread that wins the `retired_` claim. Writing it earlier let a
     /// second, stale-pointer retire clobber the winner's deleter, so the object
     /// was eventually destroyed through the wrong destructor / wrong allocator
@@ -489,7 +489,7 @@ public:
         push_retired(obj);
     }
 
-    /// P1-7: idempotent-retire claim (CAS false -> true); true if this caller won.
+    /// idempotent-retire claim (CAS false -> true); true if this caller won.
     bool claim_retired(hazptr_obj_base* obj) noexcept {
         bool expected = false;
         return obj->retired_.compare_exchange_strong(
@@ -498,7 +498,7 @@ public:
 
     /// Tag an already-claimed object with the current epoch and buffer it.
     void push_retired(hazptr_obj_base* obj) {
-        // R1-4: Warn once if the drain worker was never started.
+        // Warn once if the drain worker was never started.
         assert_drain_started();
 
         auto& buf = tls_retire_buf();
@@ -510,11 +510,11 @@ public:
             buf.owner_domain->flush_tls_buffer();
         }
         buf.owner_domain = this;
-        // P1-6 (T2.3): Tag the object with the current epoch. The tag
+        // Tag the object with the current epoch. The tag
         // is read by try_reclaim() to decide if the object is safe to
         // reclaim (epoch < min_epoch). Set exactly once at retire time.
         uint64_t current_epoch = global_epoch_.load(std::memory_order_acquire);
-        // G23: epoch_ is a non-atomic write. This is safe because:
+        // epoch_ is a non-atomic write. This is safe because:
         // 1. retired_ CAS (above) guarantees we are the only thread reaching here.
         // 2. push_pending()'s release CAS on pending_head_ ensures this write is
         //    visible to reclaim threads that acquire-load pending_head_.
@@ -536,7 +536,7 @@ public:
 
         if constexpr (is_hazptr_obj_v<T>) {
             // Zero-allocation path: T inherits from hazptr_obj_base.
-            // P1-9: the deleter is handed to retire_obj() so it is stored only
+            // the deleter is handed to retire_obj() so it is stored only
             // after this caller wins the `retired_` claim.
             retire_obj(static_cast<hazptr_obj_base*>(ptr),
                        [](hazptr_obj_base* p) { delete static_cast<T*>(p); });
@@ -559,7 +559,7 @@ public:
     }
 
     /// Flush the TLS retire buffer to the global pending list.
-    /// P1-6 (T2.3): No longer allocates retired_node wrappers. The
+    /// No longer allocates retired_node wrappers. The
     /// hazptr_obj_base objects are chained directly via their embedded
     /// `next_` pointer, and the epoch tag is read from the object's
     /// `epoch_` field. This eliminates one heap allocation + free per
@@ -567,6 +567,19 @@ public:
     void flush_tls_buffer() {
         auto& buf = tls_retire_buf();
         if (buf.count == 0) return;
+
+        // The TLS retire buffer is shared by every epoch_domain in the process
+        // (see tls_retire_buf()), and each entry is tagged with the epoch of
+        // the domain it was retired on. Flushing a buffer that belongs to
+        // another domain into *this* one publishes those objects on the wrong
+        // pending list, where *this* domain's grace period — which counts only
+        // its own participants — can free them while a reader of the owner
+        // domain is still dereferencing them. Hand the buffer back instead;
+        // push_retired() routes the same way.
+        if (buf.owner_domain != nullptr && buf.owner_domain != this) {
+            buf.owner_domain->flush_tls_buffer();
+            return;
+        }
 
         // Build a chain of hazptr_obj_base objects directly — no
         // retired_node wrapper allocation. The chain is built in
@@ -588,7 +601,7 @@ public:
         // Advance global epoch periodically
         maybe_advance_epoch();
 
-        // R1-2: Capacity-based epoch advance. When the pending list
+        // Capacity-based epoch advance. When the pending list
         // exceeds 25% of the reclaim threshold, force-advance the epoch
         // so that older retired objects become eligible for reclamation
         // sooner. Without this, in read-heavy-write-light workloads the
@@ -598,7 +611,7 @@ public:
         // memory pressure starts building, not just on a timer.
         maybe_capacity_advance();
 
-        // P1-3 (T1.4): Auto-reclaim when pending_count exceeds threshold.
+        // Auto-reclaim when pending_count exceeds threshold.
         // Bound worst-case memory pressure under bursty retire workloads
         // without adding lock contention to the steady-state hot path.
         // The CAS flag inside maybe_auto_reclaim prevents stampede — at
@@ -625,7 +638,7 @@ public:
     ///        starvation of old objects under continuous retire pressure.
     /// @return Number of objects actually reclaimed.
     ///
-    /// P1-6 (T2.3): Walks hazptr_obj_base chain directly (via next_)
+    /// Walks hazptr_obj_base chain directly (via next_)
     /// and reads epoch from hazptr_obj_base::epoch_. No retired_node
     /// wrappers to delete — reclamation invokes obj->reclaim_(obj)
     /// which both destroys the object and frees its memory.
@@ -637,7 +650,7 @@ public:
         hazptr_obj_base* head = pending_head_.exchange(nullptr, std::memory_order_acq_rel);
         if (!head) return 0;
 
-        // T-P2-3 (R-7): For incremental reclaim (batch_size > 0), reverse
+        // For incremental reclaim (batch_size > 0), reverse
         // the list so oldest objects (smallest epoch) are processed first.
         // The pending list is LIFO (push_pending prepends), so without
         // reversal the newest objects would be inspected first and oldest
@@ -664,7 +677,7 @@ public:
 
         hazptr_obj_base* curr = head;
         while (curr) {
-            // T-P2-3 (R-7): Stop after inspecting batch_size objects.
+            // Stop after inspecting batch_size objects.
             if (batch_size > 0 && processed >= batch_size) {
                 break;
             }
@@ -672,7 +685,7 @@ public:
             hazptr_obj_base* next = curr->next_;
             curr->next_ = nullptr;
 
-            // P1-5: TWO epochs of grace, which is what EBR actually requires.
+            // TWO epochs of grace, which is what EBR actually requires.
             //
             // With a single epoch of grace (`curr->epoch_ < min_epoch`) this
             // interleaving is a use-after-free:
@@ -685,7 +698,7 @@ public:
             // Reclaiming only objects at least two epochs behind the minimum
             // observed epoch closes that window, and is what makes "every
             // registered participant has observed >= E" a SUFFICIENT proof
-            // (fix.01 方案 A) rather than a hopeful one.
+            // rather than a hopeful one.
             //
             // When no participant is active, compute_min_epoch() returns
             // global_epoch + 1, so this reduces to `epoch_ < global_epoch` —
@@ -703,7 +716,7 @@ public:
                 ++reclaimed_count;
             } else {
                 // Still potentially observable — re-chain for later reclamation
-                // T-P2-3 (R-7): append to tail (instead of prepend to head)
+                // append to tail (instead of prepend to head)
                 // to preserve epoch ordering within the re-chained list.
                 if (!new_head) {
                     new_head = curr;
@@ -717,7 +730,7 @@ public:
             ++processed;
         }
 
-        // T-P2-3 (R-7): Re-chain any unprocessed objects (the `curr`
+        // Re-chain any unprocessed objects (the `curr`
         // pointer is at the first unprocessed object, or null if we
         // processed the entire list). Append them to the re-chained
         // protected entries so a single push_pending() call returns
@@ -774,7 +787,7 @@ public:
 
     /// Return the current number of pending (unreclaimed) retired objects.
     ///
-    /// P1-10: shards hold signed deltas (the reclaiming thread is generally not
+    /// shards hold signed deltas (the reclaiming thread is generally not
     /// the pushing thread, so a single shard may legitimately be negative); only
     /// the sum is meaningful. This is a snapshot — it drives the auto-reclaim
     /// threshold and the backlog metric, so exact concurrency is not required.
@@ -792,7 +805,7 @@ public:
         return reclaim_total_.load(std::memory_order_acquire);
     }
 
-    /// P1-3 (T1.4): Return the current auto-reclaim threshold. When
+    /// Return the current auto-reclaim threshold. When
     /// `pending_count()` exceeds this value, the next `flush_tls_buffer()`
     /// synchronously invokes `try_reclaim()` to drain the pending list.
     /// Default is 65536 — high enough to avoid reclaim thrashing under
@@ -802,7 +815,7 @@ public:
         return reclaim_threshold_.load(std::memory_order_acquire);
     }
 
-    /// P1-3 (T1.4): Set the auto-reclaim threshold. Set to
+    /// Set the auto-reclaim threshold. Set to
     /// `std::numeric_limits<std::size_t>::max()` to effectively disable
     /// auto-reclaim (only background / explicit reclaims will run).
     /// Thread-safe: may be called concurrently with retire().
@@ -810,14 +823,14 @@ public:
         reclaim_threshold_.store(threshold, std::memory_order_release);
     }
 
-    /// P1-3 (T1.4): Number of times auto-reclaim was triggered because
+    /// Number of times auto-reclaim was triggered because
     /// `pending_count` exceeded the threshold. Useful for sizing the
     /// threshold against actual retire pressure.
     std::size_t reclaim_auto_triggered_count() const noexcept {
         return reclaim_auto_triggered_count_.load(std::memory_order_acquire);
     }
 
-    /// P0-2 (T2.1): Set the maximum critical-section duration before
+    /// Set the maximum critical-section duration before
     /// a slot is considered "stuck" and force-advanced past. Default
     /// is 30 seconds. Set to 0 to disable force-advance (preserves
     /// original behavior — stuck threads block reclaim indefinitely).
@@ -829,7 +842,7 @@ public:
     /// dereferences a retired pointer, UAF may result. Only enable this
     /// when the alternative (unbounded reclaim backlog) is worse.
     ///
-    /// P0-2 (refactor): The policy is now governed by `force_advance_policy_`.
+    /// The policy is now governed by `force_advance_policy_`.
     /// This timeout is consulted only when the policy is
     /// `kForceAdvanceAfterNs` (or `kFailAdvance` for detection). Use
     /// `set_force_advance_policy()` to select the active policy.
@@ -839,13 +852,13 @@ public:
             std::memory_order_release);
     }
 
-    /// P0-2: Alias for `set_epoch_force_advance_timeout` — shorter name
+    /// Alias for `set_epoch_force_advance_timeout` — shorter name
     /// aligned with the `force_advance_policy` API.
     void set_force_advance_timeout(std::chrono::nanoseconds timeout) noexcept {
         set_epoch_force_advance_timeout(timeout);
     }
 
-    /// T-G4: Select the force-advance policy. See `force_advance_policy`
+    /// Select the force-advance policy. See `force_advance_policy`
     /// for the semantics of each value. Default is `kFailAdvance` (safe;
     /// never UAF). Switch to `kForceAdvanceAfter5s` only when the operator
     /// accepts the UAF risk in exchange for reclaim progress under stuck
@@ -855,19 +868,19 @@ public:
             static_cast<uint32_t>(policy), std::memory_order_release);
     }
 
-    /// P0-2: Query the active force-advance policy.
+    /// Query the active force-advance policy.
     force_advance_policy get_force_advance_policy() const noexcept {
         return static_cast<force_advance_policy>(
             force_advance_policy_.load(std::memory_order_acquire));
     }
 
-    /// P0-2 (T2.1): Query the current force-advance timeout.
+    /// Query the current force-advance timeout.
     std::chrono::nanoseconds epoch_force_advance_timeout() const noexcept {
         return std::chrono::nanoseconds(
             epoch_force_advance_timeout_ns_.load(std::memory_order_acquire));
     }
 
-    /// P0-2 (T2.1): Number of times compute_min_epoch() skipped a
+    /// Number of times compute_min_epoch() skipped a
     /// stuck slot. A steadily-increasing count indicates threads are
     /// entering CSes longer than the configured timeout — either the
     /// timeout is too low, or the workload has genuine long-running
@@ -876,7 +889,7 @@ public:
         return force_advance_count_.load(std::memory_order_acquire);
     }
 
-    /// P0-2 (T-B1): Number of individual slot observations skipped by
+    /// Number of individual slot observations skipped by
     /// `compute_min_epoch()` because `entry_time_ns` was older than
     /// the configured force-advance timeout. Distinct from
     /// `force_advance_count()` — the latter counts *reclaim passes*
@@ -889,7 +902,7 @@ public:
         return epoch_stale_count_.load(std::memory_order_acquire);
     }
 
-    /// P0-6 (T-A1): Current slot capacity (number of allocated batches
+    /// Current slot capacity (number of allocated batches
     /// × kBatchSize). Capacity grows on demand from 128 → 8192 as
     /// threads enter critical sections concurrently. Useful for sizing
     /// the workload against the upper bound.
@@ -897,7 +910,7 @@ public:
         return num_batches_.load(std::memory_order_acquire) * kBatchSize;
     }
 
-    /// P0-6 (T-A1): Number of times acquire_slot() exhausted all
+    /// Number of times acquire_slot() exhausted all
     /// 8192 slots and had to yield. Non-zero under normal operation
     /// indicates the workload has 8000+ simultaneous critical sections
     /// — likely a runaway thread-spawn pattern rather than a normal
@@ -906,7 +919,7 @@ public:
         return slot_exhaustion_count_.load(std::memory_order_acquire);
     }
 
-    /// P1-12: Number of times acquire_slot() returned npos (no slot could be
+    /// Number of times acquire_slot() returned npos (no slot could be
     /// obtained at all). A non-zero value means some reads ran unprotected and
     /// had to use the locked fallback path — the operator-facing degradation
     /// signal that replaces the previous std::runtime_error.
@@ -914,19 +927,19 @@ public:
         return slot_degraded_count_.load(std::memory_order_acquire);
     }
 
-    /// P1-12: Convenience predicate — true once any degradation has occurred.
+    /// Convenience predicate — true once any degradation has occurred.
     bool is_slot_degraded() const noexcept {
         return slot_degraded_count_.load(std::memory_order_relaxed) != 0;
     }
 
-    /// P1-5: Number of threads currently registered as participants (i.e. holding
+    /// Number of threads currently registered as participants (i.e. holding
     /// a slot). This is the size of the set over which the grace period used by
     /// reclamation is proved.
     std::size_t participant_count() const noexcept {
         return participant_count_.load(std::memory_order_acquire);
     }
 
-    /// P1-5: True when at least one registered participant is currently inside a
+    /// True when at least one registered participant is currently inside a
     /// critical section, i.e. reclamation is legitimately held back by live
     /// readers rather than by leaked state. Operators should pair this with
     /// `pending_count()` and `epoch_stale_count()` to distinguish "backlog
@@ -954,7 +967,7 @@ public:
     /// Obtain the default global epoch domain.
     /// Obtain the default global EBR domain.
     ///
-    /// P1-11 (fix.01 方案 A): intentionally NEVER destroyed (leaked at process
+    /// intentionally NEVER destroyed (leaked at process
     /// exit). ~epoch_domain() calls reclaim_all_pending(), which frees objects a
     /// still-exiting thread can be about to touch through its own TLS retire
     /// buffer. Skipping destruction removes that ordering dependency; the OS
@@ -965,7 +978,7 @@ public:
         return *domain;
     }
 
-    /// R1-4: Mark that the background drain worker has been started.
+    /// Mark that the background drain worker has been started.
     /// Called by unified_cache::start_event_drain(). If never called,
     /// assert_drain_started() will log a warning on the first retire,
     /// alerting operators that retired objects will accumulate without
@@ -974,12 +987,12 @@ public:
         drain_worker_started_.store(true, std::memory_order_release);
     }
 
-    /// R1-4: Check whether the drain worker has been started.
+    /// Check whether the drain worker has been started.
     bool is_drain_started() const noexcept {
         return drain_worker_started_.load(std::memory_order_acquire);
     }
 
-    /// R1-4: Assert the drain worker is running. Called on the retire
+    /// Assert the drain worker is running. Called on the retire
     /// path to warn (via stderr) if the drain worker was never started.
     /// Uses an atomic flag to ensure the warning prints at most once.
     void assert_drain_started() noexcept {
@@ -1000,16 +1013,18 @@ public:
         return global_epoch_.load(std::memory_order_acquire);
     }
 
-    /// P0-2 (T-B1): Block the calling thread until all threads that
+    /// Block the calling thread until all threads that
     /// were in a critical section at call time have exited, and at
     /// least one epoch advance has occurred. Returns true on success
     /// (a quiescent point was reached), false on timeout.
     ///
-    /// Implementation: bumps `sync_target_epoch_` to `current+1`, then
-    /// waits on a condition variable. Each `exit_critical()` call
-    /// notifies the CV; the predicate checks whether all active slots
-    /// have a local_epoch >= sync_target_epoch_ (meaning they entered
-    /// CS *after* our call) OR are inactive.
+    /// Implementation: takes `global_epoch_ + 1` as the target, then waits
+    /// on a condition variable. Each `exit_critical()` call notifies the CV;
+    /// the predicate checks whether all active slots have a local_epoch >=
+    /// that target (meaning they entered their CS *after* our call) OR are
+    /// inactive. Each waiter's predicate captures its own target by value, so
+    /// concurrent callers do not interfere; `sync_waiter_count_` is what tells
+    /// exit_critical() there is someone to wake.
     ///
     /// Use cases:
     ///   - Shutdown: ensures all in-flight CSes complete before destruction
@@ -1036,37 +1051,35 @@ public:
         // Slow path: wait on the CV. exit_critical() notifies after
         // updating its slot's local_epoch.
         std::unique_lock<std::mutex> lock(sync_mutex_);
+        // Register as a waiter BEFORE the first predicate evaluation, so a
+        // concurrent exit_critical() cannot decide there is nobody to notify.
+        sync_waiter_count_.fetch_add(1, std::memory_order_acq_rel);
         auto deadline = std::chrono::steady_clock::now() + timeout;
-        sync_target_epoch_.store(target_epoch, std::memory_order_release);
         bool ok = sync_cv_.wait_until(lock, deadline, [this, target_epoch] {
             return all_slots_at_or_past_epoch(target_epoch);
         });
-        // Reset the target so future callers can reuse the CV with a
-        // fresh target. If multiple callers race here, the last writer
-        // wins — but the wait predicate captures target_epoch by value,
-        // so each caller still observes its own quiescent point.
-        sync_target_epoch_.store(0, std::memory_order_release);
+        sync_waiter_count_.fetch_sub(1, std::memory_order_acq_rel);
         return ok;
     }
 
 private:
-    /// P0-2 (T-B1): Used by `exit_critical()` to notify any thread
+    /// Used by `exit_critical()` to notify any thread
     /// blocked in `synchronize_epoch()` that a slot has been released.
     /// Called without holding sync_mutex_ — notify_one is safe to call
     /// without the lock (it may be a spurious wakeup, which is filtered
     /// by the predicate).
     void notify_epoch_progress() {
-        // Only notify if someone is actually waiting. Reading
-        // sync_target_epoch_ is sufficient — non-zero means a sync call
-        // is in progress. This avoids the wakeup cost on the common
-        // exit_critical() path where no one is waiting.
-        if (sync_target_epoch_.load(std::memory_order_acquire) != 0) {
+        // Only notify if someone is actually waiting, so the common
+        // exit_critical() path pays just one relaxed load when no sync call is
+        // in flight. Taking the mutex around notify_all keeps the notify
+        // ordered against a waiter's predicate evaluation.
+        if (sync_waiter_count_.load(std::memory_order_acquire) != 0) {
             std::lock_guard<std::mutex> lock(sync_mutex_);
             sync_cv_.notify_all();
         }
     }
 
-    /// P0-2 (T-B1): Predicate used by synchronize_epoch(): returns
+    /// Predicate used by synchronize_epoch(): returns
     /// true iff all active slots have local_epoch >= target_epoch
     /// (meaning they entered their CS after our sync call) or are
     /// inactive (local_epoch == kInactiveEpoch).
@@ -1108,7 +1121,7 @@ private:
     }
 
     // ---- Retired node type ------------------------------------------------
-    // P1-6 (T2.3): retired_node wrapper removed. hazptr_obj_base now
+    // retired_node wrapper removed. hazptr_obj_base now
     // carries the epoch directly (hazptr_obj_base::epoch_), and the
     // objects are chained via their embedded next_ pointer. This
     // eliminates one heap allocation + free per retired object.
@@ -1116,7 +1129,7 @@ private:
     // ---- Slot management ---------------------------------------------------
 
     std::size_t acquire_slot() {
-        // P0-6 (T-A1): Dynamic batch expansion. Scan existing slots; if all
+        // Dynamic batch expansion. Scan existing slots; if all
         // are occupied, expand under the mutex and retry. Capacity grows
         // from 128 → 8192 across 64 batches, eliminating the infinite-spin
         // failure mode under 4K+ concurrent threads.
@@ -1162,7 +1175,7 @@ private:
                 // Bump exhaustion metric and apply bounded yield-and-retry,
                 // then fall back to synchronize_epoch() to wait for a
                 // quiescent point (which lets threads release their slots).
-                // P1-12: after exhausting sync fallbacks this returns npos
+                // after exhausting sync fallbacks this returns npos
                 // (a sentinel) instead of throwing — matches hazptr's
                 // contract and keeps noexcept callers from terminating.
                 slot_exhaustion_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1172,7 +1185,7 @@ private:
                 }
                 sync_fallback_count_.fetch_add(1, std::memory_order_relaxed);
                 if (++sync_fallbacks > kMaxSyncFallbacks) {
-                    // P1-12 (fix.01 方案 A): unified sentinel contract instead
+                    // unified sentinel contract instead
                     // of throwing. This path is reachable from noexcept callers
                     // (read_handle's constructor), where an exception means
                     // std::terminate — i.e. one transient protection-capacity
@@ -1186,7 +1199,7 @@ private:
                 // release their slots. Short timeout keeps the caller from
                 // blocking too long before retrying the slot scan.
                 (void)synchronize_epoch(std::chrono::milliseconds(100));
-                // P1-12 (measured defect): `spin_retries` is deliberately NOT
+                // `spin_retries` is deliberately NOT
                 // reset here. Re-granting the spin budget after every sync
                 // fallback let this loop run kMaxSpinRetries full-table scans per
                 // fallback round (~65,536 scans) in addition to 64 x 100 ms
@@ -1214,7 +1227,7 @@ private:
         slot_batches_[batch][offset].local_epoch.store(kInactiveEpoch, std::memory_order_release);
         slot_batches_[batch][offset].entry_time_ns.store(0, std::memory_order_release);
         used_batches_[batch][offset].store(false, std::memory_order_release);
-        // P1-5: this thread is no longer a registered participant, so it can no
+        // this thread is no longer a registered participant, so it can no
         // longer hold back reclamation.
         participant_count_.fetch_sub(1, std::memory_order_relaxed);
     }
@@ -1235,7 +1248,7 @@ private:
     /// Returns global_epoch + 1 if no participant is active (meaning all
     /// retired objects can be reclaimed).
     ///
-    /// P1-5 (fix.01 方案 A) — the grace period is now PROVED, not guessed.
+    /// The grace period is now PROVED, not guessed.
     ///
     /// The participant set is explicit: a thread becomes a participant when it
     /// acquires a slot (`participant_count_`, maintained by acquire_slot() and
@@ -1326,7 +1339,7 @@ private:
 
     // ---- Lock-free pending list --------------------------------------------
 
-    /// T-P2-3 (R-7): Reverse a singly-linked pending list in place.
+    /// Reverse a singly-linked pending list in place.
     /// Used by incremental try_reclaim(batch_size > 0) so that oldest
     /// objects (at the tail of the LIFO pending list) are processed
     /// first, preventing starvation under continuous retire pressure.
@@ -1347,11 +1360,11 @@ private:
     /// CAS-loop prepend: atomically insert a chain at the front of the
     /// global pending list. Finds the tail of the chain and links it to
     /// the current head, then CAS-swaps the head pointer. No mutex required.
-    /// P1-3 (T1.4): also bumps the pending ledger (`pending_add`) by the
+    /// also bumps the pending ledger (`pending_add`) by the
     /// chain length so `maybe_auto_reclaim()` can detect threshold
     /// overflow via `pending_count()` without walking the pending list.
     ///
-    /// P1-6 (T2.3): chain_head is a hazptr_obj_base* chain (linked via
+    /// chain_head is a hazptr_obj_base* chain (linked via
     /// next_), not a retired_node* chain. No wrapper allocations.
     void push_pending(hazptr_obj_base* chain_head) {
         // Find the tail of the chain and count its length.
@@ -1407,7 +1420,7 @@ private:
         }
     }
 
-    /// R1-2: Capacity-based epoch advance. When the pending retire list
+    /// Capacity-based epoch advance. When the pending retire list
     /// exceeds 25% of the reclaim threshold, force-advances the epoch
     /// so that older retired objects become eligible for reclamation.
     /// This complements maybe_time_advance() (timer-based) and
@@ -1499,13 +1512,13 @@ public:
         }
         if (reclaimed > 0) {
             reclaim_total_.fetch_add(reclaimed, std::memory_order_relaxed);
-            // P1-10: release what was actually removed rather than zeroing the
+            // release what was actually removed rather than zeroing the
             // ledger (producers may still be pushing concurrently).
             pending_release(reclaimed);
         }
     }
 
-    /// P1-3 (T1.4): If pending_count exceeds the configured threshold,
+    /// If pending_count exceeds the configured threshold,
     /// synchronously trigger try_reclaim() to drain the pending list.
     /// Uses a CAS flag to prevent stampede — at most one thread at a
     /// time performs the synchronous reclaim; concurrent flush_tls_buffer()
@@ -1531,7 +1544,7 @@ public:
         reclaim_in_progress_.store(false, std::memory_order_release);
     }
 
-    /// P0-2 (T2.1): Read the steady clock and return nanoseconds since
+    /// Read the steady clock and return nanoseconds since
     /// the clock's epoch. Used to timestamp slot entry so stuck slots
     /// can be detected by compute_min_epoch(). Inline + thread-safe.
     static uint64_t steady_clock_now_ns() noexcept {
@@ -1541,7 +1554,7 @@ public:
                 now.time_since_epoch()).count());
     }
 
-    /// P0-6 (T-A1): Append a new batch of kBatchSize slots without
+    /// Append a new batch of kBatchSize slots without
     /// synchronization. Caller must hold `expand_mutex_` (or be the
     /// sole thread during construction). Mirrors the same pattern in
     /// `hazptr_domain::add_batch_unchecked()`. Each batch is a unique_ptr
@@ -1572,7 +1585,7 @@ public:
     // Global epoch counter
     alignas(64) std::atomic<uint64_t> global_epoch_{0};
 
-    // P0-6 (T-A1): Dynamic slot batches (128 slots per batch, up to 64
+    // Dynamic slot batches (128 slots per batch, up to 64
     // batches = 8192 slots). Slot pointers are stored as unique_ptr arrays
     // so the slot addresses remain stable when new batches are appended —
     // concurrent readers (e.g. compute_min_epoch) can safely traverse the
@@ -1603,13 +1616,13 @@ public:
     // identical. Enter/exit now touch only the calling thread's own slot.
 
     // Lock-free global pending retire list.
-    // P1-6 (T2.3): Points to hazptr_obj_base chain (linked via next_),
+    // Points to hazptr_obj_base chain (linked via next_),
     // not retired_node wrappers.
     std::atomic<hazptr_obj_base*> pending_head_{nullptr};
 
     // Statistics counters (alignas to avoid false sharing)
     //
-    // P1-10 (fix.01 方案 C): sharded reservation ledger; see the definition of
+    // sharded reservation ledger; see the definition of
     // pending_shards_/pending_add()/pending_release()/pending_count() above.
     static constexpr std::size_t kPendingCounterShards = 8;
 
@@ -1639,7 +1652,7 @@ public:
 
     alignas(64) std::atomic<std::size_t> reclaim_total_{0};
 
-    // P1-3 (T1.4): Auto-reclaim threshold and stampede guard.
+    // Auto-reclaim threshold and stampede guard.
     // When `pending_count()` exceeds `reclaim_threshold_`, the next
     // flush_tls_buffer() synchronously invokes try_reclaim(). The
     // `reclaim_in_progress_` CAS flag ensures at most one thread at a
@@ -1653,7 +1666,7 @@ public:
     alignas(64) std::atomic<std::size_t> reclaim_auto_triggered_count_{0};
     alignas(64) std::atomic<bool> reclaim_in_progress_{false};
 
-    // P0-2 (T2.1): Force-advance timeout and counter. When a slot's
+    // Force-advance timeout and counter. When a slot's
     // entry_time_ns is older than `epoch_force_advance_timeout_ns_`,
     // compute_min_epoch() treats the slot as "stuck" and skips it,
     // allowing reclamation of objects in older epochs despite the
@@ -1664,7 +1677,7 @@ public:
     alignas(64) std::atomic<uint64_t> epoch_force_advance_timeout_ns_{5000000000ULL};
     alignas(64) mutable std::atomic<std::size_t> force_advance_count_{0};
 
-    // T-G4: Active force-advance policy. Default is `kFailAdvance` to
+    // Active force-advance policy. Default is `kFailAdvance` to
     // guarantee safety (never UAF); `kForceAdvanceAfter5s` requires
     // explicit opt-in via set_force_advance_policy() and is intended
     // for high-throughput scenarios that accept UAF risk in exchange
@@ -1681,7 +1694,7 @@ public:
     // the buffer rarely fills, so the epoch never advances and retired
     // objects can never be reclaimed (their epoch == global_epoch).
     // The background drain worker calls maybe_time_advance() on each tick.
-    // R1-1: Lowered default from 1s to 200ms. In read-heavy workloads,
+    // Lowered default from 1s to 200ms. In read-heavy workloads,
     // retired objects accumulated for up to 1s before the epoch advanced,
     // causing sustained memory pressure under bursty eviction patterns.
     // 200ms bounds worst-case reclamation latency to ~200ms while keeping
@@ -1689,18 +1702,18 @@ public:
     alignas(64) std::atomic<uint64_t> last_advance_time_ns_{0};
     alignas(64) std::atomic<uint64_t> time_advance_interval_ns_{200000000ULL}; // 200ms default (R1-1)
 
-    // P0-2 (T-B1): Per-slot stale observation counter. Increments
+    // Per-slot stale observation counter. Increments
     // each time compute_min_epoch() observes a slot whose entry_time_ns
     // exceeds the force-advance timeout. Higher granularity than
     // `force_advance_count_` (which counts reclaim passes, not slots).
     alignas(64) mutable std::atomic<std::size_t> epoch_stale_count_{0};
 
-    // P0-6 (T-A1): Bumped each time acquire_slot() finds all 8192 slots
+    // Bumped each time acquire_slot() finds all 8192 slots
     // occupied. Non-zero indicates the workload has outgrown the upper
     // bound (8000+ simultaneous critical sections).
     alignas(64) std::atomic<std::size_t> slot_exhaustion_count_{0};
 
-    // P1-5 (fix.01 方案 A): explicit participant registry size — the number of
+    // explicit participant registry size — the number of
     // threads currently holding a slot. The grace period used for reclamation is
     // the minimum observed epoch over exactly this set, which is what turns
     // "the slowest thread has probably finished" into a checkable condition.
@@ -1708,7 +1721,7 @@ public:
     // also runs from the TLS cache destructor on thread exit).
     alignas(64) std::atomic<std::size_t> participant_count_{0};
 
-    // P1-12: Bumped each time acquire_slot() gives up entirely and returns
+    // Bumped each time acquire_slot() gives up entirely and returns
     // npos (i.e. the hard cap was reached). This is the first-class "degraded"
     // signal: a non-zero value means some reads ran WITHOUT epoch protection
     // and therefore had to fall back to the locked path. Previously this
@@ -1720,21 +1733,27 @@ public:
     // hazptr's sync_fallback_count_ for behavioral parity.
     alignas(64) std::atomic<std::size_t> sync_fallback_count_{0};
 
-    // R1-4: Drain worker started flag. Set by mark_drain_started() when
+    // Drain worker started flag. Set by mark_drain_started() when
     // the cache's background drain worker is launched. Checked by
     // assert_drain_started() on the retire path to warn operators if
     // the drain worker was never started (retired objects will leak).
     alignas(64) std::atomic<bool> drain_worker_started_{false};
     alignas(64) std::atomic<bool> drain_warn_printed_{false};
 
-    // P0-2 (T-B1): synchronize_epoch() support — condition variable
+    // synchronize_epoch() support — condition variable
     // notified by exit_critical() when a slot is released. The target
     // epoch is set by synchronize_epoch() and cleared after the wait
     // completes; non-zero means a sync call is in progress.
     // Aligned to 64 to avoid false sharing with the slot vectors above.
     alignas(64) std::mutex sync_mutex_;
     alignas(64) std::condition_variable sync_cv_;
-    alignas(64) std::atomic<uint64_t> sync_target_epoch_{0};
+    /// Number of threads currently blocked in synchronize_epoch().
+    ///
+    /// notify_epoch_progress() uses this to decide whether a wake is worth the
+    /// syscall. A counter rather than a "target epoch is set" flag: with the
+    /// flag, the first caller to return cleared it, so a second caller still
+    /// waiting stopped receiving notifications and sat until its timeout.
+    alignas(64) std::atomic<std::size_t> sync_waiter_count_{0};
 };
 
 } // namespace lru::detail

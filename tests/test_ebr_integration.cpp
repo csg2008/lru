@@ -1,5 +1,5 @@
 // Unified LRU Cache - EBR (Epoch-Based Reclamation) Integration Tests
-// T2.1 / T2.2 / T2.4: Validates that:
+// Validates that:
 //   - set_ebr_domain() propagates to the hash table
 //   - is_ebr_mode() reports the correct state
 //   - find_and_pin_lockfree acquires epoch_guard at entry (no UAF)
@@ -19,7 +19,7 @@
 using namespace lru;
 
 // ============================================================================
-// T2.1 / T2.4: EBR domain setup and mode query
+// EBR domain setup and mode query
 // ============================================================================
 
 TEST(EbrIntegration, DefaultIsNotEbrMode) {
@@ -66,7 +66,7 @@ TEST(EbrIntegration, ProductionCachePropagatesEbrDomain) {
 }
 
 // ============================================================================
-// T2.2: Read paths work correctly under EBR mode
+// Read paths work correctly under EBR mode
 // ============================================================================
 
 TEST(EbrIntegration, GetWorksUnderEbrMode) {
@@ -116,7 +116,7 @@ TEST(EbrIntegration, PeekWorksUnderEbrMode) {
 }
 
 // ============================================================================
-// T2.1: Concurrent read + retire under EBR mode (no UAF)
+// Concurrent read + retire under EBR mode (no UAF)
 // ============================================================================
 
 TEST(EbrIntegration, ConcurrentReadAndEvictNoUaf) {
@@ -137,7 +137,7 @@ TEST(EbrIntegration, ConcurrentReadAndEvictNoUaf) {
             auto h = c.try_get(key);
             if (h && h->has_value()) {
                 // Dereference the value — would crash on UAF.
-                // P0-3: a `(void)` cast on a volatile reference does not
+                // a `(void)` cast on a volatile reference does not
                 // constitute an access in GCC, so read the value into a local.
                 const auto observed = **h;
                 (void)observed;
@@ -176,7 +176,7 @@ TEST(EbrIntegration, StripedConcurrentReadAndEvictNoUaf) {
                 int key = std::rand() % 500;
                 auto h = c.try_get(key);
                 if (h && h->has_value()) {
-                    // P0-3: see above — read the value rather than casting a
+                    // see above — read the value rather than casting a
                     // volatile reference to void.
                     const auto observed = **h;
                     (void)observed;
@@ -198,7 +198,7 @@ TEST(EbrIntegration, StripedConcurrentReadAndEvictNoUaf) {
 }
 
 // ============================================================================
-// T2.4: reclaim_guard unified type (tested indirectly via is_ebr_mode)
+// reclaim_guard unified type (tested indirectly via is_ebr_mode)
 // ============================================================================
 
 TEST(EbrIntegration, EbrModeCanBeToggledOff) {
@@ -251,7 +251,7 @@ TEST(EbrIntegration, FifoCacheSetEbrDomainIsNoOp) {
 }
 
 // ============================================================================
-// R9: per-shard EBR domains (opt-in)
+// per-shard EBR domains (opt-in)
 // ============================================================================
 
 TEST(EbrIntegration, EnablePerShardEbrActivatesAndWorks) {
@@ -302,7 +302,7 @@ TEST(EbrIntegration, PerShardEbrReclaimsAfterEviction) {
 }
 
 // ============================================================================
-// R8: defer_promotion mode must still collect hit callbacks
+// defer_promotion mode must still collect hit callbacks
 // ============================================================================
 
 TEST(EbrIntegration, DeferPromotionCollectsHitCallbacks) {
@@ -325,7 +325,7 @@ TEST(EbrIntegration, DeferPromotionCollectsHitCallbacks) {
 }
 
 // ============================================================================
-// R9: pending_deletion soft cap — refuse force_del of pinned items when the
+// pending_deletion soft cap — refuse force_del of pinned items when the
 // deferred-deletion list is at/over the cap, to bound memory retention.
 // ============================================================================
 

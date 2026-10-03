@@ -26,7 +26,7 @@ set_target_properties(lru_cache PROPERTIES EXPORT_NAME cache)
 # C++20 is required; C++23 is optional and controlled by LRU_ENABLE_CPP23.
 target_compile_features(lru_cache INTERFACE cxx_std_20)
 
-# P2-H: Enable cmpxchg16b on x86-64 for 128-bit lock-free CAS in the slab
+# Enable cmpxchg16b on x86-64 for 128-bit lock-free CAS in the slab
 # allocator's tagged-pointer free list. This is required for the 32-bit ABA
 # tag extension (the 16-bit tag wrapped after 65K ops, allowing ABA under
 # high contention). All modern x86-64 CPUs (since ~2006) support cmpxchg16b.
@@ -39,7 +39,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64|i686|i386|x86")
     endif()
 endif()
 
-# P0-3: the slab allocator's free list is a 128-bit tagged pointer
+# the slab allocator's free list is a 128-bit tagged pointer
 # (std::atomic<allocation_class::tagged_ptr>, see memory.hpp). GCC does not
 # always inline 16-byte atomic load/compare-exchange even with -mcx16: on targets
 # where it emits calls to __atomic_load_16 / __atomic_compare_exchange_16 (MinGW
@@ -217,7 +217,7 @@ unset(_lru_san_summary)
 option(LRU_BUILD_TESTS "Build tests" ON)
 option(LRU_BUILD_EXAMPLES "Build examples" ON)
 option(LRU_BUILD_BENCHMARKS "Build benchmarks" OFF)
-# fix.01 §4.4: libFuzzer targets for the untrusted-input boundaries
+# libFuzzer targets for the untrusted-input boundaries
 # (deserialization, shared-memory attach). libFuzzer ships with clang, so this
 # introduces no third-party dependency. Off by default because it requires a
 # clang toolchain with -fsanitize=fuzzer.
@@ -229,7 +229,7 @@ option(LRU_BUILD_FUZZERS "Build libFuzzer targets (clang only)" OFF)
 # this counter is not maintained (always 0) — active_handle_count() is
 # sourced from per-cache cache_stats instead, eliminating the cross-cache
 # cache-line ping-pong that this per-T global caused under high read QPS.
-# See P2-1 in spec.md.
+# See the cache_stats notes in core.hpp.
 if(LRU_BUILD_TESTS AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     option(LRU_DEBUG "Enable LRU debug instrumentation (per-T global handle counter)" ON)
 else()
@@ -242,7 +242,7 @@ if(LRU_DEBUG)
 endif()
 
 # ---------------------------------------------------------------------------
-# Warning configuration (P0-3, fix.01 §9.2 P0-T6 / 方案 A + B)
+# Warning configuration
 #
 # Goals:
 #   1. This project's own targets (tests/examples/benchmarks) must build with

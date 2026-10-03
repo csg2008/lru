@@ -1,4 +1,4 @@
-// T18: hot_shards memory dimension tests.
+// hot_shards memory dimension tests.
 //
 // Validates that shard_hotspot carries the new T18.1 fields
 // (memory_usage / pending_reclaim / rehash_in_progress) and that

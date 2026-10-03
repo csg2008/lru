@@ -515,7 +515,7 @@ TEST(StressPooledCache, ConcurrentGetAnyAndSet) {
     EXPECT_LE(pc.size(), 2000);
 }
 
-// H-2-A: Thread-safe underlying cache variant. This is the configuration
+// Thread-safe underlying cache variant. This is the configuration
 // that actually exercises the TOCTOU race fixed in H-2: with a thread-safe
 // underlying cache, pooled_cache::set() holds the global mutex_ in SHARED
 // mode, so two concurrent set()s on DIFFERENT pools can both pass the
@@ -556,7 +556,7 @@ TEST(StressPooledCache, ConcurrentGetAnyAndSetThreadSafeUnderlying) {
 
     EXPECT_TRUE(run_with_deadlock_watchdog(std::move(workload)))
         << "Potential deadlock in pooled_cache get_any+set (timeout after 10s)";
-    // H-2-A: total_size_ must NEVER exceed global_max_size_ (2000), even
+    // total_size_ must NEVER exceed global_max_size_ (2000), even
     // under concurrent set()s on different pools with a thread-safe
     // underlying cache. Without the H-2 fix this would flake at 2001.
     EXPECT_LE(pc.size(), 2000)
@@ -702,7 +702,7 @@ TEST(StressTest, MemoryPressureWithEviction) {
             auto rng = lru_test::seed_rng(t);
             int key = 0;
             while (!stop.load(std::memory_order_relaxed)) {
-                // P0-3: std::string's count parameter is size_type, so the
+                // std::string's count parameter is size_type, so the
                 // int-valued draw must be widened explicitly here.
                 cache.set(key++, std::string(
                     static_cast<std::size_t>(100 + lru_test::rng_int(rng) % 200),
@@ -778,7 +778,7 @@ TEST(StressTest, MixedReadPeekGet) {
 }
 
 TEST(StressTest, SegmentedCacheStress) {
-    // H-3-A: Use the real segmented_striped_cache (segmented hash table +
+    // Use the real segmented_striped_cache (segmented hash table +
     // sharded MM + striped locking). The previous "deleted operator="
     // compilation concern is resolved — segmented_concurrent_hash_table
     // provides a move assignment operator and the unified_cache wrapper
@@ -983,7 +983,7 @@ TEST(ExtendedStress, ConcurrentTTLWithEviction) {
 
     safe_ttl_cache c(1s, 5000);
 
-    // P1-A: `ttl_reaper` removed — use `detail::periodic_worker` directly.
+    // `ttl_reaper` removed — use `detail::periodic_worker` directly.
     detail::periodic_worker reaper(
         [&] { c.clear_expired(); },
         std::chrono::milliseconds(200));

@@ -1,4 +1,4 @@
-// P2-4: prometheus per-shard aggregate + detail toggle tests.
+// prometheus per-shard aggregate + detail toggle tests.
 //
 // Validates that:
 //   - By default, sharded caches emit only aggregate load-factor gauges

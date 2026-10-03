@@ -1,4 +1,4 @@
-// T16: Pre-hashed API tests
+// Pre-hashed API tests
 //
 // Verifies:
 //   - get_prehashed / try_get_prehashed / set_prehashed / peek_prehashed /
@@ -31,7 +31,7 @@ std::size_t cache_hash(const Cache&, const typename Cache::key_type& key) {
 }
 
 // ============================================================================
-// T16.1/T16.2: Hash-reuse lock + shard dispatch (covered implicitly via API)
+// Hash-reuse lock + shard dispatch (covered implicitly via API)
 // ============================================================================
 
 TEST(PrehashedApiTest, SetPrehashedThenGetPrehashed) {
@@ -205,7 +205,7 @@ TEST(PrehashedApiTest, ConcurrentPrehashedOps) {
 }
 
 // ============================================================================
-// T-CI-6: Concurrent prehashed tests — overlapping keys, read-heavy,
+// Concurrent prehashed tests — overlapping keys, read-heavy,
 // and mixed prehashed/non-prehashed interoperability.
 // ============================================================================
 

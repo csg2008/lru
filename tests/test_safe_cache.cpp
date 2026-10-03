@@ -1,9 +1,10 @@
 // Unified LRU Cache - SafeCache (thread-safe LRU) unit tests
-// 与 unified_cache 架构对齐：使用 lru::safe_cache<K,V> 别名。
-// 关键变化：get() 返回 read_handle<V>（不再是带锁的 guard），
-// size()/contains() 返回普通值，peek() 返回 read_handle<const V>。
-// 注：unified_cache 因 mm_lru 持有 new 分配的 item 指针而不可拷贝/移动，
-// 故原 copy/move 测试已移除，改为测试 stats_snapshot() 返回值的可复制性。
+// Aligned with the unified_cache architecture: use the lru::safe_cache<K,V> alias.
+// Key differences: get() returns read_handle<V> (no longer a locked guard), and
+// size()/contains() return plain values while peek() returns read_handle<const V>.
+// Note: unified_cache is neither copyable nor movable, because mm_lru owns
+// new-allocated item pointers. The copy/move tests were therefore replaced by
+// tests that stats_snapshot() returns a copyable value.
 
 #include <gtest/gtest.h>
 #include <atomic>
@@ -32,7 +33,7 @@ protected:
 };
 
 TEST_F(SafeCacheTest, BasicGet) {
-    // get() 返回 read_handle<V>，用 *result 访问值
+    // get() returns read_handle<V>; dereference with *result.
     auto result = c.get(1);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, "one");
@@ -46,7 +47,7 @@ TEST_F(SafeCacheTest, BasicSetAndGet) {
 }
 
 TEST_F(SafeCacheTest, PeekDoesNotTouch) {
-    // peek() 返回 read_handle<const V>，不改变 LRU 顺序
+    // peek() returns read_handle<const V> and does not change the LRU order.
     auto result = c.peek(1);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, "one");
@@ -64,13 +65,13 @@ TEST_F(SafeCacheTest, Delete) {
 }
 
 TEST_F(SafeCacheTest, Contains) {
-    // contains() 返回 bool，不再是 guard 包装
+    // contains() returns bool, no longer a guard wrapper.
     EXPECT_TRUE(c.contains(1));
     EXPECT_FALSE(c.contains(99));
 }
 
 TEST_F(SafeCacheTest, Size) {
-    // size() 返回 size_type，不再是 guard 包装
+    // size() returns size_type, no longer a guard wrapper.
     EXPECT_EQ(c.size(), 3);
 }
 
@@ -96,7 +97,7 @@ TEST_F(SafeCacheTest, AddNewKey) {
 
 TEST_F(SafeCacheTest, AddExistingKey) {
     EXPECT_FALSE(c.add(1, "z"));
-    EXPECT_EQ(*c.get(1), "one"); // 值不变
+    EXPECT_EQ(*c.get(1), "one"); // value unchanged
 }
 
 // ============================================================================
@@ -127,7 +128,7 @@ TEST(SafeCacheConcurrencyTest, ConcurrentReads) {
         t.join();
     }
 
-    // 所有读应成功
+    // Every read must succeed.
     EXPECT_EQ(hit_count.load(), 400);
 }
 
@@ -160,7 +161,7 @@ TEST(SafeCacheConcurrencyTest, MixedReadWrite) {
     std::atomic<bool> done{false};
     std::vector<std::thread> threads;
 
-    // 写线程
+    // Writer thread.
     threads.emplace_back([&]() {
         for (int i = 50; i < 150; ++i) {
             c.set(i, i * 2);
@@ -168,13 +169,13 @@ TEST(SafeCacheConcurrencyTest, MixedReadWrite) {
         done = true;
     });
 
-    // 读线程
+    // Reader thread.
     for (int t = 0; t < 3; ++t) {
         threads.emplace_back([&]() {
             while (!done) {
                 for (int i = 0; i < 50; ++i) {
                     auto result = c.get(i);
-                    (void)result; // 仅读取，不断言以避免竞争
+                    (void)result; // read only, no assertion, to avoid a race
                 }
             }
         });
@@ -184,7 +185,7 @@ TEST(SafeCacheConcurrencyTest, MixedReadWrite) {
         t.join();
     }
 
-    // 最终大小不超过 max_size
+    // The final size must not exceed max_size.
     EXPECT_LE(c.size(), 100);
 }
 
@@ -196,14 +197,14 @@ TEST(SafeCacheConcurrencyTest, ConcurrentGetAndDel) {
 
     std::vector<std::thread> threads;
 
-    // 线程 A：不断读取（handle 析构与 del 存在竞争窗口）
+    // Thread A: reads continuously (handle destruction races with del).
     threads.emplace_back([&]() {
         for (int i = 0; i < 50; ++i) {
             (void)c.get(i);
         }
     });
 
-    // 线程 B：不断删除（若 handle 仍活跃则 del 返回 false）
+    // Thread B: deletes continuously (del returns false while a handle is live).
     threads.emplace_back([&]() {
         for (int i = 0; i < 50; ++i) {
             (void)c.del(i);
@@ -214,7 +215,7 @@ TEST(SafeCacheConcurrencyTest, ConcurrentGetAndDel) {
         t.join();
     }
 
-    // del() 因 handle 竞争可能失败，使用 force_del 确保清理
+    // del() may fail because of the handle race, so force_del guarantees cleanup.
     for (int i = 0; i < 50; ++i) {
         c.force_del(i);
     }
@@ -243,7 +244,7 @@ TEST(SafeCacheStatsTest, HitMissTracking) {
 TEST(SafeCacheStatsTest, ConcurrentStats) {
     safe_cache<int, int> c{1000};
 
-    // 本地计数器，不依赖缓存内部统计，用于验证操作确实执行了
+    // Local counters, independent of the cache's own statistics, proving the operations ran.
     std::atomic<int> set_count{0};
     std::vector<std::thread> threads;
 
@@ -261,14 +262,14 @@ TEST(SafeCacheStatsTest, ConcurrentStats) {
         t.join();
     }
 
-    // 所有 set 都已执行
+    // Every set has executed.
     EXPECT_EQ(set_count.load(), 200);
 
     auto stats = c.stats_snapshot();
-    // 在 ideal 调度下，每个 get 都能命中刚 set 的 key，hits=200，misses=0。
-    // 但某些调度顺序可能导致 get 在另一个线程的 set 之前执行，产生少量 miss。
-    // 放宽检查：insertions 可能 =200（4线程×50），
-    // hits+misses 至少 >0（所有 get 必须返回 hit 或 miss）。
+    // Under an ideal schedule every get hits the key just set: hits=200, misses=0.
+    // Some interleavings run a get before another thread's set, producing a few misses.
+    // Relaxed check: insertions may be 200 (4 threads x 50), and
+    // hits+misses must be > 0 (every get returns either a hit or a miss).
     EXPECT_GE(stats.insertions.value.load(), 200);
     EXPECT_GE(stats.hits.value.load() + stats.misses.value.load(), 200);
     EXPECT_GE(stats.hits.value.load(), 0);
@@ -276,8 +277,8 @@ TEST(SafeCacheStatsTest, ConcurrentStats) {
 }
 
 TEST(SafeCacheStatsTest, StatsSnapshotIsCopyable) {
-    // unified_cache 不可拷贝/移动（mm_lru 持有 new 分配的指针），
-    // 但 stats_snapshot() 返回的 cache_stats 是可拷贝/移动的值类型。
+    // unified_cache is neither copyable nor movable (mm_lru owns new-allocated pointers),
+    // but the cache_stats returned by stats_snapshot() is a copyable value type.
     //
     // safe_cache embeds a large cache_stats (latency histograms), so a
     // stack-allocated cache plus several cache_stats copies would exceed
@@ -291,16 +292,16 @@ TEST(SafeCacheStatsTest, StatsSnapshotIsCopyable) {
     auto stats1 = std::make_unique<cache_stats>(c->stats_snapshot());
     EXPECT_EQ(stats1->hits.value.load(), 1);
 
-    // 拷贝构造
+    // Copy construction.
     cache_stats stats2 = *stats1;
     EXPECT_EQ(stats2.hits.value.load(), 1);
 
-    // 拷贝赋值
+    // Copy assignment.
     cache_stats stats3;
     stats3 = *stats1;
     EXPECT_EQ(stats3.hits.value.load(), 1);
 
-    // 移动构造
+    // Move construction.
     cache_stats stats4 = std::move(stats2);
     EXPECT_EQ(stats4.hits.value.load(), 1);
 }
@@ -314,7 +315,7 @@ TEST(SafeCacheCapacityTest, MaxSizeEviction) {
     c.set(1, "one");
     c.set(2, "two");
     c.set(3, "three");
-    c.set(4, "four"); // 淘汰 1
+    c.set(4, "four"); // evicts 1
 
     EXPECT_EQ(c.size(), 3);
     EXPECT_FALSE(c.contains(1));
@@ -348,7 +349,7 @@ TEST(SafeCacheCallbackTest, EvictCallback) {
 
     c.set(1, 100);
     c.set(2, 200);
-    c.set(3, 300); // 淘汰 1
+    c.set(3, 300); // evicts 1
 
     EXPECT_EQ(evict_key, 1);
     EXPECT_EQ(evict_value, 100);
@@ -443,7 +444,7 @@ TEST_F(StripedCacheTest, AddExistingKey) {
 
 TEST_F(StripedCacheTest, MaxSizeEviction) {
     // With 64 shards, max_size must be large enough for meaningful per-shard capacity.
-    // P0-A: default hash is now well-mixed (ankerl::unordered_dense::hash),
+    // default hash is now well-mixed (ankerl::unordered_dense::hash),
     // so keys distribute uniformly across all 64 shards. Use a larger max_size
     // so per-shard capacity is high enough that hash distribution skew does
     // not cause cross-shard size variance below the global cap.
@@ -479,7 +480,7 @@ TEST_F(StripedCacheTest, IsStripedPolicy) {
 // ============================================================================
 
 TEST(StripedCacheConcurrencyTest, ConcurrentReads) {
-    // P0-A: default hash is now well-mixed, so per-shard distribution is
+    // default hash is now well-mixed, so per-shard distribution is
     // uniform. Use a max_size large enough that no shard overflows during
     // the test (100 keys across 64 shards ≈ 1.5/shard; with max_size=100
     // some shards receive 2+ keys and evict, causing hit_count < 400).

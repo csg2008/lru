@@ -259,10 +259,21 @@ TEST_F(TtlCacheTest, InsertionStats) {
 // Callback Tests
 // ============================================================================
 
-TEST_F(TtlCacheTest, EvictCallbackOnTtlExpiry) {
+// A TTL expiry is reported through on_expire, NOT on_evict: the two are
+// deliberately distinct so a consumer can tell "expired" from "evicted to make
+// room" (see MmP1Ttl.P1_31_SweepFiresOnExpireNotOnEvict). clear_expired() now
+// sweeps the item-level expiry index instead of deleting key by key, so it
+// reports the event the way the sweep does — this test previously observed
+// on_evict only because the old implementation routed through del().
+TEST_F(TtlCacheTest, ExpireCallbackOnTtlExpiry) {
     ttl_cache<int, std::string, std::chrono::milliseconds> c(50ms);
+    int expire_count = 0;
     int evict_count = 0;
 
+    c.underlying().callbacks().on_expire([&](const int& k, const ttl_entry<std::string>& v) {
+        (void)k; (void)v;
+        ++expire_count;
+    });
     c.underlying().callbacks().on_evict([&](const int& k, const ttl_entry<std::string>& v) {
         (void)k; (void)v;
         ++evict_count;
@@ -272,7 +283,8 @@ TEST_F(TtlCacheTest, EvictCallbackOnTtlExpiry) {
     std::this_thread::sleep_for(100ms);
     c.clear_expired();
 
-    EXPECT_EQ(evict_count, 1);
+    EXPECT_EQ(expire_count, 1) << "a TTL expiry must fire on_expire";
+    EXPECT_EQ(evict_count, 0) << "a TTL expiry is not a capacity eviction";
 }
 
 TEST_F(TtlCacheTest, InsertCallback) {
@@ -626,7 +638,7 @@ TEST(PeriodicWorkerNoexceptTest, DestructorNoexceptWithoutExplicitStop) {
 // TTL Periodic Worker Shutdown Order Tests
 // ============================================================================
 //
-// P1-A: `ttl_reaper` has been removed. These tests verify that a
+// `ttl_reaper` has been removed. These tests verify that a
 // `detail::periodic_worker` driving `ttl_cache::clear_expired()` can
 // be safely stopped before / after the cache, and that concurrent
 // `clear_expired()` calls on a stopped cache are no-ops.
@@ -727,7 +739,7 @@ TEST(BackgroundEvictorShutdownTest, StopBeforeCacheDestruction) {
 }
 
 // ============================================================================
-// spec.md P1-1: Native TTL integration on unified_cache (no wrapper)
+// Native TTL integration on unified_cache (no wrapper).
 // ============================================================================
 //
 // These tests verify that `unified_cache` (specifically `lru::cache` and

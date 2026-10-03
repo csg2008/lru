@@ -179,7 +179,7 @@ public:
     }
 
     void clear() {
-        // P2-F: Per-stripe locking instead of a global write_all lock.
+        // Per-stripe locking instead of a global write_all lock.
         //
         // The previous implementation used `striped_mutex_write_all_guard`,
         // which acquires every stripe's exclusive lock simultaneously. This
@@ -235,7 +235,7 @@ private:
 // ============================================================================
 
 // ----------------------------------------------------------------------------
-// O5: Backend Circuit Breaker
+// Backend Circuit Breaker
 // ----------------------------------------------------------------------------
 //
 // Protects the tiered cache against cascading backend failures. When the
@@ -458,6 +458,24 @@ private:
     alignas(64) std::atomic<int64_t> last_failure_ms_{0};
 };
 
+namespace detail {
+
+/// Hash function to key the tiered cache's write-back bookkeeping by: the
+/// primary cache's own hash when it exposes one (unified_cache does, as
+/// `hash_type`), otherwise std::hash. Using the primary's hash keeps custom
+/// key types working without requiring std::hash.
+template <typename Cache, typename = void>
+struct primary_hash {
+    using type = std::hash<typename Cache::key_type>;
+};
+
+template <typename Cache>
+struct primary_hash<Cache, std::void_t<typename Cache::hash_type>> {
+    using type = typename Cache::hash_type;
+};
+
+}  // namespace detail
+
 /// A two-tier cache that combines a fast in-memory primary cache with a
 /// slower storage backend. On a primary miss, it queries the backend
 /// (read-through) and promotes the value to the primary cache.
@@ -497,14 +515,14 @@ public:
         /// Maximum number of items to promote per background cycle.
         std::size_t promotion_batch_size = 64;
 
-        /// O5: Circuit breaker configuration for the backend. When
+        /// Circuit breaker configuration for the backend. When
         /// `error_threshold > 0`, repeated backend failures trip the
         /// breaker and short-circuit subsequent requests (fail fast)
         /// until the cooldown elapses. Set `error_threshold = 0` to
         /// disable (always pass through to the backend).
         circuit_breaker_config breaker;
 
-        /// T-G5: Async writeback queue capacity. When > 0, evicted dirty
+        /// Async writeback queue capacity. When > 0, evicted dirty
         /// items are enqueued for a background worker to persist via
         /// `backend_->put()` instead of blocking the eviction callback.
         /// When 0, writeback is synchronous (legacy behavior). When the
@@ -512,7 +530,7 @@ public:
         /// `writeback_dropped_count` is incremented.
         std::size_t async_writeback_queue_capacity = 4096;
 
-        /// T-G5: Interval at which the background writeback worker drains
+        /// Interval at which the background writeback worker drains
         /// the queue. Default 10ms balances latency vs backend batch
         /// coalescing.
         std::chrono::milliseconds async_writeback_interval{10};
@@ -551,7 +569,9 @@ public:
         }
     }
 
-    ~tiered_cache() {
+    // Virtual: promoting_tiered_cache extends the promotion strategy through
+    // promote_from_backend(), and callers may hold a tiered_cache&.
+    virtual ~tiered_cache() {
         stop_promotion_worker();
         stop_writeback_worker();
     }
@@ -594,7 +614,7 @@ public:
         {
             std::shared_future<std::optional<mapped_type>> follower_fut;
             {
-                // O4: striped lock — only conflicts with other threads
+                // striped lock — only conflicts with other threads
                 // fetching the SAME key (or a key hashing to the same
                 // stripe), not with unrelated fetches.
                 const std::size_t stripe = inflight_stripe_for(key);
@@ -630,7 +650,7 @@ public:
             leader_prom.get_future().share();
         bool is_leader = false;
         {
-            // O4: striped lock — race for leader slot under the per-key stripe.
+            // striped lock — race for leader slot under the per-key stripe.
             const std::size_t stripe = inflight_stripe_for(key);
             auto inflight_lock =
                 inflight_stripes_.make_unique_lock(stripe);
@@ -664,7 +684,7 @@ public:
 
         // Phase 4: Leader — query backend outside any lock.
         //
-        // O5: Circuit breaker check. If the breaker is OPEN (tripped due
+        // Circuit breaker check. If the breaker is OPEN (tripped due
         // to repeated backend failures), short-circuit: erase the in-flight
         // entry, notify followers with nullopt, and return empty without
         // hitting the backend. This protects the backend from being
@@ -690,12 +710,12 @@ public:
         std::exception_ptr backend_ex;
         try {
             backend_value = backend_->get(key);
-            // O5: Record success — may close the circuit if in HALF_OPEN.
+            // Record success — may close the circuit if in HALF_OPEN.
             breaker_.record_success();
         } catch (...) {
             backend_threw = true;
             backend_ex = std::current_exception();
-            // O5: Record failure — may trip or re-open the circuit.
+            // Record failure — may trip or re-open the circuit.
             breaker_.record_failure();
         }
 
@@ -703,7 +723,7 @@ public:
             // Erase from in-flight table first, then propagate exception
             // to followers so they don't wait forever.
             {
-                // O4: striped lock — same stripe as the emplace above.
+                // striped lock — same stripe as the emplace above.
                 const std::size_t stripe = inflight_stripe_for(key);
                 auto inflight_lock =
                     inflight_stripes_.make_unique_lock(stripe);
@@ -763,10 +783,13 @@ public:
     void set(const key_type& key, V&& value) {
         primary_.set(key, value);
         if (config_.write_back_on_evict) {
-            // T-G5: write-through path persists immediately. The eviction
-            // callback (async or sync) handles write-back for evictions.
-            // We do NOT enqueue here because the value is already in the
-            // backend — enqueuing would create redundant puts.
+            // Write-through: the value is persisted here, so this path does
+            // NOT enqueue (that would be a redundant put). It must, however,
+            // invalidate any write-back still pending for this key and wait
+            // out a put that is already in flight, otherwise the worker could
+            // land the older evicted value after this put and silently revert
+            // the key. See claim_writeback_ownership().
+            claim_writeback_ownership(key);
             backend_->put(key, value);
             ++writebacks_;
         }
@@ -775,6 +798,11 @@ public:
     /// Delete a key from both the primary cache and the backend.
     bool del(const key_type& key) {
         auto primary_result = primary_.del(key);
+        // Invalidate the pending write-back for this key before removing it
+        // from the backend. Without this the eviction callback (which fired
+        // when the key was still live) can replay the old value afterwards
+        // and resurrect a key the caller explicitly deleted.
+        claim_writeback_ownership(key);
         backend_->remove(key);
         return primary_result;
     }
@@ -812,7 +840,7 @@ public:
             while (promotion_running_.load(std::memory_order_acquire)) {
                 std::this_thread::sleep_for(interval);
                 if (!promotion_running_.load(std::memory_order_acquire)) break;
-                promote_from_backend();
+                run_promotion_cycle();
             }
         });
     }
@@ -826,7 +854,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // T-G5: Async writeback worker
+    // Async writeback worker
     // --------------------------------------------------------------------
 
     /// Start the background writeback worker that drains the async
@@ -845,20 +873,11 @@ public:
                 // Drain the queue under the lock, then release before
                 // calling backend_->put() so a slow backend doesn't
                 // block the eviction callback.
-                std::deque<std::pair<key_type, mapped_type>> batch;
+                std::deque<writeback_entry> batch;
                 batch.swap(writeback_queue_);
                 lk.unlock();
-                for (auto& [k, v] : batch) {
-                    try {
-                        backend_->put(k, v);
-                        ++writebacks_;
-                    } catch (...) {
-                        // Backend error on a single item must not crash
-                        // the writeback thread (an uncaught exception in
-                        // a std::thread triggers std::terminate). Drop
-                        // the offending item and keep draining.
-                        ++writeback_dropped_;
-                    }
+                for (auto& item : batch) {
+                    flush_one_writeback(item);
                 }
             }
             // Final drain after stop signal — bounded by a 5s deadline
@@ -866,7 +885,7 @@ public:
             // indefinitely. The queue is swapped out under a short lock
             // so the mutex is NOT held during backend I/O; remaining
             // items after the timeout are dropped and counted.
-            std::deque<std::pair<key_type, mapped_type>> remaining;
+            std::deque<writeback_entry> remaining;
             {
                 std::lock_guard<std::mutex> lk(writeback_mtx_);
                 remaining.swap(writeback_queue_);
@@ -877,12 +896,7 @@ public:
                    std::chrono::steady_clock::now() < deadline) {
                 auto item = std::move(remaining.front());
                 remaining.pop_front();
-                try {
-                    backend_->put(item.first, item.second);
-                    ++writebacks_;
-                } catch (...) {
-                    ++writeback_dropped_;
-                }
+                flush_one_writeback(item);
             }
             if (!remaining.empty()) {
                 writeback_dropped_.fetch_add(
@@ -901,20 +915,125 @@ public:
         }
     }
 
-    /// T-G5: Number of dirty items dropped because the async writeback
+    /// Number of dirty items dropped because the async writeback
     /// queue was full.
     std::size_t writeback_dropped_count() const noexcept {
         return writeback_dropped_.load(std::memory_order_relaxed);
     }
 
-    /// T-G5: Current number of items pending in the async writeback queue.
+    /// Number of queued write-backs skipped because a newer set()/del() on
+    /// the same key already owned the truth. These are deliberate skips, not
+    /// data loss — they are counted separately from writeback_dropped_count()
+    /// so an operator can tell "queue overflow" from "write coalescing".
+    std::size_t writeback_superseded_count() const noexcept {
+        return writeback_superseded_.load(std::memory_order_relaxed);
+    }
+
+    /// Current number of items pending in the async writeback queue.
     std::size_t writeback_queue_size() const noexcept {
         std::lock_guard<std::mutex> lk(writeback_mtx_);
         return writeback_queue_.size();
     }
 
 private:
-    /// T-G5: Wire up the eviction callback. When
+    /// One queued write-back. `gen` is the value of writeback_gen_ at the
+    /// moment the eviction callback enqueued it; it is compared against
+    /// writeback_keys_[key].gen to decide whether the entry is still the
+    /// newest intent for that key.
+    struct writeback_entry {
+        key_type key;
+        mapped_type value;
+        std::uint64_t gen;
+    };
+
+    /// Write-back bookkeeping for a key that currently has queued work.
+    ///
+    /// An entry exists only while the queue holds something for that key, so
+    /// the map stays bounded by the queue capacity: it is created by the
+    /// eviction callback, and erased by the worker when it publishes the
+    /// write, by the drop path, or by claim_writeback_ownership().
+    struct writeback_key_state {
+        std::uint64_t gen = 0;     ///< generation stamped on the queued entry
+        bool in_flight = false;    ///< the worker is inside backend_->put()
+    };
+
+    /// Drop the oldest pending entry (called with writeback_mtx_ held).
+    /// Also retires the key's bookkeeping when that entry was its newest
+    /// intent, so writeback_keys_ stays bounded by the queue capacity.
+    void drop_oldest_writeback_locked() {
+        const writeback_entry& oldest = writeback_queue_.front();
+        auto it = writeback_keys_.find(oldest.key);
+        if (it != writeback_keys_.end() && it->second.gen == oldest.gen) {
+            writeback_keys_.erase(it);
+        }
+        writeback_queue_.pop_front();
+        writeback_dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// Take ownership of `key`'s write-back away from the queue.
+    ///
+    /// The caller performs its own backend write immediately after this
+    /// returns, and the wait guarantees the worker's older put has already
+    /// landed, so the caller's write is the last one for the key. Without the
+    /// wait a worker put could land *after* the caller's and revert the value
+    /// (or, for `del`, resurrect the key).
+    ///
+    /// Dropping the record rather than bumping its generation is what keeps
+    /// writeback_keys_ bounded: the worker treats a missing record as "a newer
+    /// intent owns this key" and skips the write, so no stale entry survives
+    /// to accumulate. Creating a record here instead would leak one entry per
+    /// distinct key ever written when write-back is enabled.
+    void claim_writeback_ownership(const key_type& key) {
+        std::unique_lock<std::mutex> lk(writeback_mtx_);
+        if (writeback_keys_.find(key) == writeback_keys_.end()) {
+            return;  // nothing queued for this key
+        }
+        // Release the mutex while waiting for an in-flight put to land. The
+        // worker may erase the entry while we wait, which invalidates any
+        // iterator we held, so re-find it on every evaluation.
+        writeback_claim_cv_.wait(lk, [&] {
+            auto it = writeback_keys_.find(key);
+            return it == writeback_keys_.end() || !it->second.in_flight;
+        });
+        writeback_keys_.erase(key);
+    }
+
+    /// Write one entry back, honouring the generation contract.
+    void flush_one_writeback(const writeback_entry& item) {
+        {
+            std::lock_guard<std::mutex> lk(writeback_mtx_);
+            auto it = writeback_keys_.find(item.key);
+            if (it == writeback_keys_.end() || it->second.gen != item.gen) {
+                // A newer set()/del() owns this key; replaying the evicted
+                // value would revert or resurrect it.
+                writeback_superseded_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            it->second.in_flight = true;
+        }
+        try {
+            backend_->put(item.key, item.value);
+            ++writebacks_;
+        } catch (...) {
+            // Backend error on a single item must not crash the writeback
+            // thread (an uncaught exception in a std::thread triggers
+            // std::terminate). Drop the offending item and keep draining.
+            writeback_dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
+        {
+            std::lock_guard<std::mutex> lk(writeback_mtx_);
+            auto it = writeback_keys_.find(item.key);
+            if (it != writeback_keys_.end()) {
+                it->second.in_flight = false;
+                if (it->second.gen == item.gen) {
+                    writeback_keys_.erase(it);  // published cleanly
+                }
+            }
+            writeback_claim_cv_.notify_all();
+        }
+    }
+
+    /// Wire up the eviction callback. When
     /// `async_writeback_queue_capacity > 0`, the callback enqueues the
     /// dirty item and returns immediately (O(1) amortized — a lock+copy
     /// + notify). When the queue is full, the oldest pending item is
@@ -929,13 +1048,21 @@ private:
                 {
                     std::lock_guard<std::mutex> lk(writeback_mtx_);
                     if (writeback_queue_.size() >= config_.async_writeback_queue_capacity) {
-                        // Queue full — drop the oldest pending item to
-                        // make room. This favors recency over age under
-                        // sustained writeback pressure.
-                        writeback_queue_.erase(writeback_queue_.begin());
-                        writeback_dropped_.fetch_add(1, std::memory_order_relaxed);
+                        // Queue full — drop the oldest pending item to make
+                        // room. This favors recency over age under sustained
+                        // writeback pressure. pop_front() is O(1) on a deque
+                        // (erase(begin()) is O(n)).
+                        drop_oldest_writeback_locked();
                     }
-                    writeback_queue_.emplace_back(key, value);
+                    // Stamp the entry with a fresh generation so that a later
+                    // set()/del() on this key invalidates it. The in-flight
+                    // flag is preserved: a write-back for this key may be
+                    // running right now, and clearing the flag would let a
+                    // concurrent set()/del() assume it had drained.
+                    writeback_key_state& st = writeback_keys_[key];
+                    st.gen = ++writeback_gen_;
+                    writeback_queue_.push_back(
+                        writeback_entry{key, value, st.gen});
                 }
                 writeback_cv_.notify_one();
             });
@@ -951,17 +1078,25 @@ private:
 
 public:
 
-    /// Manually trigger a single promotion cycle from the backend.
-    std::size_t promote_from_backend() {
-        // Subclasses can override the promotion strategy.
-        // Default: iterate keys from primary's snapshot, check backend
-        // for missing items, and promote the first N.
-        std::size_t promoted = 0;
-        // This base implementation relies on the backend providing a way
-        // to enumerate keys. Since storage_backend doesn't require key
-        // enumeration, the default promotion is a no-op.
-        // Users should subclass and override promote_from_backend() or
-        // provide a custom promotion strategy via the constructor.
+    /// Promote items from the backend into the primary cache.
+    ///
+    /// Override hook: the base implementation is a no-op because
+    /// storage_backend does not require key enumeration, so the generic
+    /// tiered_cache cannot scan the backend. promoting_tiered_cache
+    /// overrides this for enumerable backends. Returns the number of items
+    /// actually promoted.
+    virtual std::size_t promote_from_backend() { return 0; }
+
+    /// Run one promotion cycle and account for it.
+    ///
+    /// The background worker calls this rather than promote_from_backend()
+    /// directly, so the promotions counter has exactly one writer and stays
+    /// correct for every override.
+    std::size_t run_promotion_cycle() {
+        const std::size_t promoted = promote_from_backend();
+        if (promoted != 0) {
+            promotions_.fetch_add(promoted, std::memory_order_relaxed);
+        }
         return promoted;
     }
 
@@ -979,9 +1114,9 @@ public:
         // Number of get() calls served by waiting on an in-flight leader
         // rather than issuing a duplicate backend request.
         std::size_t inflight_followers = 0;
-        // O5: Number of get() calls short-circuited by the circuit breaker.
+        // Number of get() calls short-circuited by the circuit breaker.
         std::size_t circuit_breaker_rejections = 0;
-        // T-G5: Dirty items dropped because the async writeback queue
+        // Dirty items dropped because the async writeback queue
         // was full. Non-zero under sustained eviction pressure with a
         // slow backend.
         std::size_t writeback_dropped = 0;
@@ -1024,7 +1159,7 @@ public:
     }
 
     // --------------------------------------------------------------------
-    // O5: Circuit breaker access
+    // Circuit breaker access
     // --------------------------------------------------------------------
 
     /// Access the backend circuit breaker (for config inspection/state).
@@ -1036,7 +1171,7 @@ public:
     /// Returns the number of keys currently being fetched by a leader
     /// (i.e., the size of the in-flight table). For diagnostics/tests.
     ///
-    /// O4: With striped locking, there's no single lock that protects
+    /// With striped locking, there's no single lock that protects
     /// the entire map. We acquire all stripes (in ascending order to
     /// avoid deadlock) to get a consistent snapshot. This is O(N) on
     /// the number of stripes (default 64) but is only called from
@@ -1061,8 +1196,15 @@ public:
 private:
     primary_type primary_;
     Backend* backend_;  // non-owning
+
+protected:
+    /// Policy for promotion batching, writeback and the worker intervals.
+    /// Protected rather than private so a strategy that extends the eviction
+    /// hook (promoting_tiered_cache) can read promotion_batch_size without a
+    /// public accessor that would also expose mutation.
     config config_;
 
+private:
     // Statistics (atomic for lock-free updates)
     std::atomic<std::size_t> primary_hits_{0};
     std::atomic<std::size_t> primary_misses_{0};
@@ -1074,11 +1216,11 @@ private:
     // leader instead of querying the backend themselves (thundering herd
     // prevention metric).
     std::atomic<std::size_t> inflight_followers_{0};
-    // O5: Number of get() calls that were short-circuited by the circuit
+    // Number of get() calls that were short-circuited by the circuit
     // breaker (OPEN state) without hitting the backend.
     std::atomic<std::size_t> circuit_breaker_rejections_{0};
 
-    // O5: Backend circuit breaker. Initialized from config_.breaker.
+    // Backend circuit breaker. Initialized from config_.breaker.
     backend_circuit_breaker breaker_;
 
     // In-flight table for thundering-herd prevention. Maps a key to the
@@ -1086,7 +1228,7 @@ private:
     // backend. Followers find their future here and wait on it instead
     // of issuing a duplicate backend request.
     //
-    // O4: striped locking — instead of a single global mutex, the
+    // striped locking — instead of a single global mutex, the
     // inflight table is sharded into N stripes (default 64), each with
     // its OWN mutex (from inflight_stripes_) and its OWN unordered_map
     // (from inflight_maps_). This is critical: concurrent emplace() on
@@ -1102,7 +1244,7 @@ private:
     mutable std::vector<std::unordered_map<
         key_type, std::shared_future<std::optional<mapped_type>>>> inflight_maps_;
 
-    /// O4: Compute the stripe index for a key. Uses std::hash<key_type>
+    /// Compute the stripe index for a key. Uses std::hash<key_type>
     /// which is the same hash function the primary cache uses by default.
     std::size_t inflight_stripe_for(const key_type& key) const noexcept {
         return inflight_stripes_.stripe_for(
@@ -1113,16 +1255,29 @@ private:
     std::atomic<bool> promotion_running_{false};
     std::thread promotion_thread_;
 
-    // T-G5: Async writeback queue + worker. The eviction callback enqueues
+    // Async writeback queue + worker. The eviction callback enqueues
     // dirty items here under writeback_mtx_; the writeback_thread_ drains
     // the queue and calls backend_->put() outside the eviction path so a
     // slow backend cannot block cache operations.
+    //
+    // Ordering: an enqueue alone is not enough to keep write-back correct,
+    // because the primary can evict, then the caller can set() or del() the
+    // same key before the worker runs. writeback_keys_ records the newest
+    // intent per key and writeback_claim_cv_ lets set()/del() wait out a put
+    // that is already in flight, so the last mutation always wins on the
+    // backend. All three are guarded by writeback_mtx_.
     mutable std::mutex writeback_mtx_;
     std::condition_variable writeback_cv_;
-    std::deque<std::pair<key_type, mapped_type>> writeback_queue_;
+    std::condition_variable writeback_claim_cv_;
+    std::deque<writeback_entry> writeback_queue_;
+    std::unordered_map<key_type, writeback_key_state,
+                       typename detail::primary_hash<primary_type>::type>
+        writeback_keys_;
+    std::uint64_t writeback_gen_ = 0;
     std::atomic<bool> writeback_running_{false};
     std::thread writeback_thread_;
     std::atomic<std::size_t> writeback_dropped_{0};
+    std::atomic<std::size_t> writeback_superseded_{0};
 };
 
 // ============================================================================
@@ -1181,7 +1336,7 @@ public:
     }
 
     std::vector<Key> enumerate_keys() const override {
-        std::shared_lock lock(mutex_);
+        std::lock_guard lock(mutex_);
         std::vector<Key> keys;
         keys.reserve(data_.size());
         for (const auto& [k, v] : data_) {

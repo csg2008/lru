@@ -18,7 +18,7 @@ using namespace lru::detail;
 
 TEST(RefcountTest, BasicIncDecRef) {
     refcount_with_flags rc;
-    // P1-22: incRef() requires kLinked (see RefcountTest.IncRefRequiresLinked),
+    // incRef() requires kLinked (see RefcountTest.IncRefRequiresLinked),
     // so an item must be in the MM container before it can be pinned.
     rc.markInMMContainer();
     EXPECT_EQ(rc.getAccessRef(), 0u);
@@ -33,7 +33,7 @@ TEST(RefcountTest, BasicIncDecRef) {
     EXPECT_EQ(r2, IncResult::kIncOk);
     EXPECT_EQ(rc.getAccessRef(), 2u);
 
-    // P0-3: decRef() returns the new raw refcount word. Assert on its
+    // decRef() returns the new raw refcount word. Assert on its
     // access-ref bits as well as via getAccessRef() so the return value is
     // genuinely exercised (-Wunused-but-set-variable) and the two views of the
     // same state are cross-checked.
@@ -52,7 +52,7 @@ TEST(RefcountTest, BasicIncDecRef) {
 
 TEST(RefcountTest, IncRefMultipleTimes) {
     refcount_with_flags rc;
-    // P1-22: incRef() requires kLinked — see RefcountTest.IncRefRequiresLinked.
+    // incRef() requires kLinked — see RefcountTest.IncRefRequiresLinked.
     rc.markInMMContainer();
     for (int i = 0; i < 100; ++i) {
         auto r = rc.incRef();
@@ -241,7 +241,7 @@ TEST(RefcountTest, IsDrained) {
     rc.unmarkInMMContainer();
     EXPECT_TRUE(rc.isDrained());
 
-    // P1-22: incRef() requires kLinked.
+    // incRef() requires kLinked.
     rc.markInMMContainer();
     EXPECT_EQ(rc.incRef(), IncResult::kIncOk);
     EXPECT_FALSE(rc.isDrained());
@@ -331,7 +331,7 @@ TEST(RefcountTest, RawValueLayout) {
     refcount_with_flags rc;
     EXPECT_EQ(rc.getRaw(), 0u);
 
-    // P1-22: incRef() requires kLinked, so mark the container first.
+    // incRef() requires kLinked, so mark the container first.
     rc.markInMMContainer();
     EXPECT_EQ(rc.incRef(), IncResult::kIncOk);
     // access_ref should be 1 → bit 0 is set
@@ -346,7 +346,7 @@ TEST(RefcountTest, RawValueLayout) {
 }
 
 // ============================================================================
-// P1-22: kLinked is the pin barrier — incRef() fails on an unlinked item
+// kLinked is the pin barrier — incRef() fails on an unlinked item
 // ============================================================================
 
 TEST(RefcountTest, IncRefRequiresLinked) {

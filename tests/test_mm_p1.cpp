@@ -53,14 +53,14 @@ struct replace_node_access : Mm {
 };
 
 // ============================================================================
-// P1-19 / P1-23: capacity is enforced by ONE gate, and rejection is visible
+// capacity is enforced by ONE gate, and rejection is visible
 // ============================================================================
 //
 // Every eviction strategy is exercised. `EvictionPredicate` refuses to evict
 // anything, which is the strongest form of "no candidate may be reclaimed":
 // the previous per-strategy `insert_new()` bodies inserted regardless of
 // whether an eviction had succeeded, so size() grew without bound. After
-// P1-19 (方案 B) the unified_cache admission gate must roll the insert back and
+// the unified_cache admission gate must roll the insert back and
 // report the rejection.
 template <typename Cache>
 void expect_capacity_enforced_under_pin_pressure() {
@@ -90,16 +90,16 @@ void expect_capacity_enforced_under_pin_pressure() {
         c.set(i, i);
     }
 
-    // P1-19: the capacity invariant holds no matter what the MM layer tried.
+    // the capacity invariant holds no matter what the MM layer tried.
     EXPECT_LE(c.size(), kMax)
         << "P1-19: size() must never exceed max_size even when every item is pinned";
-    // P1-23 方案 B: the failure is observable, not silent.
+    // The failure is observable, not silent.
     EXPECT_GT(rejects, 0u)
         << "P1-23: a refused insertion must be reported via on_reject";
 }
 
 // ============================================================================
-// P1-21: bounded-time return when the tiny tail is pinned
+// bounded-time return when the tiny tail is pinned
 // ============================================================================
 
 TEST(MmP1, P1_21_TinyTailPinnedReturnsInBoundedTime) {
@@ -128,7 +128,7 @@ TEST(MmP1, P1_21_TinyTailPinnedReturnsInBoundedTime) {
 }
 
 // ============================================================================
-// P1-24: replace_node() keeps map / list / refcount coherent
+// replace_node() keeps map / list / refcount coherent
 // ============================================================================
 
 TEST(MmP1, P1_24_ReplaceNodeKeepsStateCoherent) {
@@ -155,7 +155,7 @@ TEST(MmP1, P1_24_ReplaceNodeKeepsStateCoherent) {
 
     mm.do_replace(old_node, new_node);
 
-    // P1-24: the new node must be the live, container-registered one.
+    // the new node must be the live, container-registered one.
     EXPECT_TRUE(new_node->refcount.isInMMContainer())
         << "P1-24: new_node must be marked in the MM container";
     EXPECT_TRUE(new_node->hook.is_linked())
@@ -175,7 +175,7 @@ TEST(MmP1, P1_24_ReplaceNodeKeepsStateCoherent) {
         EXPECT_EQ(*live, 100);
     }
 
-    // P1-24: a replaced node must be removable. Before the fix new_node never
+    // a replaced node must be removable. Before the fix new_node never
     // got kLinked, so `remove_from_list()` early-returned on the D5 guard and
     // `pop()` returned nullopt (an item that can never leave the cache is a
     // permanent leak). `mm_lru::pop()` is used directly so that an access
@@ -192,7 +192,7 @@ TEST(MmP1, P1_24_ReplaceNodeKeepsStateCoherent) {
 }
 
 // ============================================================================
-// P1-27: a hot probation tail must not block window promotion
+// a hot probation tail must not block window promotion
 // ============================================================================
 
 TEST(MmP1, P1_27_HotProbationTailStillPromotesWindow) {
@@ -208,7 +208,7 @@ TEST(MmP1, P1_27_HotProbationTailStillPromotesWindow) {
         c.set(i, i);
     }
 
-    // P1-27: promotion must still happen — the swap (not an eviction) keeps the
+    // promotion must still happen — the swap (not an eviction) keeps the
     // cache full rather than permanently one slot short, and the window keeps
     // rotating. Assert both effects.
     EXPECT_EQ(c.size(), c.max_size())
@@ -225,7 +225,7 @@ TEST(MmP1, P1_27_HotProbationTailStillPromotesWindow) {
 }
 
 // ============================================================================
-// P1-28: TinyLFU's promotion path performs the admission comparison
+// TinyLFU's promotion path performs the admission comparison
 // ============================================================================
 //
 // Verified structurally through the frequency-protected window→main handoff:
@@ -265,10 +265,10 @@ TEST(MmP1, P1_28_TinyLfuPromotionRespectsFrequency) {
 }
 
 // ============================================================================
-// P1-30: strict capacity by default, explicit amplification opt-in
+// strict capacity by default, explicit amplification opt-in
 // ============================================================================
 //
-// P1-30 方案 A makes silent amplification a hard error. 方案 B's complement —
+// Option A makes silent amplification a hard error. Option B's complement -
 // also implemented — removes the *need* to throw for the common
 // `striped_cache<K,V> c{N}` case by deriving the shard/stripe count from the
 // requested capacity, so a request of N slots becomes N shards rather than 64
@@ -343,7 +343,7 @@ TEST(MmP1, P1_30_AllowAmplificationOptIn) {
 }
 
 // ============================================================================
-// P1-41: eviction still starts from the oldest evictable item
+// eviction still starts from the oldest evictable item
 // ============================================================================
 
 TEST(MmP1, P1_41_PinnedTailDoesNotHideOlderItems) {
@@ -390,7 +390,7 @@ TEST(MmP1, P1_41_PinnedTailDoesNotHideOlderItems) {
 }
 
 // ============================================================================
-// P1-42: pop_lru() accounting must return current_memory() to zero
+// pop_lru() accounting must return current_memory() to zero
 // ============================================================================
 
 template <typename Cache>
@@ -408,7 +408,7 @@ void expect_pop_lru_drains_memory() {
         auto popped = c.pop_lru();
         ASSERT_TRUE(popped.has_value()) << "pop_lru must yield item " << i;
     }
-    // P1-42: the memory charge must have been computed from the pre-move value,
+    // the memory charge must have been computed from the pre-move value,
     // so N pops exactly cancel N inserts.
     EXPECT_EQ(c.size(), 0u);
     EXPECT_EQ(c.current_memory(), 0u)
@@ -428,7 +428,7 @@ TEST(MmP1, P1_42_PopLruRestoresMemoryToZeroLru) {
 }
 
 // ============================================================================
-// P1-43 / P1-44: the two size notions stay identical after an insert failure
+// the two size notions stay identical after an insert failure
 // ============================================================================
 //
 // P1-44 removes the split between "linked in a queue" and "present in the map"
@@ -515,7 +515,7 @@ TEST(MmP1, P1_19_23_CapacityEnforcedUnderPinPressureWTinyLfu) {
 }
 
 // ============================================================================
-// P1-32: TTL semantics are consistent across the read APIs
+// TTL semantics are consistent across the read APIs
 // ============================================================================
 //
 // `contains()` and the `get()`/`get_with_ttl()` family must agree about an
@@ -545,7 +545,7 @@ TEST(MmP1, P1_32_TtlConsistentAcrossReadApis) {
     // Let key 2 lapse.
     std::this_thread::sleep_for(30ms);
 
-    // P1-32: the read paths must agree that key 2 is gone while key 1 remains.
+    // the read paths must agree that key 2 is gone while key 1 remains.
     EXPECT_TRUE(c.contains(1)) << "P1-32: a non-TTL key must stay present";
     EXPECT_FALSE(c.contains(2)) << "P1-32: contains() must honour TTL";
     {
@@ -570,7 +570,7 @@ TEST(MmP1, P1_32_TtlConsistentAcrossReadApis) {
 }
 
 // ============================================================================
-// P1-31: a pinned oldest-expiry item must not block the other expiries
+// a pinned oldest-expiry item must not block the other expiries
 // ============================================================================
 
 TEST(MmP1, P1_31_PinnedOldestExpiryDoesNotStarveOtherKeys) {
@@ -596,7 +596,7 @@ TEST(MmP1, P1_31_PinnedOldestExpiryDoesNotStarveOtherKeys) {
     std::this_thread::sleep_for(120ms);
 
     const auto evicted = c.evict_expired_now();
-    // P1-31 (A1): the pinned key is deferred, but the other expired keys are
+    // the pinned key is deferred, but the other expired keys are
     // still processed in the same call. The old heap loop `break`ed on the first
     // pinned entry (which is key 1, the earliest expiry), so a single long-lived
     // handle over the earliest-expiring key blocked every subsequent expiry.

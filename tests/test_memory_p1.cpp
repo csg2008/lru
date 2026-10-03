@@ -1,4 +1,4 @@
-// Unified LRU Cache Library — regression tests for spec/fix.01.md §3.3
+// Unified LRU Cache Library - slab allocator and memory monitor regression tests.
 // (slab allocator / memory monitor fixes P1-13 … P1-18)
 // SPDX-License-Identifier: MIT
 //
@@ -620,4 +620,76 @@ TEST(MemoryP1Test, SnapshotAggregatesNumaNodes) {
     }
     held.clear();
     EXPECT_EQ(alloc.snapshot().live_bytes_total, 0u);
+}
+
+// ---------------------------------------------------------------------------
+// Real payload billing (max_memory as a byte budget, not an item-count proxy)
+// ---------------------------------------------------------------------------
+//
+// Without a size calculator the cache bills a compile-time constant per item,
+// so a 1 KB std::string and a 10-byte one are billed identically and max_memory
+// is really an item count. These tests pin the API that fixes the accounting.
+
+TEST(MemoryPayloadSizes, DeepSizeReportsContainerFootprint) {
+    // deep_size reports the CONTAINER OBJECT plus its heap payload, which is
+    // what a byte budget has to account for. It uses capacity(), not size():
+    // the allocated block is what occupies memory. Note that capacity() is
+    // never 0 for std::string -- the small-string buffer counts -- so the
+    // assertions are >= rather than exact.
+    EXPECT_GE(lru::detail::deep_size(std::string{}), sizeof(std::string));
+    EXPECT_GE(lru::detail::deep_size(std::string(1000, 'x')),
+              sizeof(std::string) + 1000u);
+
+    std::vector<int> v;
+    v.reserve(64);
+    EXPECT_EQ(v.capacity(), 64u);
+    EXPECT_EQ(lru::detail::deep_size(v),
+              sizeof(std::vector<int>) + 64u * sizeof(int));
+
+    // Trivially-copyable types fall back to sizeof(T).
+    EXPECT_EQ(lru::detail::deep_size(int{7}), sizeof(int));
+}
+
+TEST(MemoryPayloadSizes, ValueSizeCalculatorIsHonoured) {
+    lru::safe_cache<int, std::string> c(64);
+
+    // Baseline: the default billing ignores the payload entirely.
+    c.set(0, std::string(4000, 'z'));
+    const std::size_t default_billed = c.current_memory();
+
+    lru::safe_cache<int, std::string> c2(64);
+    c2.use_real_payload_sizes();
+    c2.set(0, std::string(4000, 'z'));
+    const std::size_t real_billed = c2.current_memory();
+
+    EXPECT_GT(real_billed, default_billed)
+        << "billing the real payload must exceed the constant-per-item default";
+
+    // Two items whose payloads differ by 100x must be billed differently under
+    // real accounting; under the default they are billed identically.
+    lru::safe_cache<int, std::string> a(64), b(64);
+    a.use_real_payload_sizes();
+    b.use_real_payload_sizes();
+
+    a.set(1, std::string(10, 'p'));
+    const std::size_t one_small = a.current_memory();
+    a.set(2, std::string(1000, 'p'));
+    const std::size_t small_plus_large = a.current_memory();
+
+    b.set(1, std::string(10, 'p'));
+    b.set(2, std::string(10, 'p'));
+    const std::size_t two_small = b.current_memory();
+
+    EXPECT_GT(small_plus_large, two_small)
+        << "a 1000-byte payload must cost more than a 10-byte one";
+    EXPECT_GT(small_plus_large - one_small, 900u);
+}
+
+TEST(MemoryPayloadSizes, KeySizeCalculatorIsHonoured) {
+    lru::safe_cache<std::string, int> c(64);
+    c.set_key_size_calculator(
+        [](const std::string& k) { return lru::detail::deep_size(k); });
+
+    c.set(std::string(2000, 'k'), 1);
+    EXPECT_GT(c.current_memory(), 2000u);
 }

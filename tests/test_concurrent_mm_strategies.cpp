@@ -2,7 +2,7 @@
 // Concurrent correctness tests for non-LRU eviction strategies.
 //
 // Covers spec gap G12 (P2):
-//   G12: TinyLFU / W-TinyLFU / 2Q / FIFO concurrent correctness
+//   TinyLFU / W-TinyLFU / 2Q / FIFO concurrent correctness
 //        Verify hit+miss == total and data integrity under multi-thread load.
 
 #include <gtest/gtest.h>
@@ -90,7 +90,7 @@ void run_concurrent_correctness(CacheT& c, int num_threads, int ops_per_thread) 
 }  // namespace
 
 // ============================================================================
-// TC-G12: TinyLFU concurrent correctness
+// TinyLFU concurrent correctness
 //
 // Uses the `safe_lfu_cache` alias (unified_cache + tiny_lfu_trait +
 // thread_safe_policy, single global distributed_shared_mutex) because the
@@ -112,7 +112,7 @@ TEST(ConcurrentMMStrategies, TinyLfuConcurrentCorrectness) {
 }
 
 // ============================================================================
-// TC-G12: W-TinyLFU concurrent correctness
+// W-TinyLFU concurrent correctness
 // ============================================================================
 TEST(ConcurrentMMStrategies, WTinyLfuConcurrentCorrectness) {
     safe_w_tiny_lfu<int, int> c(8000);
@@ -120,7 +120,7 @@ TEST(ConcurrentMMStrategies, WTinyLfuConcurrentCorrectness) {
 }
 
 // ============================================================================
-// TC-G12: 2Q concurrent correctness
+// 2Q concurrent correctness
 // ============================================================================
 TEST(ConcurrentMMStrategies, TwoQConcurrentCorrectness) {
     safe_two_q<int, int> c(8000);
@@ -128,7 +128,7 @@ TEST(ConcurrentMMStrategies, TwoQConcurrentCorrectness) {
 }
 
 // ============================================================================
-// TC-G12: FIFO concurrent correctness
+// FIFO concurrent correctness
 // ============================================================================
 TEST(ConcurrentMMStrategies, FifoConcurrentCorrectness) {
     safe_fifo_cache<int, int> c(8000);
@@ -136,7 +136,7 @@ TEST(ConcurrentMMStrategies, FifoConcurrentCorrectness) {
 }
 
 // ============================================================================
-// TC-G12 (extended): TinyLFU under heavy read load + occasional writes
+// TinyLFU under heavy read load + occasional writes
 // Verifies data integrity when reads dominate.
 //
 // Uses `safe_lfu_cache` (thread-safe variant) because `lfu_cache` is
@@ -176,7 +176,7 @@ TEST(ConcurrentMMStrategies, TinyLfuReadHeavyCorrectness) {
 }
 
 // ============================================================================
-// H-1-C: Repeated set() on the SAME key from multiple threads.
+// Repeated set() on the SAME key from multiple threads.
 //
 // Verifies the insert_new/update_existing split for mm_2q / mm_tiny_lfu /
 // mm_wtiny_lfu does NOT trigger the historical assertions:
@@ -249,7 +249,7 @@ TEST(ConcurrentMMStrategies, MmWTinyLfuRepeatSetOnSameKey) {
 }
 
 // ============================================================================
-// H-1-B (negative assertion): Under high concurrency with mixed insert +
+// Under high concurrency with mixed insert +
 // update paths, no assertion fires. Each thread interleaves new-key inserts
 // with updates to a shared hot key, exercising the cross-queue promotion
 // path (Cold->Warm for mm_2q, Probation->Protection for mm_wtiny_lfu).

@@ -16,3 +16,8 @@ _deps/
 gdb_output.log
 verify_output.log
 build_log.txt
+
+# Local audit scratch (compile probes, translation scripts, one-off analysis).
+# Never committed: it holds working copies of headers, which would both confuse
+# the tree and trip the CJK / task-id CI gates.
+.audit/

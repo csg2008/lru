@@ -179,7 +179,7 @@ public:
 
     /// Begin a read section. Returns the current sequence number.
     ///
-    /// P1-7 (fix.01 方案 A): this is a plain load — it deliberately does NOT
+    /// this is a plain load — it deliberately does NOT
     /// wait for an in-progress writer, and never sleeps. Waiting here inverted
     /// the entire point of a seqlock: one preempted writer put *every* reader
     /// to sleep for microseconds-to-milliseconds, so a rare writer could
@@ -290,12 +290,14 @@ private:
 // Striped Mutex
 // ============================================================================
 
-// cacheline 大小：固定为 64 以避免 std::hardware_destructive_interference_size 的 ABI
-// 警告（其值可能随编译器版本或 -mtune 变化）。x86/ARM 常规 cacheline 均为 64。
+// Cacheline size is fixed at 64 rather than using
+// std::hardware_destructive_interference_size, whose value can change with the
+// compiler version or -mtune and would therefore be an ABI hazard. x86 and ARM
+// both use 64-byte cachelines in practice.
 inline constexpr std::size_t kCachelineSize = 64;
 
-// 每个 stripe 的 mutex 独占一个 cacheline，消除多核 false sharing。
-// 对齐 CacheLib 的 folly::cacheline_aligned<Mutex> 用法（MMLru.h:474）。
+// Each stripe's mutex owns a whole cacheline, eliminating false sharing between
+// cores. Mirrors CacheLib's folly::cacheline_aligned<Mutex> (MMLru.h:474).
 template <typename MutexType>
 struct alignas(kCachelineSize) AlignedMutex {
     MutexType mutex;
@@ -360,7 +362,7 @@ public:
         return std::unique_lock<MutexType>(stripes_[stripe].mutex, std::try_to_lock);
     }
 
-    // T-G1: Try to shared-lock a stripe (non-blocking). Used by the
+    // Try to shared-lock a stripe (non-blocking). Used by the
     // value-layer TTL scanner to avoid blocking writers.
     auto try_make_shared_lock(std::size_t stripe) {
         return std::shared_lock<MutexType>(stripes_[stripe].mutex, std::try_to_lock);
@@ -368,14 +370,15 @@ public:
 
     std::size_t size() const noexcept { return stripes_.size(); }
 
-    // P2-2: Access a specific stripe's mutex by index. Used for runtime
+    // Access a specific stripe's mutex by index. Used for runtime
     // configuration (e.g., set_lock_order_checking, set_fairness_mode).
     MutexType& mutex_at(std::size_t stripe) { return stripes_[stripe].mutex; }
     const MutexType& mutex_at(std::size_t stripe) const { return stripes_[stripe].mutex; }
 
     // Lock all stripes (for operations that need exclusive global access).
-    // 异常安全：若某个 stripe 的 lock 抛异常，回滚所有已锁定的 stripe，避免死锁。
-    // 仅异常路径有额外开销，正常路径无性能损失。
+    // Exception safety: if locking a stripe throws, unlock every stripe already
+    // held, so the caller cannot deadlock against itself. The rollback costs
+    // nothing on the normal path.
     void lock_all() {
         std::size_t locked = 0;
         try {
@@ -437,10 +440,10 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // P1-1: Writer starvation detector forwarding
+    // Writer starvation detector forwarding
     // ----------------------------------------------------------------
 
-    /// P1-1: Set the writer starvation timeout on every stripe.
+    /// Set the writer starvation timeout on every stripe.
     template <typename M = MutexType>
     auto set_writer_starvation_timeout(uint64_t timeout_ns)
         -> decltype(std::declval<M&>().set_writer_starvation_timeout(timeout_ns), void())
@@ -448,7 +451,7 @@ public:
         for (auto& a : stripes_) a.mutex.set_writer_starvation_timeout(timeout_ns);
     }
 
-    /// P1-1: Aggregate writer_starvation_events across all stripes.
+    /// Aggregate writer_starvation_events across all stripes.
     template <typename M = MutexType>
     auto writer_starvation_events() const
         -> decltype(std::declval<const M&>().writer_starvation_events())
@@ -458,7 +461,7 @@ public:
         return total;
     }
 
-    /// P1-1: Maximum writer_max_wait_ns across all stripes.
+    /// Maximum writer_max_wait_ns across all stripes.
     template <typename M = MutexType>
     auto writer_max_wait_ns() const
         -> decltype(std::declval<const M&>().writer_max_wait_ns())
@@ -471,7 +474,7 @@ public:
         return max_ns;
     }
 
-    /// P1-1: Reset writer_max_wait_ns on every stripe.
+    /// Reset writer_max_wait_ns on every stripe.
     template <typename M = MutexType>
     auto reset_writer_max_wait_ns()
         -> decltype(std::declval<M&>().reset_writer_max_wait_ns(), void())
@@ -479,7 +482,7 @@ public:
         for (auto& a : stripes_) a.mutex.reset_writer_max_wait_ns();
     }
 
-    /// P1-5 (T1.5): Quiescent variant — acquires all stripes exclusively
+    /// Quiescent variant — acquires all stripes exclusively
     /// (draining all in-flight readers), then atomically switches every
     /// stripe's fairness mode, then releases. Guarantees no in-flight
     /// operation observes a mode change mid-critical-section.
@@ -533,7 +536,7 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // T-B2 (P0-1-补): NUMA-aware reader counter forwarding
+    // NUMA-aware reader counter forwarding
     // ----------------------------------------------------------------
     //
     // Forward set_numa_aware / numa_aware / num_numa_nodes to every
@@ -608,19 +611,21 @@ public:
         return std::unique_lock<std::mutex>(stripes_[stripe].mutex, std::try_to_lock);
     }
 
-    /// 对于 std::mutex 特化，共享锁等价于独占锁（因为没有读-读并发需求）。
+    /// In the std::mutex specialisation, a shared lock is an exclusive lock:
+    /// there is no reader-reader concurrency to preserve.
     auto make_shared_lock(std::size_t stripe) {
         return make_unique_lock(stripe);
     }
 
     std::size_t size() const noexcept { return stripes_.size(); }
 
-    // P2-2: Access a specific stripe's mutex by index.
+    // Access a specific stripe's mutex by index.
     std::mutex& mutex_at(std::size_t stripe) { return stripes_[stripe].mutex; }
     const std::mutex& mutex_at(std::size_t stripe) const { return stripes_[stripe].mutex; }
 
-    // 异常安全：若某个 stripe 的 lock 抛异常，回滚所有已锁定的 stripe，避免死锁。
-    // 仅异常路径有额外开销，正常路径无性能损失。
+    // Exception safety: if locking a stripe throws, unlock every stripe already
+    // held, so the caller cannot deadlock against itself. The rollback costs
+    // nothing on the normal path.
     void lock_all() {
         std::size_t locked = 0;
         try {
@@ -637,9 +642,11 @@ public:
 
     void unlock_all() { for (auto& m : stripes_) m.mutex.unlock(); }
 
-    // 对于 std::mutex 特化，shared lock 等价于 exclusive lock（无读-读并发语义）。
-    // 提供 lock_shared_all/unlock_shared_all 以便模板代码（striped_read_lock_all、
-    // striped_mutex_read_all_guard 等）无需特化即可统一调用。
+    // In the std::mutex specialisation, a shared lock is an exclusive lock (there
+    // is no reader-reader concurrency). lock_shared_all / unlock_shared_all are
+    // still provided so template code (striped_read_lock_all,
+    // striped_mutex_read_all_guard, ...) can call one uniform interface without
+    // specialising on the mutex type.
     void lock_shared_all() { lock_all(); }
     void unlock_shared_all() { unlock_all(); }
 
@@ -648,7 +655,7 @@ private:
 };
 
 // ============================================================================
-// P0-1 (fix.01 方案 C): Non-striped storage placeholder for striped_mutex_storage
+// Non-striped storage placeholder for striped_mutex_storage
 // ============================================================================
 //
 // unified_cache<Trait, K, V> stores its striped lock array in a member whose
@@ -686,7 +693,7 @@ struct no_striped_mutex {
 };
 
 // ============================================================================
-// T-P3-5: Lazy-allocated striped_mutex wrapper
+// Lazy-allocated striped_mutex wrapper
 // ============================================================================
 //
 // For striped caches backed by sharded_mm_lru (which has its own per-shard
@@ -800,7 +807,7 @@ public:
         return ensure().get_fairness_mode();
     }
 
-    // P1-1: Writer starvation detector forwarding (lazy variant)
+    // Writer starvation detector forwarding (lazy variant)
     template <typename M = MutexType>
     auto set_writer_starvation_timeout(uint64_t timeout_ns)
         -> decltype(std::declval<M&>().set_writer_starvation_timeout(timeout_ns), void())
@@ -936,7 +943,7 @@ public:
 
     // Change the interval dynamically.
     //
-    // P1-39: the notification is only a hint to *re-evaluate the deadline*; it
+    // the notification is only a hint to *re-evaluate the deadline*; it
     // must not be interpreted by run() as "the interval elapsed", otherwise
     // every reconfiguration runs the task one extra time (for a TTL cleaner or
     // drain worker that means a full extra pass over every shard).
@@ -955,7 +962,7 @@ public:
 
     /// Install the exception handler invoked when the task throws.
     ///
-    /// P1-39 (fix.01 方案 A): the handler is published through an atomic
+    /// the handler is published through an atomic
     /// shared_ptr, because the worker thread reads it (in `run()`) while any
     /// thread may replace it here. The previous code read and wrote a plain
     /// `std::function` with no synchronization — a data race that could let the
@@ -971,7 +978,7 @@ private:
     void run() {
         std::unique_lock<std::mutex> lock(mutex_);
         while (running_.load()) {
-            // P1-39: wait on an absolute DEADLINE rather than on "a
+            // wait on an absolute DEADLINE rather than on "a
             // notification arrived". A notification from set_interval() (or a
             // spurious wake-up) merely causes a re-evaluation of the deadline;
             // the task runs only once the deadline has genuinely passed.
@@ -1018,16 +1025,97 @@ private:
 };
 
 // ============================================================================
-// Locked Iterator Guard — 消除四个 MM 类型中 LockedIterator 的重复代码
+// Payload size estimation
 // ============================================================================
 
-/// 管理 LockedIterator 的锁生命周期和 active flag。
-/// 每个 MM 类型的 LockedIterator 通过组合此守卫 + 队列遍历逻辑实现。
+/// Real in-memory size of a key or value, in bytes.
 ///
-/// 用法（在 MM type 的 LockedIterator 中）：
+/// The cache's default accounting bills a compile-time constant per item, so
+/// `max_memory` degrades into an item-count proxy: a 1 KB std::string and a
+/// 10-byte one are billed identically, and the memory watermarks then trigger
+/// on the wrong signal. These overloads give the common owning containers their
+/// real footprint (capacity plus the container object itself), so a caller can
+/// opt into byte-accurate accounting:
+///
+///     c.set_value_size_calculator([](const V& v) { return detail::deep_size(v); });
+///
+/// It is deliberately not the default: changing the billed size changes when
+/// eviction fires, which is observable behaviour.
+template <typename T>
+std::size_t deep_size(const T&) noexcept {
+    return sizeof(T);
+}
+
+inline std::size_t deep_size(const std::string& s) noexcept {
+    return sizeof(std::string) + s.capacity();
+}
+
+template <typename T, typename Alloc>
+std::size_t deep_size(const std::vector<T, Alloc>& v) noexcept {
+    return sizeof(std::vector<T, Alloc>) + v.capacity() * sizeof(T);
+}
+
+// ============================================================================
+// Lock wait accounting
+// ============================================================================
+
+/// RAII: add the number of slow-path entries a mutex took while we acquired it
+/// to a statistics counter.
+///
+/// The lock primitives (distributed_shared_mutex, shared_spinlock) expose a
+/// monotonic per-instance `wait_count()`, incremented once per slow-path entry.
+/// Sampling it around one acquisition gives exactly the number of times this
+/// thread blocked — no guessing from a latency threshold — and costs two
+/// relaxed loads when uncontended.
+///
+/// Construct it *before* the lock is taken; the destructor runs after the
+/// acquisition completes (the returned lock is constructed first, then locals
+/// are destroyed).
+template <typename Mutex>
+class lock_wait_counter {
+public:
+    lock_wait_counter(std::atomic<std::size_t>& counter,
+                      const Mutex* mutex) noexcept
+        : counter_(&counter), mutex_(mutex) {
+        if constexpr (has_wait_count) {
+            before_ = mutex ? mutex->wait_count() : 0;
+        }
+    }
+
+    ~lock_wait_counter() {
+        if constexpr (has_wait_count) {
+            if (!mutex_) return;
+            const std::size_t now = mutex_->wait_count();
+            if (now != before_) {
+                counter_->fetch_add(now - before_, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    lock_wait_counter(const lock_wait_counter&) = delete;
+    lock_wait_counter& operator=(const lock_wait_counter&) = delete;
+
+private:
+    static constexpr bool has_wait_count =
+        requires(const Mutex& m) { m.wait_count(); };
+
+    std::atomic<std::size_t>* counter_;
+    const Mutex* mutex_;
+    std::size_t before_ = 0;
+};
+
+// ============================================================================
+// Locked Iterator Guard - removes the duplicated LockedIterator code from the four
+// MM strategy types.
+// ============================================================================
+
+/// Manages a LockedIterator's lock lifetime and active flag.
+/// Each MM type's LockedIterator composes this guard with its own queue-walk logic.
+///
+/// Usage, inside an MM type's LockedIterator:
 ///   class LockedIterator {
 ///       locked_iterator_guard guard_;
-///       // ... 专有遍历逻辑
+///       // ... strategy-specific walk
 ///   public:
 ///       LockedIterator(MMType& mm)
 ///           : guard_(mm.update_mutex_.m, mm.iterator_active_) {}
@@ -1037,10 +1125,10 @@ private:
 template <typename Mutex = std::mutex>
 class locked_iterator_guard {
 public:
-    /// 构造时锁定 mutex 并检查 active flag。
-    /// 若 iterator_active 已为 true，抛出 runtime_error。
-    /// @param m             MM 层的 update_mutex
-    /// @param active_flag   MM 层的 iterator_active_ 原子标记
+    /// Locks the mutex and checks the active flag.
+    /// Throws runtime_error if iterator_active was already true.
+    /// @param m             The MM layer's update_mutex.
+    /// @param active_flag   The MM layer's iterator_active_ atomic flag.
     locked_iterator_guard(Mutex& m, std::atomic<bool>& active_flag)
         : lock_(m), active_flag_(&active_flag) {
         if (active_flag_->exchange(true)) {
@@ -1061,7 +1149,7 @@ public:
         other.valid_ = false;
     }
 
-    /// 释放锁并清除 active flag。
+    /// Releases the lock and clears the active flag.
     void destroy() noexcept {
         if (valid_) {
             if (active_flag_) active_flag_->store(false, std::memory_order_release);
@@ -1070,7 +1158,7 @@ public:
         }
     }
 
-    /// 返回底层的 unique_lock 引用（允许手动 unlock 等操作）。
+    /// The underlying unique_lock, so callers can unlock manually if needed.
     std::unique_lock<Mutex>& lock() noexcept { return lock_; }
 
 private:

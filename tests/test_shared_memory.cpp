@@ -44,7 +44,7 @@
 #    ifndef WIN32_LEAN_AND_MEAN
 #      define WIN32_LEAN_AND_MEAN
 #    endif
-    // P0-3: guard each macro — GCC warns (-Werror) when NOMINMAX is already
+    // guard each macro — GCC warns (-Werror) when NOMINMAX is already
     // defined by another header included earlier in the translation unit.
 #    ifndef NOMINMAX
 #      define NOMINMAX
@@ -614,7 +614,7 @@ TEST(SlabAllocatorSharedMemTest, WarmRestartWithCorruptFileFallsBack) {
         std::ofstream out(path, std::ios::binary);
         // Write some garbage that's large enough to contain a header
         std::vector<char> garbage(256, '\xFF');
-        // P0-3: ostream::write takes streamsize (signed); the vector's size()
+        // ostream::write takes streamsize (signed); the vector's size()
         // is unsigned, so convert explicitly at this boundary.
         out.write(garbage.data(),
                   static_cast<std::streamsize>(garbage.size()));

@@ -86,7 +86,7 @@ TEST(ConcurrentRehash, F14DualArrayConcurrentRehashCorrectness) {
     }
 
     // Wait for writers to complete, then signal readers to stop.
-    // P0-3: join via iterators instead of an int index into the vector, so no
+    // join via iterators instead of an int index into the vector, so no
     // signed/unsigned conversion is needed for threads[i].
     const auto batch_readers_begin = threads.begin() + kThreads;
     for (auto it = threads.begin(); it != batch_readers_begin; ++it) it->join();
@@ -245,7 +245,7 @@ TEST(ConcurrentRehash, LockFreeRehashFallbackAccounting) {
         });
     }
     for (int t = 0; t < kReaders; ++t) {
-        // P3-3: Capture `t` by value (not by reference). The loop variable `t`
+        // Capture `t` by value (not by reference). The loop variable `t`
         // goes out of scope when the for loop ends at the closing `}`, but the
         // reader thread may still be running and would dereference a dangling
         // reference. ASan reports this as "stack-use-after-scope" on the

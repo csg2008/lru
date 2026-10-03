@@ -28,7 +28,7 @@ public:
     // width = number of counters per hash row
     // depth = number of hash functions (rows)
     // Default: width ~6*e/epsilon, depth ~ln(1/delta)/ln(2)
-    // P1-25 (fix.01 方案 A): the table is sized from the CAPACITY, matching
+    // the table is sized from the CAPACITY, matching
     // CacheLib's MMTinyLFU:
     //     numCounters = next_pow2(e * capacity * window_multiplier / error_threshold)
     //     hash_count  = 4
@@ -45,6 +45,10 @@ public:
     // Callers that want the old, tiny table can still ask for it explicitly;
     // what they can no longer do is get it by accident from a capacity argument.
     static constexpr std::size_t kDefaultWindowMultiplier = 32;
+    /// Fallback capacity used when a caller passes 0. CacheLib applies the same
+    /// floor (MMWTinyLFU.h) so a zero-capacity construction cannot silently
+    /// produce a degenerate table.
+    static constexpr std::size_t kDefaultCapacity = 1000;
     static constexpr double kDefaultErrorThreshold = 5.0;
     static constexpr std::size_t kDefaultHashCount = 4;
     /// Floor for the geometric window shrink below. Without a floor the decay
@@ -60,12 +64,20 @@ public:
         return p;
     }
 
-    explicit count_min_sketch(std::size_t capacity = 1000,
+    explicit count_min_sketch(std::size_t capacity = kDefaultCapacity,
                               std::size_t window_multiplier = kDefaultWindowMultiplier,
                               double error_threshold = kDefaultErrorThreshold,
-                              std::size_t hash_count = kDefaultHashCount)
-        : max_window_size_(capacity * window_multiplier),
-          window_size_(capacity * window_multiplier) {
+                              std::size_t hash_count = kDefaultHashCount) {
+        // A zero capacity has no meaningful table size: the formula below would
+        // round it up to a 4x4 table (16 counters) at ANY cache size, so the
+        // estimate degenerates into collision noise while still looking
+        // healthy. Every TinyLFU strategy now backfills the real capacity (see
+        // detail::with_expected_items); this floor keeps any other caller from
+        // silently getting a degenerate sketch.
+        if (capacity == 0) capacity = kDefaultCapacity;
+        const std::size_t window = capacity * window_multiplier;
+        max_window_size_.store(window, std::memory_order_relaxed);
+        window_size_.store(window, std::memory_order_relaxed);
         const double raw = std::exp(1.0) * static_cast<double>(capacity) *
                            static_cast<double>(window_multiplier) / error_threshold;
         const std::size_t counters =
@@ -108,7 +120,7 @@ public:
             // max_window_size_, attempt to claim the decay duty via CAS
             // (reset total_accesses_ to 0). Only the winning thread proceeds.
             auto old_total = total_accesses_.fetch_add(1, std::memory_order_relaxed) + 1;
-            // P1-26 (fix.01 方案 A): the decay period is the single `window_size_`
+            // the decay period is the single `window_size_`
             // (geometrically shrinking), not `max_window_size_`. Previously the
             // counter was reset at max_window_size_ every time, so the growth
             // condition in recompute_size() (`total > 2 * max_window`) could never
@@ -172,7 +184,7 @@ public:
         }
         total_accesses_.store(0, std::memory_order_relaxed);
         decay_step_.store(0, std::memory_order_relaxed);
-        // P1-26: an explicit full decay also re-arms the window to its configured
+        // an explicit full decay also re-arms the window to its configured
         // maximum, undoing any accumulated geometric shrink.
         window_size_.store(max_window_size_.load(std::memory_order_relaxed),
                            std::memory_order_relaxed);
@@ -226,14 +238,14 @@ public:
 
     void set_max_window_size(std::size_t size) noexcept {
         max_window_size_.store(size, std::memory_order_relaxed);
-        // P1-26: the decay period is the live `window_size_`; setting the maximum
+        // the decay period is the live `window_size_`; setting the maximum
         // re-arms it (so the existing callers that pass a window size keep
         // working), and later decays shrink it geometrically from there.
         window_size_.store(size, std::memory_order_relaxed);
     }
     std::size_t max_window_size() const noexcept { return max_window_size_.load(std::memory_order_relaxed); }
 
-    /// P1-26 (fix.01 方案 A): the LIVE decay period. Starts at
+    /// the LIVE decay period. Starts at
     /// `capacity * window_multiplier` and halves on every whole-table decay down
     /// to `kMinWindowSize`. Exposed so the geometric-shrink contract is testable
     /// and observable rather than an internal detail.
@@ -242,7 +254,7 @@ public:
     }
 
     // ====================================================================
-    // S3: Serialization support — save/restore CMS internal state
+    // Serialization support — save/restore CMS internal state
     // ====================================================================
 
     /// Serialize CMS internal state to an output iterator.
@@ -305,7 +317,7 @@ public:
         }
         init_hash_seeds();
         recount_saturated();
-        // 返回消耗的 uint32_t 数：5(header) + depth_ * width_(table)
+        // Returns the number of uint32_t consumed: 5 (header) + depth_ * width_.
         return 5 + depth_ * width_;
     }
 
@@ -361,7 +373,7 @@ private:
     // the exclusive lock and use structure_change_guard.
     void step_decay_locked() noexcept {
         structure_change_guard guard(structure_version_);
-        // P1-26: halve the WHOLE table (see step_decay_shared for why per-row
+        // halve the WHOLE table (see step_decay_shared for why per-row
         // ageing was wrong) and shrink the window geometrically.
         for (std::size_t i = 0; i < table_size_; ++i) {
             auto& cell = table_[i];
@@ -389,7 +401,7 @@ private:
     // No structure_change_guard is needed here because the table dimensions
     // and hash seeds don't change. The row-halving only touches atomic
     // cells, which estimate() already reads atomically.
-    // P1-26 (fix.01 方案 A): decay the WHOLE table and shrink the window
+    // decay the WHOLE table and shrink the window
     // geometrically, matching CacheLib's MMTinyLFU.
     //
     // The previous policy halved ONE ROW per event, round-robin via decay_step_.
@@ -459,7 +471,7 @@ private:
     std::size_t depth_ = 0;
     alignas(64) std::atomic<std::size_t> total_accesses_{0};
     std::atomic<std::size_t> max_window_size_{1000};
-    /// P1-25/P1-26 (fix.01 方案 A): the live decay period, initialised from
+    /// the live decay period, initialised from
     /// `capacity * window_multiplier` and halved on every whole-table decay
     /// (with a kMinWindowSize floor). Distinct from max_window_size_, which
     /// records the configured ceiling that an explicit decay() resets to.

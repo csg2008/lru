@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// R7: High-concurrency test suite for production read-heavy workloads.
+// High-concurrency test suite for production read-heavy workloads.
 //
 // Supplements the existing 16-thread tests (test_read_heavy_concurrent.cpp,
 // test_read_heavy_soak.cpp) with:
@@ -70,7 +70,7 @@ inline std::size_t sample_rss_bytes() {
     HMODULE psapi = ::LoadLibraryW(L"psapi.dll");
     if (!psapi) return 0;
     using GetProcessMemoryInfo_t = BOOL(WINAPI*)(HANDLE, void*, DWORD);
-    // P0-3: GetProcAddress returns FARPROC (int(*)()), an incompatible
+    // GetProcAddress returns FARPROC (int(*)()), an incompatible
     // function-pointer type; launder the address through memcpy rather than a
     // function-pointer cast, which trips GCC's -Wcast-function-type (and, for
     // the two-step void(*)() form, Clang's -Wcast-function-type-strict).
@@ -193,7 +193,7 @@ void run_fixed_ops_concurrent(
 } // anonymous namespace
 
 // ============================================================================
-// R7-1: 32-thread high-concurrency read-heavy correctness
+// 32-thread high-concurrency read-heavy correctness
 // Tests production_cache with 32 threads doing 95% reads / 5% writes.
 // Validates no value corruption, no capacity violation, no crash.
 // ============================================================================
@@ -215,7 +215,7 @@ TEST(HighConcurrencySuite, ProductionCache32Threads) {
 }
 
 // ============================================================================
-// R7-2: 64-thread high-concurrency read-heavy correctness
+// 64-thread high-concurrency read-heavy correctness
 // Tests production_cache with 64 threads doing 95% reads / 5% writes.
 // ============================================================================
 TEST(HighConcurrencySuite, ProductionCache64Threads) {
@@ -236,7 +236,7 @@ TEST(HighConcurrencySuite, ProductionCache64Threads) {
 }
 
 // ============================================================================
-// R7-3: Extreme read ratio — 99% reads with 32 threads
+// Extreme read ratio — 99% reads with 32 threads
 // In read-heavy production, the read ratio can exceed 99%. This test
 // verifies correctness under near-pure-read workloads where TLS rings
 // fill slowly and EBR epochs advance infrequently.
@@ -265,7 +265,7 @@ TEST(HighConcurrencySuite, ExtremeReadRatio99Percent) {
 }
 
 // ============================================================================
-// R7-4: Extreme read ratio — 99.9% reads with 32 threads
+// Extreme read ratio — 99.9% reads with 32 threads
 // Even more extreme: only 1 write per 1000 operations. Validates that
 // the R1 capacity-based epoch advance triggers and the R6 auto-drain
 // threshold (kRingSize/2) keeps TLS rings from overflowing.
@@ -387,7 +387,7 @@ TEST(HighConcurrencySuite, ExtremeReadRatio9999Percent) {
 }
 
 // ============================================================================
-// R7-5: NUMA-aware routing smoke test
+// NUMA-aware routing smoke test
 // Validates that set_numa_aware(true) doesn't crash or corrupt data under
 // concurrent access. Real NUMA benefit requires multi-socket hardware; this
 // test is a correctness smoke test, not a performance benchmark.
@@ -408,7 +408,7 @@ TEST(HighConcurrencySuite, NumaAwareRoutingCorrectness) {
 }
 
 // ============================================================================
-// R7-6: EBR epoch advancement under read-heavy load
+// EBR epoch advancement under read-heavy load
 // Validates that with R1's capacity-based epoch advance + time-based advance,
 // retired objects are reclaimed even when writes are infrequent.
 // Runs a workload that evicts items (triggering retire) and checks that
@@ -484,7 +484,7 @@ TEST(HighConcurrencySuite, EpochAdvancementUnderReadHeavyLoad) {
 }
 
 // ============================================================================
-// R7-7: Extended soak with 32+ threads and memory growth monitoring
+// Extended soak with 32+ threads and memory growth monitoring
 // Runs a 95% read / 5% write workload across 32+ threads for a configurable
 // duration (default 5s CI; set LRU_STRESS_DURATION_MS=300000 for 5-min soak).
 // Validates:
@@ -609,7 +609,7 @@ TEST(HighConcurrencySuite, ExtendedSoak32Threads) {
 }
 
 // ============================================================================
-// R7-8: Mixed read-heavy + rehash stress with 32 threads
+// Mixed read-heavy + rehash stress with 32 threads
 // Forces rehash by using tiny initial buckets, then runs 32 threads doing
 // 90% reads / 10% writes. Validates dual-array lookup safety under high
 // concurrency during incremental rehash.
@@ -631,7 +631,7 @@ TEST(HighConcurrencySuite, RehashStress32Threads) {
 }
 
 // ============================================================================
-// R7-9: Production cache with defer_promotion under 32-thread read-heavy
+// Production cache with defer_promotion under 32-thread read-heavy
 // Tests the TLS ring deferred promotion path (the primary read-heavy
 // optimization) under high thread counts. Validates that promotions are
 // not lost and LRU ordering is maintained.

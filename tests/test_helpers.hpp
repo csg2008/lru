@@ -52,7 +52,7 @@ inline std::uint64_t read_test_seed(std::uint64_t default_seed) {
     }
 }
 
-// P0-3 (fix.01 方案 B, type convergence): std::mt19937's seed type is unsigned
+// std::mt19937's seed type is unsigned
 // (result_type == uint32_t), whereas a test suite naturally derives a
 // per-thread seed from a signed loop counter or an unsigned index:
 //

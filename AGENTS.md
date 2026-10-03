@@ -1,4 +1,7 @@
-# CLAUDE.md
+# AGENTS.md - in-tree engineering guide
+#
+# This file documents how to build, test and reason about this library. It is
+# the in-tree reference; the short project instructions live in ../CLAUDE.md.
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -262,7 +265,7 @@ Convenience aliases wire common combinations:
 - Do not replace `detail::distributed_shared_mutex` with `std::shared_mutex` on Windows/MinGW; the MinGW `pthread_rwlock_t` implementation returns `EINVAL` under high mixed read/write contention.
 - `distributed_shared_mutex` defaults to `writer_fair` fairness (prevents writer starvation). Use `set_fairness_mode()` on `unified_cache` to switch to `reader_preferred` if maximum read throughput is needed and write latency is acceptable.
 - `striped_thread_safe_policy` is designed for `sharded_mm_lru`: different keys can hash to different shards and be accessed concurrently. The stripe count is runtime-configurable via the `(max_size, num_stripes)` constructor.
-- **Shard hash distribution (G12, superseding R-9 / T-P2-5)**: `sharded_mm_lru::shard_for(key)` delegates to `shard_for_hash(Hash{}(key))`, which applies a splitmix64 mix **by default** (`sharded_mm_lru_config::mix_shard_hash = true`) before the `% num_shards_` reduction. The historical reason for *not* mixing — when `max_size < num_shards`, `distribute_max_size()` used to give the first `max_size` shards quota 1 and the rest 0, so mixing would route keys onto zero-capacity shards — was removed by the P0-A fix: `distribute_max_size()` now grants **every** shard a minimum quota of 1, so mixing can never produce a silently-dropping shard. Mixing is therefore safe for any workload and is on by default; it also means an identity hash such as the default `std::hash<int>` no longer causes hot shards. `lru::default_hash<Key>` is `ankerl::unordered_dense::hash` when ankerl is available (falling back to `std::hash<Key>` otherwise). Callers who already supply a well-mixed hash and want to skip the extra shifts/multiplies can construct the sharded MM with `mix_shard_hash = false`; verify the result via `hot_shards(n)` / `hot_shards_by_memory(n)` and `mix_shard_hash()`.
+- **Shard hash distribution (G12, superseding R-9 / T-P2-5)**: `sharded_mm_lru::shard_for(key)` delegates to `shard_for_hash(Hash{}(key))`, which applies a splitmix64 mix **by default** (`sharded_mm_lru_config::mix_shard_hash = true`) before the `% num_shards_` reduction. The historical reason for *not* mixing — when `max_size < num_shards`, `distribute_max_size()` used to give the first `max_size` shards quota 1 and the rest 0, so mixing would route keys onto zero-capacity shards — is gone: under the default policy `distribute_max_size()` **throws** `cache_config_exception` when `max_size < num_shards`, and with `allow_amplification = true` it grants every shard a minimum quota of 1. Mixing can therefore never produce a silently-dropping shard, and is safe for any accepted configuration; it is on by default, it also means an identity hash such as the default `std::hash<int>` no longer causes hot shards. `lru::default_hash<Key>` is `ankerl::unordered_dense::hash` when ankerl is available (falling back to `std::hash<Key>` otherwise). Callers who already supply a well-mixed hash and want to skip the extra shifts/multiplies can construct the sharded MM with `mix_shard_hash = false`; verify the result via `hot_shards(n)` / `hot_shards_by_memory(n)` and `mix_shard_hash()`.
 - `single_threaded_policy` is truly zero-overhead.
 - `defer_promotion` defaults to `true` in `mm_lru`/`sharded_mm_lru`: `get()` hits do not acquire the write lock for LRU promotion; accesses are batched in a TLS ring and drained later. This significantly reduces read-path lock pressure in read-heavy workloads.
 - Incremental rehash (chain mode, F14 mode, and segmented mode): `set_incremental_rehash(true)` makes hash table expansion migrate buckets incrementally across multiple operations instead of blocking all writers during a single rehash. F14 mode implements incremental rehash via dual-array lookup (reads query both old and new arrays during migration; writes route by progress boundary). Segmented mode applies incremental rehash independently per segment (1/64 stall at any moment). T11.1: `segmented_*` and `production_*` aliases auto-enable incremental rehash on construction.
@@ -346,12 +349,15 @@ Convenience aliases wire common combinations:
 
 ## Development requirements
 
-1. 从资深 C++ 架构师角度思考如何让整体架构更优、性能更好、源码可读性更好
-2. 如果一个问题有多个解决方案，需选择最佳实现而不是最简单实现
-3. 尽量复用已有的工具类或函数实现，不要重复创造轮子
-4. 问题标记完成时必须检查代码确认，如果未完成需要继续处理
-5. 执行命令前需将 MSYS2 Clang64 工具链添加到 PATH 环境变量（`export PATH=/clang64/bin:/usr/bin:$PATH`）
-6. 尽量以 Debug 模式编译测试，用 `mingw32-make -j2` 两进程并行编译
-7. 编译时如果缺少工具或库不能自动安装，只能输出提示
-8. 提交 git 时，消息前后不要添加无用的 @ 符号
-9. 请用 bash 环境编译测试
+1. Think like a senior C++ architect: better structure, better performance,
+   more readable source.
+2. When a problem has several solutions, pick the best one, not the simplest.
+3. Reuse the existing utilities and helpers instead of reinventing them.
+4. When an item is marked done, verify it in the code; if it is not done,
+   keep working on it.
+5. Put the MSYS2 Clang64 toolchain on PATH before running commands
+   (`export PATH=/clang64/bin:/usr/bin:$PATH`).
+6. Prefer Debug builds for iteration; build with `mingw32-make -j2`.
+7. If a tool or library is missing, do not try to install it — report it.
+8. Do not add decorative @ markers to git commit messages.
+9. Build and test from the bash environment.

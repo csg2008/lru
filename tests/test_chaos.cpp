@@ -1,6 +1,6 @@
 // test_chaos.cpp — Chaos engineering and realistic workload simulation tests.
 //
-// P3-1: Tests for production-readiness under adverse conditions:
+// Tests for production-readiness under adverse conditions:
 //   - Zipf-distributed access patterns (realistic hot-key workload)
 //   - Memory watermark / OOM protection
 //   - Random thread exit during concurrent access
@@ -131,7 +131,7 @@ TEST(ChaosMemoryWatermark, CriticalModeRejectsInsertions) {
             // Size should not grow (insertion rejected).
             // Note: it might grow by one if the key replaced an existing item,
             // but net new items must be rejected.
-            // P0-3: this assertion is what size_before/size_after exist for.
+            // this assertion is what size_before/size_after exist for.
             EXPECT_LE(size_after, size_before + 1)
                 << "critical-mode set() must not grow the cache";
             break;
@@ -483,7 +483,7 @@ TEST(SerdeRace, SaveConcurrentWithSetValidSnapshot) {
     EXPECT_GT(stats.current_size.load(), 0u);
     EXPECT_LE(stats.current_size.load(), 5000u);
 
-    // T-T2: rbegin() returns a locked_range RAII wrapper, not an iterator.
+    // rbegin() returns a locked_range RAII wrapper, not an iterator.
     // Use range.begin()/range.end() to iterate.
     auto range = c2.rbegin();
     for (auto it = range.begin(); it != range.end(); ++it) {
@@ -508,7 +508,7 @@ TEST(SerdeRace, SavePerShardConcurrentWithSetValidSnapshot) {
     EXPECT_GT(stats.current_size.load(), 0u);
     EXPECT_LE(stats.current_size.load(), 5000u);
 
-    // T-T2: rbegin() returns a locked_range RAII wrapper, not an iterator.
+    // rbegin() returns a locked_range RAII wrapper, not an iterator.
     // Use range.begin()/range.end() to iterate.
     auto range = c2.rbegin();
     for (auto it = range.begin(); it != range.end(); ++it) {
@@ -597,7 +597,7 @@ TEST(IteratorRace, ShardRbeginWithConcurrentSet) {
 }
 
 // ============================================================================
-// C-1-B: production_cache high-concurrency set() stress test with forced
+// production_cache high-concurrency set() stress test with forced
 // rehash. Verifies the rehash_finish() CAS guard (Defect B fix) prevents
 // double-free / UAF when foreground set() and the background rehash balancer
 // concurrently call rehash_finish().
@@ -644,7 +644,7 @@ TEST(ProductionCacheStress, ConcurrentSetWithForcedRehashNoCrash) {
 }
 
 // ============================================================================
-// C-2-B: production_cache save() + concurrent set() + drain worker deadlock
+// production_cache save() + concurrent set() + drain worker deadlock
 // regression test. Verifies the save()->save_per_shard() delegation (C-2 fix)
 // eliminates the deadlock with the drain worker.
 // ============================================================================

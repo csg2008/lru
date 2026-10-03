@@ -466,3 +466,72 @@ jobs:
             echo "=== $f ==="
             "$f" -max_total_time=60 -print_final_stats=1
           done
+
+  # Comment governance. The library's comments are its documentation, and two
+  # classes of noise had accumulated in them:
+  #   1. internal task identifiers ("P1-23 (fix.01 方案 B): ..."), which mean
+  #      nothing to a reader who does not have the planning documents;
+  #   2. Chinese prose in an otherwise English codebase.
+  # Both were cleaned up; this gate keeps them from coming back. It is a hard
+  # gate rather than a report, because the tree is clean as of that cleanup.
+  comments:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject CJK characters in source
+        run: |
+          set -uo pipefail
+          if grep -rnP '[\x{3000}-\x{303f}\x{4e00}-\x{9fff}\x{ff00}-\x{ffef}]' \
+               --include='*.hpp' --include='*.cpp' --include='*.h' . ; then
+            echo "::error::Non-ASCII CJK text found in source. Comments must be English."
+            exit 1
+          fi
+          echo "No CJK characters in source."
+
+      - name: Reject internal task identifiers in comments
+        run: |
+          set -uo pipefail
+          # A comment line whose first token is a task id ("P1-23:", "T-G5:",
+          # "B16:", "R-9 / T-P2-5:") is planning metadata, not documentation.
+          if grep -rnE '^[[:space:]]*//[/!]?[[:space:]]*((T-)?[A-Z]{1,2}[0-9]+([-.][0-9]+)*([[:space:]]*[/+,][[:space:]]*(T-)?[A-Z]{1,2}[0-9]+([-.][0-9]+)*)*)[[:space:]]*(\([^()]*\))?[[:space:]]*:' \
+               --include='*.hpp' --include='*.cpp' . ; then
+            echo "::error::Comment starts with an internal task id. Drop the prefix."
+            exit 1
+          fi
+          echo "No task-id comment prefixes."
+
+  # Header self-containment. Every public header must compile on its own: a
+  # downstream user who includes only `lru::compressed_ptr` should not have to
+  # know which other header happens to define what it needs. Two headers failed
+  # this before the fix work (detail/intrusive_list.hpp forward-declared
+  # hazptr_obj_base instead of including it; compressed_ptr.hpp used
+  # detail::cache_item without including its definition), and serialization.hpp
+  # included its standard headers inside `namespace lru`, which is undefined
+  # behaviour that only worked when something else had included them first.
+  headers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+          git clone --depth 1 https://github.com/martinus/unordered_dense.git ../unordered_dense
+
+      - name: Each header must compile standalone
+        run: |
+          set -uo pipefail
+          fail=0
+          for h in *.hpp detail/*.hpp; do
+            printf '#include "%s"\nint main(){return 0;}\n' "$h" > /tmp/self.cpp
+            if ! clang++ -std=c++20 -I. -I../unordered_dense/include \
+                   -fsyntax-only /tmp/self.cpp >/tmp/self.log 2>&1; then
+              echo "::error file=$h::header is not self-contained"
+              head -20 /tmp/self.log
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "All headers are self-contained."
+          exit $fail

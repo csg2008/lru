@@ -17,7 +17,7 @@
 //     reasonable cache-operation latency. Samples ≥ 2^35 ns clump into the
 //     final bucket.
 //   - Each bucket counter is std::atomic<uint64_t> for lock-free recording.
-//     G17: counters ARE per-cache-line padded (64 bytes each, 32 KB total
+//     counters ARE per-cache-line padded (64 bytes each, 32 KB total
 //     per histogram). Adjacent 8-byte atomics previously shared a cache
 //     line, and under high-QPS concurrent recorders on the same shard the
 //     neighbouring fetch_add operations caused false sharing that lowered
@@ -155,9 +155,9 @@ public:
     // ----------------------------------------------------------------
 
     /// Record a latency sample in nanoseconds.
-    /// O(1): one bucket index computation + one fetch_add.
+    /// one bucket index computation + one fetch_add.
     ///
-    /// T12.1/T12.2: When `set_latency_sample_rate(rate > 1)` is set,
+    /// When `set_latency_sample_rate(rate > 1)` is set,
     /// record() uses a thread_local counter to deterministically sample
     /// 1 out of every `rate` calls. This reduces hot-path overhead
     /// (clock reads + atomic fetch_add) for high-throughput workloads
@@ -165,7 +165,7 @@ public:
     /// multiply their bucket count by `rate` on readback so the total
     /// count remains approximately correct.
     void record(uint64_t latency_ns) noexcept {
-        // T12.2: deterministic sampling via thread_local counter.
+        // deterministic sampling via thread_local counter.
         const uint32_t rate = sample_rate_.load(std::memory_order_relaxed);
         if (rate > 1) {
             // Per-thread, per-histogram counter. We use a thread_local
@@ -216,7 +216,7 @@ public:
         }
     }
 
-    /// T12.1: Set the sampling rate for `record()`.
+    /// Set the sampling rate for `record()`.
     /// - rate == 1 (default): every call is recorded (no sampling).
     /// - rate > 1: 1 out of every `rate` calls is recorded. Bucket
     ///   counts and sum will undercount by ~rate×; use `sample_rate()`
@@ -227,7 +227,7 @@ public:
         sample_rate_.store(rate == 0 ? 1 : rate, std::memory_order_relaxed);
     }
 
-    /// T12.1: Query the current sampling rate.
+    /// Query the current sampling rate.
     uint32_t sample_rate() const noexcept {
         return sample_rate_.load(std::memory_order_relaxed);
     }
@@ -269,12 +269,12 @@ public:
     /// sample, using linear interpolation within the bucket for tighter
     /// accuracy. Returns 0 if no samples are recorded.
     ///
-    /// O12: previously returned `bucket_lower_bound(i)`, which biased
+    /// previously returned `bucket_lower_bound(i)`, which biased
     /// percentiles downward by up to one bucket width (≤ 6.25% for
     /// L ≥ 128 ns). Midpoint interpolation halves the worst-case error
     /// (≤ 3.125%) and eliminates the systematic low bias.
     ///
-    /// P2-2: with 16 sub-buckets per octave, the worst-case relative error
+    /// with 16 sub-buckets per octave, the worst-case relative error
     /// (reported midpoint vs. true value) is ≤ 1/32 ≈ 3.125% for L ≥ 128 ns,
     /// and ≤ 5% for L ≥ 320 ns. For sub-100 ns latencies the linear 1 ns
     /// buckets in [1, 16) provide exact reporting.
@@ -335,7 +335,7 @@ public:
         sum_.store(0, std::memory_order_relaxed);
     }
 
-    /// T12.3: Release histogram memory.
+    /// Release histogram memory.
     ///
     /// Clears all bucket counters and summary statistics, releasing the
     /// accumulated data. The fixed-size bucket array (32 KB) remains
@@ -387,7 +387,7 @@ public:
     /// Merge another histogram's bucket counts, sum, and min/max into this
     /// one. Used by cache_stats::operator+ to aggregate per-shard histograms.
     ///
-    /// O12: previously min/max were NOT merged, causing aggregated stats to
+    /// previously min/max were NOT merged, causing aggregated stats to
     /// report 0 for min/max when individual shards had valid extremes. Now
     /// min/max are merged with CAS loops so the global extreme is preserved.
     /// A kSentinel (no-samples) value on either side is treated as missing
@@ -491,7 +491,7 @@ private:
     alignas(64) std::atomic<uint64_t> max_{kSentinel};
     alignas(64) std::atomic<uint64_t> sum_{0};
 
-    /// T12.1: Sampling rate for record(). 1 = no sampling (default).
+    /// Sampling rate for record(). 1 = no sampling (default).
     /// When > 1, only 1 out of every `rate` calls to record() actually
     /// records a sample, reducing hot-path overhead for high-throughput
     /// workloads. Not copied across histograms — sampling policy is

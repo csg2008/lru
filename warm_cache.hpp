@@ -66,7 +66,7 @@ namespace lru {
 /// atomically swap it in. Existing readers holding the old shared_ptr are
 /// unaffected until they request a new reference.
 ///
-/// P2-G: True incremental delta snapshots. The previous implementation
+/// True incremental delta snapshots. The previous implementation
 /// wrote a full cache->save() on every tick, which is wasteful when only
 /// a small fraction of keys change between snapshots. The new
 /// implementation hooks on_insert / on_evict callbacks to track the dirty
@@ -216,7 +216,7 @@ public:
     /// Block until the async load is ready (or failed), then atomically swap
     /// the live cache pointer. Returns true on successful swap.
     ///
-    /// T-G6: If delta tracking was enabled on the old live cache, it is
+    /// If delta tracking was enabled on the old live cache, it is
     /// automatically re-attached to the new cache after the swap so
     /// callbacks continue firing without the caller needing to call
     /// `reattach_delta_callbacks()` manually.
@@ -244,12 +244,19 @@ public:
         live_cache_.store(std::move(pending_cache_));
         pending_cache_.reset();
         state_.store(load_state::idle, std::memory_order_release);
-        // G9: Auto-reattach delta callbacks on the new live cache so
+        // Auto-reattach delta callbacks on the new live cache so
         // delta tracking continues without caller intervention. The
         // in-memory delta map is preserved so pending deltas are not
         // lost across the swap.
         reattach_delta_callbacks();
         return true;
+    }
+
+    /// Publish a fully reconstructed cache and re-arm delta tracking, so the
+    /// swap is indistinguishable from the async load path's swap.
+    void publish_staged(std::shared_ptr<cache_type> staged) {
+        live_cache_.store(std::move(staged));
+        reattach_delta_callbacks();
     }
 
     /// Get the current load state.
@@ -369,7 +376,7 @@ public:
             std::lock_guard lock(s.mtx);
             s.map[key] = value;
         });
-        // O7: Hook on_update: record the updated value for this key
+        // Hook on_update: record the updated value for this key
         // (existing key whose value changed). This replaces the previous
         // behavior of firing on_insert for updates.
         cache->on_update([state](const key_type& key, const mapped_type& value) {
@@ -487,21 +494,11 @@ public:
         try {
             auto cache = get_cache();
             auto data = cache->save();
-
-            // Write to a temporary file first, then rename atomically.
-            auto tmp_path = path + ".tmp";
-            {
-                std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
-                if (!file.is_open()) return false;
-                file.write(reinterpret_cast<const char*>(data.data()),
-                          static_cast<std::streamsize>(data.size()));
-                if (!file) return false;
-                file.close();
-            }
-
-            // Atomic rename (on POSIX, rename() is atomic; on Windows,
-            // MoveFileEx with MOVEFILE_REPLACE_EXISTING).
-            std::filesystem::rename(tmp_path, path);
+            // Atomic + durable: unique temp file, flush to disk, rename, then
+            // fsync the parent directory (POSIX). A bare ofstream + rename
+            // left the snapshot non-durable and used a fixed temp name that
+            // concurrent snapshots could interleave.
+            save_to_file(data, path);
             return true;
         } catch (...) {
             return false;
@@ -550,9 +547,8 @@ public:
             return 0;
         }
 
-        // Write the delta to <path>.delta via a temp file + rename.
+        // Write the delta to <path>.delta atomically and durably.
         auto delta_path = path + ".delta";
-        auto tmp_path = delta_path + ".tmp";
         try {
             std::vector<uint8_t> data;
             detail::binary_writer w;
@@ -572,20 +568,9 @@ public:
             }
             data = w.release();
 
-            {
-                std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
-                if (!file.is_open()) return 0;
-                file.write(reinterpret_cast<const char*>(data.data()),
-                          static_cast<std::streamsize>(data.size()));
-                if (!file) return 0;
-                file.close();
-            }
-            std::filesystem::rename(tmp_path, delta_path);
+            save_to_file(data, delta_path);
             return local_delta.size();
         } catch (...) {
-            // Best-effort cleanup of the temp file.
-            std::error_code ec;
-            std::filesystem::remove(tmp_path, ec);
             return 0;
         }
     }
@@ -597,10 +582,24 @@ public:
     ///
     /// This is the recommended warm-restart path: it restores the most
     /// recent state with minimal I/O (full snapshot + small delta).
+    ///
+    /// The reconstructed cache is published with a single atomic swap, so a
+    /// caller that passed its own shared_ptr to the constructor must re-acquire
+    /// the live cache afterwards via get_cache() / operator-> — the pointer it
+    /// supplied is superseded. Readers holding the old shared_ptr keep a
+    /// consistent pre-load view until they release it. A failure mid-load
+    /// leaves the live cache untouched.
     bool load_with_delta(const std::string& path) {
         try {
-            // Phase 1: load the full snapshot into a fresh cache.
-            auto cache = get_cache();
+            // Phase 1: reconstruct into a STAGED cache, never the live one.
+            // Loading into the live cache flushed it first, so every reader saw
+            // an empty cache for the whole load, and a failure part-way through
+            // left it half-updated with no way back. The staged instance is
+            // published by a single atomic store only once the full snapshot
+            // AND the delta have both been applied.
+            auto current = get_cache();
+            if (!current) return false;
+            auto cache = std::make_shared<cache_type>(current->max_size());
             auto full_path = path + ".full";
             {
                 std::ifstream full_file(full_path, std::ios::binary | std::ios::ate);
@@ -618,7 +617,9 @@ public:
             // Phase 2: apply the delta file if it exists.
             auto delta_path = path + ".delta";
             if (!std::filesystem::exists(delta_path)) {
-                return true;  // no delta, full snapshot is the latest state
+                // No delta: the full snapshot alone is the latest state.
+                publish_staged(std::move(cache));
+                return true;
             }
             std::vector<uint8_t> delta_data;
             {
@@ -647,7 +648,7 @@ public:
             if (count > 10'000'000) {
                 return false;  // sanity bound
             }
-            // T-G6: Batch deserialization — parse all entries first, then
+            // Batch deserialization — parse all entries first, then
             // apply in a tight loop. This separates I/O-bound work
             // (deserialization) from mutation (set/remove) and avoids
             // interleaving cache lock acquisition with binary reading.
@@ -679,6 +680,7 @@ public:
                     cache->remove(e.key);
                 }
             }
+            publish_staged(std::move(cache));
             return true;
         } catch (...) {
             return false;
@@ -736,7 +738,7 @@ private:
     std::size_t snapshot_tick_count_ = 0;
 
     // Delta tracking state (P2-G, T-G6: sharded for low contention)
-    // T-G6: the delta map is sharded into 16 stripes, each with its own mutex
+    // the delta map is sharded into 16 stripes, each with its own mutex
     // and map. The on_insert / on_update / on_evict callbacks (hot path
     // under high write concurrency) pick a shard by hash(key) % 16 and
     // lock only that shard. size() and swap() iterate all shards.
@@ -815,17 +817,7 @@ template <typename CacheType>
 bool save_cache_to_file(const CacheType& cache, const std::string& path) {
     try {
         auto data = cache.save();
-
-        auto tmp_path = path + ".tmp";
-        {
-            std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
-            if (!file.is_open()) return false;
-            file.write(reinterpret_cast<const char*>(data.data()),
-                      static_cast<std::streamsize>(data.size()));
-            if (!file) return false;
-        }
-
-        std::filesystem::rename(tmp_path, path);
+        save_to_file(data, path);
         return true;
     } catch (...) {
         return false;

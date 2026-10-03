@@ -1,4 +1,4 @@
-// T19: F14 / segmented / chain mode diagnostics consistency tests.
+// F14 / segmented / chain mode diagnostics consistency tests.
 //
 // Validates that diagnostics() / diagnostics_text() correctly report the
 // hash table mode (chain / F14 / segmented / compressed_hook) for each
@@ -62,7 +62,7 @@ TEST(F14DiagnosticsTest, CompressedCacheReportsCompressedHook) {
 }
 
 TEST(F14DiagnosticsTest, SetIncrementalRehashWorksForAllModes) {
-    // T19.2: set_incremental_rehash() must be effective for chain, F14,
+    // set_incremental_rehash() must be effective for chain, F14,
     // and segmented caches. We verify by toggling the flag and reading
     // it back via incremental_rehash_enabled().
     //
@@ -90,7 +90,7 @@ TEST(F14DiagnosticsTest, SetIncrementalRehashWorksForAllModes) {
 }
 
 TEST(F14DiagnosticsTest, DiagnosticsTextContainsReclaimSection) {
-    // T17.3 + T19.3: diagnostics_text() must include both the hash table
+    // diagnostics_text() must include both the hash table
     // mode section (T19.3) and the reclaim health section (T17.3).
     lru::cache<int, std::string> c{256};
     c.set(1, "one");
@@ -109,7 +109,7 @@ TEST(F14DiagnosticsTest, F14StripedCacheReportsBothF14AndStriped) {
 }
 
 // ============================================================================
-// T-O5: diagnostics aggregation cache
+// diagnostics aggregation cache
 // Validates that the segmented hash table's diagnostics snapshot cache
 // (cached_max_chain_length_, cached_snapshot_ns_, cached_per_segment_lf_)
 // is populated by refresh_diagnostics_cache() and served by max_chain_length()

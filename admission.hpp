@@ -408,7 +408,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(policy_mutex_);
             if (!policy_->should_admit(key)) {
-                // O7: Fire on_reject so consumers can monitor admission
+                // Fire on_reject so consumers can monitor admission
                 // rejections (e.g. reject_first_ap filtering first-access
                 // keys). Value is forwarded by const reference here — we
                 // must NOT move it, since the caller still owns it.
@@ -429,7 +429,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(policy_mutex_);
             if (!policy_->should_admit(key)) {
-                // O7: Fire on_reject for admission rejection.
+                // Fire on_reject for admission rejection.
                 cache_.callbacks().collect_reject(key, value);
                 return false;
             }

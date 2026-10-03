@@ -26,7 +26,7 @@ using namespace lru;
 using namespace std::chrono_literals;
 
 // ============================================================================
-// G1: Expired entry is lazily deleted by get()
+// Expired entry is lazily deleted by get()
 // ============================================================================
 TEST(TtlLazyDelete, ExpiredEntryRemovedOnGet) {
     ttl_cache<int, std::string> cache;
@@ -50,7 +50,7 @@ TEST(TtlLazyDelete, ExpiredEntryRemovedOnGet) {
 }
 
 // ============================================================================
-// G1: Lazy deletion does not affect non-expired entries
+// Lazy deletion does not affect non-expired entries
 // ============================================================================
 TEST(TtlLazyDelete, NonExpiredEntrySurvivesGet) {
     ttl_cache<int, std::string> cache;
@@ -75,7 +75,7 @@ TEST(TtlLazyDelete, NonExpiredEntrySurvivesGet) {
 }
 
 // ============================================================================
-// G1: peek() does NOT lazily delete (const, read-only)
+// peek() does NOT lazily delete (const, read-only)
 // ============================================================================
 TEST(TtlLazyDelete, PeekDoesNotDelete) {
     ttl_cache<int, std::string> cache;
@@ -94,7 +94,7 @@ TEST(TtlLazyDelete, PeekDoesNotDelete) {
 }
 
 // ============================================================================
-// G1: Multiple expired entries are each lazily deleted
+// Multiple expired entries are each lazily deleted
 // ============================================================================
 TEST(TtlLazyDelete, MultipleExpiredEntriesRemoved) {
     ttl_cache<int, std::string> cache;

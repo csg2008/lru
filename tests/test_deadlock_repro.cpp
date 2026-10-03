@@ -20,7 +20,7 @@
 // hard timeout. If the test completes within the timeout, the deadlock is
 // fixed. If it times out, the deadlock is still present.
 //
-// P2-5: Refactored to use bounded-join + stop-flag instead of detaching
+// Refactored to use bounded-join + stop-flag instead of detaching
 // the watchdog thread on timeout. Each worker thread polls a stop_flag
 // between iterations and exits cleanly when the flag is set, so the test
 // runner can `join()` every thread within a bounded post-timeout grace
@@ -41,7 +41,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// P2-5: Bounded-join thread wrapper. Spawns a worker that polls a stop
+// Bounded-join thread wrapper. Spawns a worker that polls a stop
 // flag between iterations of its work loop. The caller can `join()` the
 // worker thread; if the worker has not finished within `deadline`, the
 // caller sets `stop = true` and waits an additional grace period
@@ -116,7 +116,7 @@ bool bounded_join_with_stop(Fn&& fn) {
 // Reproduction: 2 threads x 1 op (try_get) on production_cache
 // This was the exact scenario that hung before the fix.
 //
-// P2-5: Each worker checks the stop flag between operations. With only
+// Each worker checks the stop flag between operations. With only
 // 1 op per thread, the stop flag is mostly insurance against the case
 // where try_get itself hangs — the worker can't be interrupted mid-op,
 // but the grace period gives it time to return after the cache op
@@ -149,7 +149,7 @@ TEST(ProductionCacheDeadlock, TwoThreadTryGetNoHang) {
 // Slightly more aggressive: 8 threads, many try_get ops, mixed with
 // occasional set() calls to keep the bucket locks moving.
 //
-// P2-5: Each worker thread checks the stop flag between iterations, so
+// Each worker thread checks the stop flag between iterations, so
 // when the watchdog signals stop, all 8 threads exit their loops within
 // a single cache-op latency (microseconds). The outer thread then joins
 // all 8 cleanly within the grace period.

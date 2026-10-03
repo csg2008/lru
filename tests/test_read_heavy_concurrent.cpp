@@ -119,7 +119,7 @@ void run_concurrent_with_rehash(CacheT& c, int key_space,
 }  // namespace
 
 // ============================================================================
-// H-3-A: segmented_striped_cache concurrent stress
+// segmented_striped_cache concurrent stress
 // (was avoided in test_stress.cpp:SegmentedCacheStress due to a stale
 // "deleted operator=" compilation concern — verified compilable here.)
 // ============================================================================
@@ -137,7 +137,7 @@ TEST(ReadHeavyConcurrent, SegmentedStripedCacheRehashStress) {
 }
 
 // ============================================================================
-// H-3-B: read_heavy_cache / read_heavy_striped_cache concurrent stress
+// read_heavy_cache / read_heavy_striped_cache concurrent stress
 // (95% read / 5% write, 16 threads). These are the aliases AGENTS.md
 // recommends for read-heavy production workloads but had ZERO concurrent
 // test coverage before this file.
@@ -163,7 +163,7 @@ TEST(ReadHeavyConcurrent, ReadHeavyStripedCacheReadHeavy) {
 }
 
 // ============================================================================
-// H-3-C: f14_production_cache concurrent stress (mixed reads + writes +
+// f14_production_cache concurrent stress (mixed reads + writes +
 // rehash). Combines F14 SIMD probing + sharded MM + striped locking.
 // ============================================================================
 TEST(ReadHeavyConcurrent, F14ProductionCacheRehashStress) {
@@ -179,7 +179,7 @@ TEST(ReadHeavyConcurrent, F14ProductionCacheReadHeavy) {
 }
 
 // ============================================================================
-// H-3-D: production_cache (the headline "recommended for production" alias)
+// production_cache (the headline "recommended for production" alias)
 // under sustained read-heavy load. With C-1/C-2 fixed, this alias is now
 // safe to exercise. The test pre-populates, then runs 16 threads doing
 // 95% reads + 5% writes for at least 30s (configurable via env).

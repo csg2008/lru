@@ -2,7 +2,7 @@
 // TLS ring improvements tests.
 //
 // Covers spec gap G20 (P2):
-//   G20: test_tls_ring_improvements.cpp was an empty file with only "// Tests".
+//   test_tls_ring_improvements.cpp was an empty file with only "// Tests".
 //        This file implements actual TLS ring tests covering:
 //          - overflow policy (silent drop / flush callback)
 //          - auto-drain threshold behavior
@@ -41,7 +41,7 @@ TEST(TlsRingImprovements, AutoDrainThresholdConfigurable) {
     using ring_t = tls_access_ring<int>;
     auto& ring = ring_t::instance();
 
-    // R6: Default threshold is now kRingSize / 2 (auto-drain enabled by
+    // Default threshold is now kRingSize / 2 (auto-drain enabled by
     // default — proactively drains before overflow to bound drain latency).
     std::size_t default_threshold = ring_t::tls_drain_threshold();
     EXPECT_EQ(default_threshold, ring_t::kRingSize / 2);
@@ -170,8 +170,8 @@ TEST(TlsRingImprovements, ThreadExitBackupBuffer) {
 }
 
 // ============================================================================
-// TC-T-D2: Per-cache TLS ring config
-// T-D2 (P2-2): Per-cache `tls_ring_config_` member overrides static defaults
+// Per-cache TLS ring config
+// Per-cache `tls_ring_config_` member overrides static defaults
 // when the cache's `record_access_in_ring()` activates it via
 // `active_config_scope` RAII. Two cache instances of the same `<Key, N>`
 // specialization should be able to use different overflow policies and
@@ -264,7 +264,7 @@ TEST(TlsRingImprovements, PerCacheFlushCallbackInvoked) {
     safe_cache<int, int> cache(8192);
     cache.set_defer_promotion(true);
     cache.set_tls_ring_full_policy(tls_ring_full_policy::kFlushOnFull);
-    // R6: init_production_features() sets auto_drain_threshold to kRingSize/2,
+    // init_production_features() sets auto_drain_threshold to kRingSize/2,
     // which drains the ring at 50% capacity before it can overflow. This test
     // specifically tests the kFlushOnFull overflow path, so disable auto-drain
     // by setting the threshold back to kRingSize (the condition `threshold < cap`
@@ -302,8 +302,8 @@ TEST(TlsRingImprovements, PerCacheFlushCallbackInvoked) {
 }
 
 // ============================================================================
-// TC-T-O3: TLS ring runtime-configurable capacity
-// T-O3 (P2-1): The compile-time template parameter N is the upper bound;
+// TLS ring runtime-configurable capacity
+// The compile-time template parameter N is the upper bound;
 // set_tls_ring_capacity() controls the effective capacity at runtime.
 // ============================================================================
 TEST(TlsRingImprovements, RuntimeCapacityConfigurable) {

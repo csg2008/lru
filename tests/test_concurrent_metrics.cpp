@@ -2,11 +2,11 @@
 // Concurrent metrics / statistics atomicity tests.
 //
 // Covers spec gaps G7, G17, G18, G21, G22 (P1/P2):
-//   G7:  refcount saturation boundary (kIncFailedOverflow)
-//   G17: event_tracker concurrent record consistency
-//   G18: latency_histogram concurrent record correctness
-//   G21: count_min_sketch concurrent add atomicity
-//   G22: overflow_policy::kRejectInsert under concurrent set()
+//   refcount saturation boundary (kIncFailedOverflow)
+//   event_tracker concurrent record consistency
+//   latency_histogram concurrent record correctness
+//   count_min_sketch concurrent add atomicity
+//   overflow_policy::kRejectInsert under concurrent set()
 
 #include <gtest/gtest.h>
 
@@ -27,7 +27,7 @@ using namespace lru::detail;
 using namespace std::chrono_literals;
 
 // ============================================================================
-// TC-G7: RefcountSaturatesAndStaysCorrect
+// RefcountSaturatesAndStaysCorrect
 // Drive incRef() to the saturation point; verify kIncFailedOverflow is
 // returned and that subsequent decRef() calls correctly restore state.
 //
@@ -102,7 +102,7 @@ TEST(ConcurrentMetrics, RefcountSaturatesAndStaysCorrect) {
 }
 
 // ============================================================================
-// TC-G17: EventTrackerConcurrentRecord
+// EventTrackerConcurrentRecord
 // Many threads concurrently record events; the streaming top_keys summary
 // must be consistent after all threads drain.
 // ============================================================================
@@ -139,7 +139,7 @@ TEST(ConcurrentMetrics, EventTrackerConcurrentRecord) {
 }
 
 // ============================================================================
-// TC-G18: LatencyHistogramConcurrentRecord
+// LatencyHistogramConcurrentRecord
 // N threads concurrently record samples; sum() and count() must be exact.
 // ============================================================================
 TEST(ConcurrentMetrics, LatencyHistogramConcurrentRecord) {
@@ -179,12 +179,12 @@ TEST(ConcurrentMetrics, LatencyHistogramConcurrentRecord) {
 }
 
 // ============================================================================
-// TC-G21: CountMinSketchConcurrentAdd
+// CountMinSketchConcurrentAdd
 // Concurrent record() calls must not corrupt the sketch; estimate() must
 // be a lower bound (Count-Min Sketch property).
 // ============================================================================
 TEST(ConcurrentMetrics, CountMinSketchConcurrentAdd) {
-    // P1-25: the sketch is now parameterised like CacheLib's —
+    // the sketch is now parameterised like CacheLib's —
     // (capacity, window_multiplier, error_threshold, hash_count). The old
     // (error_rate, confidence) pair gave a 42-counter table regardless of
     // capacity; these settings ask for a table sized for 10000 items.
@@ -221,7 +221,7 @@ TEST(ConcurrentMetrics, CountMinSketchConcurrentAdd) {
 }
 
 // ============================================================================
-// TC-G22: OverflowPolicyRejectInsertUnderConcurrency
+// OverflowPolicyRejectInsertUnderConcurrency
 // When the cache is at capacity with kRejectInsert policy, concurrent set()
 // calls must not over-insert. The cache size must stay bounded.
 // ============================================================================

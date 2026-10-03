@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// T-G14: 128-thread read-heavy soak test.
+// 128-thread read-heavy soak test.
 //
 // Verifies the cache remains correct (no race, no crash, no data
 // corruption) under sustained 99% read / 1% write load from 128

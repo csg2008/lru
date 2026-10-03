@@ -22,7 +22,7 @@ using namespace lru;
 // SubTask 2.4: Concurrent allocate/deallocate test for slab_allocator
 // ============================================================================
 //
-// P2-H: The allocation_class uses a 128-bit tagged-pointer Treiber stack
+// The allocation_class uses a 128-bit tagged-pointer Treiber stack
 // (32-bit ABA counter + 64-bit pointer, cmpxchg16b). The 32-bit tag wraps
 // after ~4 billion operations, effectively eliminating ABA for realistic
 // workloads. The previous 16-bit tag wrapped after 65K ops; tests worked
@@ -110,7 +110,7 @@ TEST(SlabAllocatorTest, ConcurrentMixedSizeAllocate) {
     // No crash means success
 }
 
-// P2-H: Verify the 32-bit ABA tag survives a workload that would have wrapped
+// Verify the 32-bit ABA tag survives a workload that would have wrapped
 // the old 16-bit tag (>65K ops on the same free list) and caused ABA.
 // Threads rapidly allocate and deallocate on the same shared free list,
 // forcing the tag counter past the 16-bit wrap point.
@@ -253,7 +253,7 @@ TEST(MemoryPressureTest, MemoryAwareEvictorLifecycle) {
 }
 
 // ============================================================================
-// spec.md P0-4: OS Memory Sampler + Pressure Callback
+// OS Memory Sampler + Pressure Callback.
 // ============================================================================
 //
 // These tests cover the new OS-level memory integration:

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// T-G13: clone_and_reshard — stop-the-world shard-count expansion utility.
+// clone_and_reshard — stop-the-world shard-count expansion utility.
 //
 // Online resharding (in-place shard count change while serving traffic)
 // is NOT supported because:
@@ -45,7 +45,7 @@
 
 namespace lru {
 
-/// T-G13: Clone a cache with a different shard count.
+/// Clone a cache with a different shard count.
 ///
 /// Constructs a new cache of the same type with `new_num_shards` shards,
 /// copies all items from `old_cache`, and returns the new cache. The old

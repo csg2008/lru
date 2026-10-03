@@ -19,7 +19,7 @@
 // `deserialize(T&, const void* src, std::size_t len)` overload, which
 // this header detects via SFINAE and uses in preference to memcpy.
 //
-// T5 (P0-5): Cross-process synchronization & integrity
+// Cross-process synchronization & integrity
 // ----------------------------------------------------
 // The header now carries a CRC32 of the data region and a byte count of
 // the valid data, so attach() can detect torn writes / partial flushes.
@@ -535,7 +535,7 @@ private:
 // ============================================================================
 
 // ----------------------------------------------------------------------------
-// T5.1: cross_process_mutex
+// cross_process_mutex
 // ----------------------------------------------------------------------------
 //
 // A kernel-level named mutex used to serialize save()/attach() across
@@ -755,7 +755,7 @@ private:
 };
 
 // ----------------------------------------------------------------------------
-// T5.3: CRC32 (IEEE 802.3 polynomial, table-less branchless implementation)
+// CRC32 (IEEE 802.3 polynomial, table-less branchless implementation)
 // ----------------------------------------------------------------------------
 
 /// fix.01 P2-18: the 256-entry CRC table, initialized exactly once.
@@ -810,7 +810,7 @@ inline uint32_t crc32_compute(const void* data, std::size_t len) noexcept {
 /// etc.). This avoids coupling the shared-memory layer to any specific
 /// cache implementation.
 ///
-/// T5: Cross-process safety
+/// Cross-process safety
 /// ------------------------
 /// `save()` and `attach()` acquire a `cross_process_mutex` (named mutex
 /// on Windows, named POSIX semaphore on Linux) before touching the data
@@ -882,7 +882,7 @@ public:
 
         if (segment_.is_newly_created()) {
             // Fresh segment — initialize the header.
-            // P0-3: `header` has default member initializers, so it is a
+            // `header` has default member initializers, so it is a
             // non-trivial type and std::memset on it trips -Wclass-memaccess
             // (and is only conditionally well-defined). The struct is exactly
             // 128 bytes with no padding (see the static_assert below it), so
@@ -925,9 +925,9 @@ public:
     /// in-memory cache. This decouples attach() from any specific cache
     /// type (unified_cache, striped_cache, etc.).
     ///
-    /// T5.2: Acquires `mutex_` (a `cross_process_mutex`) so a concurrent
+    /// Acquires `mutex_` (a `cross_process_mutex`) so a concurrent
     /// save() in another process cannot interleave with this attach.
-    /// T5.3: Verifies the CRC32 of the data region before deserializing.
+    /// Verifies the CRC32 of the data region before deserializing.
     /// If the CRC does not match (torn write, partial flush, corruption),
     /// attach() returns 0 and the header's data_size_bytes is reset.
     ///
@@ -952,7 +952,7 @@ public:
             std::forward<Inserter>(inserter));
     }
 
-    /// T5.4: Same as attach(inserter) but with a bounded wait on the
+    /// Same as attach(inserter) but with a bounded wait on the
     /// cross-process mutex. Returns 0 if the timeout expired before
     /// the mutex could be acquired (no items read).
     template <typename Inserter, typename Rep, typename Period>
@@ -995,7 +995,7 @@ public:
         const std::size_t claimed = hdr->item_count;
         const std::size_t data_size = data_region_size();
 
-        // T5.3: verify CRC32 before deserializing. If the writer crashed
+        // verify CRC32 before deserializing. If the writer crashed
         // mid-save, the CRC will not match and we refuse to recover.
         const uint32_t expected_crc = hdr->data_crc32;
         const std::size_t valid_bytes = hdr->data_size_bytes;
@@ -1022,7 +1022,7 @@ public:
         // or truncated region can't cause an out-of-bounds read.
         const char* p = static_cast<const char*>(data_region());
         const char* end = p + data_size;
-        // T5.3: prefer the recorded valid_bytes as the bound, falling back
+        // prefer the recorded valid_bytes as the bound, falling back
         // to the full region size only if the header predates the size
         // field (it should not, since version is checked at construction).
         if (valid_bytes > 0 && valid_bytes <= data_size) {
@@ -1077,7 +1077,7 @@ public:
     /// templated attach(inserter) overload for actual recovery.
     bool attach() {
         if (!has_previous_data_) return false;
-        // T5.2: still acquire the mutex to serialize with save().
+        // still acquire the mutex to serialize with save().
         std::lock_guard<cross_process_mutex> lk(mutex_);
         header_ptr()->last_attach_timestamp = current_timestamp();
         segment_.flush();
@@ -1092,10 +1092,10 @@ public:
     /// at the last item that fits and the header's item_count is updated
     /// to reflect the actual count persisted.
     ///
-    /// T5.2: Acquires `mutex_` (a `cross_process_mutex`) before writing, so
+    /// Acquires `mutex_` (a `cross_process_mutex`) before writing, so
     /// concurrent save() / attach() calls from different processes cannot
     /// interleave.
-    /// T5.3: Computes CRC32 of the written data region and stores it in
+    /// Computes CRC32 of the written data region and stores it in
     /// the header along with `data_size_bytes` for attach()-time
     /// integrity verification.
     ///
@@ -1106,7 +1106,7 @@ public:
     std::size_t save(InputIt first, InputIt last) {
         if (!segment_) return 0;
 
-        // T5.2: serialize with other processes.
+        // serialize with other processes.
         std::lock_guard<cross_process_mutex> lk(mutex_);
 
         char* p = static_cast<char*>(data_region());
@@ -1141,7 +1141,7 @@ public:
             ++written;
         }
 
-        // T5.3: compute CRC32 + valid byte count over what we just wrote.
+        // compute CRC32 + valid byte count over what we just wrote.
         const std::size_t bytes_used = static_cast<std::size_t>(p - static_cast<char*>(data_region()));
         const uint32_t crc = (bytes_used > 0)
             ? crc32_compute(data_region(), bytes_used)

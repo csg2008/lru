@@ -1,4 +1,4 @@
-// T20: tls_event_ring backup buffer tests.
+// tls_event_ring backup buffer tests.
 //
 // Validates that events recorded by a thread are NOT lost when the thread
 // exits before the next drain cycle. The thread_exit_sentinel must push
@@ -55,7 +55,7 @@ TEST(TlsEventBackupTest, PushToBackupIsRetrievable) {
 }
 
 TEST(TlsEventBackupTest, ThreadExitPushesEventsToBackup) {
-    // T20.4: A thread records events then exits WITHOUT draining. The
+    // A thread records events then exits WITHOUT draining. The
     // sentinel must push those events into the backup buffer so they
     // can be retrieved by a subsequent drain_backup() / drain_all_threads().
     (void)drain_backup_count();
@@ -64,7 +64,7 @@ TEST(TlsEventBackupTest, ThreadExitPushesEventsToBackup) {
     constexpr int kEvents = 10;
 
     {
-        // P0-3: kEvents is a constant expression, so capturing it is
+        // kEvents is a constant expression, so capturing it is
         // unnecessary (-Wunused-lambda-capture).
         std::thread t([&tracker]() {
             for (int i = 0; i < kEvents; ++i) {
@@ -87,7 +87,7 @@ TEST(TlsEventBackupTest, ThreadExitPushesEventsToBackup) {
 }
 
 TEST(TlsEventBackupTest, DrainAllThreadsRetrievesExitedThreadEvents) {
-    // T20.4: drain_all_threads() should retrieve events from exited
+    // drain_all_threads() should retrieve events from exited
     // threads via the backup buffer, in addition to live threads' data.
     (void)drain_backup_count();
 
@@ -95,7 +95,7 @@ TEST(TlsEventBackupTest, DrainAllThreadsRetrievesExitedThreadEvents) {
     constexpr int kEvents = 20;
 
     {
-        // P0-3: kEvents is a constant expression, so capturing it is
+        // kEvents is a constant expression, so capturing it is
         // unnecessary (-Wunused-lambda-capture).
         std::thread t([&tracker]() {
             for (int i = 0; i < kEvents; ++i) {
@@ -118,14 +118,14 @@ TEST(TlsEventBackupTest, DrainAllThreadsRetrievesExitedThreadEvents) {
 }
 
 TEST(TlsEventBackupTest, FlushAllRegisteredRetrievesBackupEvents) {
-    // T20.4: flush_all_registered() should also drain the backup buffer.
+    // flush_all_registered() should also drain the backup buffer.
     (void)drain_backup_count();
 
     event_tracker<int> tracker(10000);
     constexpr int kEvents = 5;
 
     {
-        // P0-3: kEvents is a constant expression, so capturing it is
+        // kEvents is a constant expression, so capturing it is
         // unnecessary (-Wunused-lambda-capture).
         std::thread t([&tracker]() {
             for (int i = 0; i < kEvents; ++i) {
@@ -143,7 +143,7 @@ TEST(TlsEventBackupTest, FlushAllRegisteredRetrievesBackupEvents) {
 }
 
 TEST(TlsEventBackupTest, MultipleThreadsExitEventsPreserved) {
-    // T20.4: Multiple short-lived threads all record events and exit.
+    // Multiple short-lived threads all record events and exit.
     // All their events should be pushed to the backup buffer and
     // retrieved together.
     (void)drain_backup_count();
@@ -174,7 +174,7 @@ TEST(TlsEventBackupTest, MultipleThreadsExitEventsPreserved) {
 }
 
 TEST(TlsEventBackupTest, NoEventsLostAcrossThreadLifecycle) {
-    // T20.4: End-to-end test — record events from multiple short-lived
+    // End-to-end test — record events from multiple short-lived
     // threads, then generate a report. The report's total events should
     // account for all recorded inserts (within ring-overflow tolerance).
     (void)drain_backup_count();
@@ -197,7 +197,7 @@ TEST(TlsEventBackupTest, NoEventsLostAcrossThreadLifecycle) {
         tracker.record_insert(9000 + i);
     }
 
-    // T20.4: Explicitly drain_all_threads() to pick up events from the
+    // Explicitly drain_all_threads() to pick up events from the
     // 4 exited threads (via the backup buffer) before generating the
     // report. generate_report() only calls drain_tls() (calling thread),
     // so without this step the exited threads' events would not be
@@ -214,7 +214,7 @@ TEST(TlsEventBackupTest, NoEventsLostAcrossThreadLifecycle) {
 }
 
 TEST(TlsEventBackupTest, BackupBufferIsPerTemplateSpecialization) {
-    // T20.4: Different Key types should have independent backup buffers.
+    // Different Key types should have independent backup buffers.
     // Recording int events should not affect the std::string backup buffer.
     (void)drain_backup_count();
     (void)tls_event_ring<std::string>::drain_all_backups();

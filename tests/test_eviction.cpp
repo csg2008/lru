@@ -18,7 +18,7 @@ protected:
     w_tiny_lfu<int, char> c;
 
     void SetUp() override {
-        // W-TinyLFU 窗口队列太小（max(1, size*0.01)=1），仅插入 1 个避免提前淘汰
+        // The W-TinyLFU window queue is tiny (max(1, size*0.01) == 1), so insert
         c.set(1, 'a');
     }
 };
@@ -54,7 +54,7 @@ TEST_F(WTinyLfuTest, Peek) {
 
 TEST_F(WTinyLfuTest, AddReplaceSemantics) {
     EXPECT_TRUE(c.add(2, 'b'));
-    EXPECT_FALSE(c.add(1, 'z'));  // 已存在
+    EXPECT_FALSE(c.add(1, 'z'));  // already present
     EXPECT_EQ(*c.get(1), 'a');
 
     EXPECT_TRUE(c.replace(1, 'z'));
@@ -261,7 +261,7 @@ TEST(TwoQApiTest, PopByKey) {
 }
 
 // ============================================================================
-// FIFO Cache — CRUD 和淘汰语义
+// FIFO cache: CRUD and eviction semantics.
 // (migrated from test_serde.cpp — these CRUD/eviction-order tests are
 //  unrelated to serialization and belong with the other eviction strategies)
 // ============================================================================

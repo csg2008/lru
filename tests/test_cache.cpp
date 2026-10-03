@@ -1,6 +1,6 @@
 // Unified LRU Cache - Cache unit tests
-// 与 unified_cache 架构对齐：使用 lru::cache<K,V> 别名，
-// 迭代器通过 c.mm() 访问，get() 返回 read_handle<V>，用 *result 访问值。
+// Aligned with the unified_cache architecture: use the lru::cache<K,V> alias;
+// iterators come from c.mm(), get() returns read_handle<V>, dereference with *result.
 
 #include <gtest/gtest.h>
 #include <string>
@@ -32,9 +32,9 @@ TEST_F(CacheCrudTest, SetAndGet) {
 }
 
 TEST_F(CacheCrudTest, GetUpdatesLruOrder) {
-    c.set_defer_promotion(false);  // 显式启用即时提升，恢复测试预期行为
-    // 初始顺序（MRU -> LRU）：3, 2, 1
-    c.get(1); // 1 提升为 MRU，顺序变为：1, 3, 2
+    c.set_defer_promotion(false);  // enable immediate promotion, restoring the expected order
+    // Initial order (MRU -> LRU): 3, 2, 1
+    c.get(1); // 1 is promoted to MRU, so the order becomes 1, 3, 2
     auto it = c.mm().begin();
     EXPECT_EQ(it->key, 1);
     ++it;
@@ -50,7 +50,7 @@ TEST_F(CacheCrudTest, AddNewKey) {
 
 TEST_F(CacheCrudTest, AddExistingKey) {
     EXPECT_FALSE(c.add(1, 'z'));
-    // 已存在的 key，值不变
+    // Existing key: the value is unchanged.
     EXPECT_EQ(*c.get(1), 'a');
 }
 
@@ -79,7 +79,7 @@ TEST_F(CacheCrudTest, Contains) {
 }
 
 TEST_F(CacheCrudTest, PeekDoesNotPromote) {
-    // peek 不改变 LRU 顺序，返回 const handle
+    // peek does not change the LRU order and returns a const handle.
     auto result = c.peek(1);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 'a');
@@ -98,20 +98,20 @@ TEST_F(CacheCrudTest, EmptyCache) {
 }
 
 TEST_F(CacheCrudTest, RemoveReturnsSuccessOrNotFound) {
-    // B16: remove() 返回 RemoveRes 枚举
+    // remove() reports a structured RemoveRes.
     EXPECT_EQ(c.remove(1), decltype(c)::RemoveRes::kSuccess);
     EXPECT_FALSE(c.contains(1));
     EXPECT_EQ(c.remove(999), decltype(c)::RemoveRes::kNotFound);
 }
 
 TEST_F(CacheCrudTest, ContainsFast) {
-    // B17: contains() 仅查 map，不触发访问/提升
+    // contains() only consults the map; it does not record an access or promote.
     EXPECT_TRUE(c.contains(1));
     EXPECT_FALSE(c.contains(999));
 }
 
 TEST_F(CacheCrudTest, PopViaMm) {
-    // pop() 通过 MM 层访问：移除并返回值
+    // pop() goes through the MM layer: removes the item and returns its value.
     auto val = c.mm().pop(1);
     ASSERT_TRUE(val.has_value());
     EXPECT_EQ(*val, 'a');
@@ -130,7 +130,7 @@ TEST_F(CacheCrudTest, PopLru) {
     c2.set(2, "two");
     auto result = c2.mm().pop_lru();
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(result->first, 1);  // 1 是 LRU（最早插入）
+    EXPECT_EQ(result->first, 1);  // 1 is the LRU (inserted first)
     EXPECT_EQ(c2.size(), 1);
 }
 
@@ -149,7 +149,7 @@ TEST(CacheCapacityTest, MaxSizeEviction) {
     c.set(1, "one");
     c.set(2, "two");
     c.set(3, "three");
-    c.set(4, "four"); // 应淘汰 1（LRU）
+    c.set(4, "four"); // should evict 1 (the LRU)
 
     EXPECT_EQ(c.size(), 3);
     EXPECT_FALSE(c.contains(1));
@@ -160,11 +160,11 @@ TEST(CacheCapacityTest, MaxSizeEviction) {
 
 TEST(CacheCapacityTest, LruEvictionOrder) {
     cache<int, std::string> c(2);
-    c.set_defer_promotion(false);  // 显式启用即时提升，恢复测试预期行为
+    c.set_defer_promotion(false);  // enable immediate promotion, restoring the expected order
     c.set(1, "one");
     c.set(2, "two");
-    c.get(1); // 1 提升为 MRU，2 变为 LRU
-    c.set(3, "three"); // 应淘汰 2
+    c.get(1); // 1 is promoted to MRU, so 2 becomes the LRU
+    c.set(3, "three"); // should evict 2
 
     EXPECT_TRUE(c.contains(1));
     EXPECT_FALSE(c.contains(2));
@@ -172,17 +172,17 @@ TEST(CacheCapacityTest, LruEvictionOrder) {
 }
 
 TEST(CacheCapacityTest, MaxMemoryEviction) {
-    // 每项内存 = item_overhead + key_size*2 + value_size
+    // Per-item memory = item_overhead + key_size*2 + value_size.
     cache<std::string, std::string> c(unlimited, 500);
     c.set_key_size_calculator([](const std::string& s) { return s.size(); });
     c.set_value_size_calculator([](const std::string& s) { return s.size(); });
 
-    // 插入元素直到触发淘汰
+    // Insert until eviction is triggered.
     for (int i = 0; i < 20; ++i) {
         c.set("key_" + std::to_string(i), "val_" + std::to_string(i));
     }
 
-    // 淘汰后内存应在限制内
+    // After eviction, memory must be within the limit.
     EXPECT_LE(c.current_memory(), 500);
     EXPECT_GT(c.size(), 0u);
 }
@@ -194,7 +194,7 @@ TEST(CacheCapacityTest, ResizeDown) {
     }
     EXPECT_EQ(c.size(), 5);
 
-    c.max_size(2); // 缩容触发淘汰
+    c.max_size(2); // shrinking triggers eviction
     EXPECT_EQ(c.size(), 2);
 }
 
@@ -220,7 +220,7 @@ TEST(CacheStatsTest, InsertionAndEvictionTracking) {
     cache<int, int> c(2);
     c.set(1, 1);
     c.set(2, 2);
-    c.set(3, 3); // 触发淘汰
+    c.set(3, 3); // triggers eviction
 
     auto stats = c.stats_snapshot();
     EXPECT_EQ(stats.insertions.value.load(), 3);
@@ -233,7 +233,7 @@ TEST(CacheStatsTest, InsertionAndEvictionTracking) {
 
 TEST(CacheCallbackTest, HitCallback) {
     cache<int, int> c;
-    c.set_defer_promotion(false);  // 显式启用即时提升，使 hit 回调同步触发
+    c.set_defer_promotion(false);  // enable immediate promotion so the hit callback fires synchronously
     int hit_key = 0;
     int hit_value = 0;
 
@@ -274,7 +274,7 @@ TEST(CacheCallbackTest, EvictCallback) {
 
     c.set(1, 100);
     c.set(2, 200);
-    c.set(3, 300); // 淘汰 1
+    c.set(3, 300); // evicts 1
 
     EXPECT_EQ(evict_key, 1);
     EXPECT_EQ(evict_value, 100);
@@ -297,18 +297,18 @@ TEST(CacheCallbackTest, InsertCallback) {
 }
 
 // ============================================================================
-// Iterator Tests（通过 c.mm() 访问 MM 层迭代器）
+// Iterator tests (the MM-layer iterators are reached through c.mm()).
 // ============================================================================
 
 TEST(CacheIteratorTest, OrderedIteration) {
     cache<int, char> c;
-    c.set_defer_promotion(false);  // 显式启用即时提升，恢复测试预期行为
+    c.set_defer_promotion(false);  // enable immediate promotion, restoring the expected order
     c.set(1, 'a');
     c.set(2, 'b');
     c.set(3, 'c');
-    c.get(1); // 1 提升为 MRU
+    c.get(1); // 1 is promoted to MRU
 
-    // 顺序（MRU -> LRU）：1, 3, 2
+    // Order (MRU -> LRU): 1, 3, 2
     auto it = c.mm().begin();
     EXPECT_EQ(it->key, 1);
     ++it;
@@ -325,7 +325,7 @@ TEST(CacheIteratorTest, RangeBasedFor) {
     c.set(2, 20);
 
     int sum = 0;
-    // cache_item 通过 .value 成员访问值
+    // cache_item exposes its value through the .value member.
     for (const auto& item : c.mm()) {
         sum += item.value;
     }
@@ -341,7 +341,7 @@ TEST(CacheMemoryPolicyTest, SetValueSizeCalculator) {
     c.set_value_size_calculator([](const std::string& s) { return s.size(); });
 
     c.set("k", "12345");
-    // current_memory 应包含 item_overhead + value_size
+    // current_memory must include item_overhead + value_size.
     EXPECT_GT(c.current_memory(), 0u);
 }
 
@@ -350,7 +350,7 @@ TEST(CacheMemoryPolicyTest, SetKeySizeCalculator) {
     c.set_key_size_calculator([](const std::string& s) { return s.size(); });
 
     c.set("abcde", "v");
-    // key_size 计入内存（*2），current_memory 应大于 0
+    // key_size is counted (doubled), so current_memory must exceed 0.
     EXPECT_GT(c.current_memory(), 0u);
 }
 
@@ -367,7 +367,7 @@ TEST(CacheConstructorTest, InitList) {
 }
 
 TEST(CacheConstructorTest, InitListEmpty) {
-    // 显式类型避免 {}→size_type(0) 的歧义
+    // Explicit type, avoiding the {} -> size_type(0) ambiguity.
     std::initializer_list<std::pair<const int, std::string>> empty{};
     cache<int, std::string> c(empty, 100);
     EXPECT_TRUE(c.empty());
@@ -375,14 +375,14 @@ TEST(CacheConstructorTest, InitListEmpty) {
 }
 
 TEST(CacheConstructorTest, InitListEvictsWhenOversize) {
-    // 通过两步构造：先构造，再确认容量限制生效
+    // Two-step construction: build first, then confirm the capacity limit applies.
     cache<int, std::string> c(2); // max_size = 2
     c.set(1, "a");
     c.set(2, "b");
-    c.set(3, "c"); // 触发淘汰
+    c.set(3, "c"); // triggers eviction
     c.set(4, "d");
     EXPECT_EQ(c.size(), 2u);
-    // 仅保留最后 2 个
+    // Only the last two survive.
     EXPECT_FALSE(c.contains(1));
     EXPECT_FALSE(c.contains(2));
 }
@@ -418,7 +418,7 @@ TEST(CacheValueProviderTest, GetOrFetchWithStoredProvider) {
 
     auto v = c.get_or_fetch(42);
     EXPECT_EQ(v, "auto_42");
-    // 现在应缓存
+    // It should be cached now.
     EXPECT_TRUE(c.contains(42));
     EXPECT_EQ(c.size(), 1u);
 }
@@ -446,7 +446,7 @@ TEST(CacheValueProviderTest, GetOrFetchWithInlineProvider) {
 
 TEST(CacheValueProviderTest, GetOrFetchInlineDoesNotNeedStoredProvider) {
     cache<int, std::string> c(100);
-    // 未设置 value_provider，但传入了 inline provider，二应成功
+    // No value_provider is set, but an inline provider was passed, so it must succeed.
     auto v = c.get_or_fetch(99, [](const int&) { return "ok"; });
     EXPECT_EQ(v, "ok");
     EXPECT_EQ(c.size(), 1u);
@@ -454,7 +454,7 @@ TEST(CacheValueProviderTest, GetOrFetchInlineDoesNotNeedStoredProvider) {
 
 TEST(CacheValueProviderTest, GetOrFetchWithoutProviderThrows) {
     cache<int, std::string> c(100);
-    // 没有设置 value_provider
+    // No value_provider has been set.
     EXPECT_THROW(c.get_or_fetch(42), std::runtime_error);
 }
 
@@ -464,7 +464,7 @@ TEST(CacheValueProviderTest, OperatorSubscript) {
 
     auto v1 = c[42];
     EXPECT_EQ(v1, "auto_42");
-    // 第二次应命中缓存
+    // The second call must hit the cache.
     auto v2 = c[42];
     EXPECT_EQ(v2, "auto_42");
     EXPECT_EQ(c.size(), 1u);
@@ -497,19 +497,19 @@ TEST(CacheGetSharedTest, OutlivesEviction) {
     c.flush();
     EXPECT_TRUE(c.empty());
 
-    // shared_ptr 持有的副本不受 flush 影响
+    // A copy held by shared_ptr is unaffected by flush.
     EXPECT_EQ(*sp, "persistent");
 }
 
 TEST(CacheGetSharedTest, DoesNotPromoteLru) {
     cache<int, std::string> c(100);
     c.set(1, "first");
-    c.set(2, "second");  // 2 是 MRU
-    // 初始顺序: 2(MRU) → 1(LRU)
+    c.set(2, "second");  // 2 is the MRU
+    // Initial order: 2 (MRU) -> 1 (LRU)
 
-    c.get_shared(1);  // 不改变 LRU 顺序
+    c.get_shared(1);  // does not change the LRU order
     auto it = c.mm().begin();
-    EXPECT_EQ(it->key, 2);  // 2 仍是 MRU
+    EXPECT_EQ(it->key, 2);  // 2 is still the MRU
 }
 
 TEST(CacheGetSharedTest, RecordsHitAndMiss) {
@@ -523,7 +523,7 @@ TEST(CacheGetSharedTest, RecordsHitAndMiss) {
 }
 
 // ============================================================================
-// pop(key) Tests — 不触发 eviction callback
+// pop(key) tests: pop must not fire the eviction callback.
 // ============================================================================
 
 TEST(CachePopTest, PopFromUnifiedCache) {
@@ -548,22 +548,22 @@ TEST(CachePopTest, PopDoesNotFireEvictionCallback) {
     cache<int, std::string> c(3);
     c.set(1, "one");
     c.set(2, "two");
-    c.set(3, "three");     // size=3，已满
+    c.set(3, "three");     // size == 3, now full
 
     int evict_count = 0;
     c.callbacks().on_evict([&](const int&, const std::string&) { ++evict_count; });
 
-    auto popped = c.pop(2);  // 不触发 eviction callback
+    auto popped = c.pop(2);  // must not fire the eviction callback
     ASSERT_TRUE(popped.has_value());
     EXPECT_EQ(*popped, "two");
-    EXPECT_EQ(evict_count, 0);  // pop 绝不触发 eviction callback
-    EXPECT_EQ(c.size(), 2u);    // pop 后 size=2，有空位
+    EXPECT_EQ(evict_count, 0);  // pop never fires the eviction callback
+    EXPECT_EQ(c.size(), 2u);    // size is 2 after the pop, leaving a free slot
 
-    // 正常淘汰应触发 callback
-    c.set(4, "four");   // size=3，仍不超限
+    // A normal eviction must fire the callback.
+    c.set(4, "four");   // size == 3, still within the limit
     EXPECT_EQ(evict_count, 0);
 
-    c.set(5, "five");   // size=4 → 淘汰一个（>= max_size=3）
+    c.set(5, "five");   // size == 4 -> one eviction (>= max_size == 3)
     EXPECT_EQ(evict_count, 1);
 }
 
@@ -607,7 +607,7 @@ TEST(CacheIteratorTest, ReverseIteration) {
     c.set(3, 'c');
     // MRU→LRU: 3, 2, 1
 
-    // rbegin() = LRU 端 = 1
+    // rbegin() is the LRU end, i.e. 1.
     auto rit = c.mm().rbegin();
     ASSERT_NE(rit, c.mm().rend());
     EXPECT_EQ(rit->key, 1);
@@ -642,14 +642,14 @@ TEST(CacheIteratorTest, ReverseIterationSingleItem) {
 
 TEST(CacheIteratorTest, ReverseIterationAfterGetPromotion) {
     cache<int, char> c(100);
-    c.set_defer_promotion(false);  // 显式启用即时提升，恢复测试预期行为
+    c.set_defer_promotion(false);  // enable immediate promotion, restoring the expected order
     c.set(1, 'a');
     c.set(2, 'b');
     c.set(3, 'c');
     // MRU→LRU: 3, 2, 1
 
-    c.get(1); // 1 提升为 MRU → 1, 3, 2
-    // 反向: 2(LRU), 3, 1(MRU)
+    c.get(1); // 1 is promoted to MRU -> order 1, 3, 2
+    // Reversed: 2 (LRU), 3, 1 (MRU)
 
     auto rit = c.mm().rbegin();
     EXPECT_EQ(rit->key, 2);
@@ -682,7 +682,7 @@ TEST(CacheIteratorTest, ReverseRangeBasedFor) {
     c.set(1, 10);
     c.set(2, 20);
     c.set(3, 30);
-    // MRU→LRU: 3,2,1 — 反向应得到 1,2,3
+    // MRU -> LRU is 3,2,1, so reversing gives 1,2,3.
 
     std::vector<int> keys;
     for (auto it = c.mm().rbegin(); it != c.mm().rend(); ++it) {
@@ -701,9 +701,9 @@ TEST(CacheIteratorTest, ReverseRangeBasedFor) {
 TEST(CacheDelTest, DelReturnsFalseForMissingKey) {
     cache<int, std::string> c(100);
     c.set(1, "one");
-    // key 不存在 → del 返回 false
+    // Missing key -> del returns false.
     EXPECT_FALSE(c.del(999));
-    // key 存在 → del 返回 true
+    // Present key -> del returns true.
     EXPECT_TRUE(c.del(1));
     EXPECT_FALSE(c.contains(1));
 }
@@ -711,7 +711,7 @@ TEST(CacheDelTest, DelReturnsFalseForMissingKey) {
 TEST(CacheDelTest, DelExReturnsKNotFound) {
     cache<int, std::string> c(100);
     c.set(1, "one");
-    // key 不存在 → del_ex 返回 kNotFound
+    // Missing key -> del_ex returns kNotFound.
     auto result = c.del_ex(999);
     EXPECT_EQ(result, decltype(c)::DelResult::kNotFound);
 }
@@ -727,12 +727,12 @@ TEST(CacheDelTest, DelExReturnsKSuccess) {
 TEST(CacheDelTest, DelExReturnsKPinnedWhenHandleHoldsKey) {
     cache<int, std::string> c(100);
     c.set(1, "one");
-    // 持有 handle → del 失败 → del_ex 返回 kPinned
+    // Handle held -> del fails, so del_ex returns kPinned.
     auto handle = c.get(1);
     ASSERT_TRUE(handle);
     auto result = c.del_ex(1);
     EXPECT_EQ(result, decltype(c)::DelResult::kPinned);
-    // key 仍存在
+    // The key is still present.
     EXPECT_TRUE(c.contains(1));
 }
 
@@ -741,17 +741,17 @@ TEST(CacheDelTest, ForceDelRemovesPinnedItem) {
     c.set(1, "one");
     c.set(2, "two");
 
-    // 持有 handle → 普通 del 失败
+    // A handle is held, so a plain del fails.
     auto handle = c.get(1);
     ASSERT_TRUE(handle);
     EXPECT_FALSE(c.del(1));
 
-    // force_del 即使有 handle 也删除
+    // force_del removes the item even with a handle outstanding.
     EXPECT_TRUE(c.force_del(1));
     EXPECT_FALSE(c.contains(1));
     EXPECT_EQ(c.size(), 1u);
 
-    // handle 仍可访问（内存延迟释放）
+    // The handle can still read the value (the memory is freed later).
     EXPECT_EQ(*handle, "one");
 }
 
@@ -760,17 +760,17 @@ TEST(CacheDelTest, ForceDelDeferredCleanup) {
     c.set(1, "one");
     c.set(2, "two");
 
-    // 持有 handle 时 force_del
+    // force_del while a handle is held.
     auto handle = c.get(1);
     ASSERT_TRUE(handle);
     EXPECT_TRUE(c.force_del(1));
     EXPECT_FALSE(c.contains(1));
     EXPECT_EQ(c.size(), 1u);
 
-    // 释放 handle
+    // Release the handle.
     handle.release();
 
-    // 触发 cleanup（通过另一次操作或 flush）
+    // Trigger cleanup (via another operation or flush).
     c.flush();
     EXPECT_EQ(c.size(), 0u);
 }
@@ -784,7 +784,7 @@ TEST(CacheDelTest, ForceDelReturnsFalseForMissingKey) {
 TEST(CacheDelTest, ForceDelWithoutHandleDeletesImmediately) {
     cache<int, std::string> c(100);
     c.set(1, "one");
-    // 无 handle → force_del 直接删除
+    // No handle -> force_del removes it directly.
     EXPECT_TRUE(c.force_del(1));
     EXPECT_FALSE(c.contains(1));
     EXPECT_EQ(c.size(), 0u);
@@ -838,7 +838,7 @@ TEST(MemoryMonitorTest, SetRejectsNewKeyWhenOverCriticalWatermark) {
 }
 
 TEST(MemoryMonitorTest, ExistingKeyUpdateRespectsAdmission) {
-    // T-G2: updates to existing keys also go through memory admission.
+    // updates to existing keys also go through memory admission.
     // When memory is below the critical watermark, updates succeed; once
     // memory crosses the critical watermark, further updates are rejected
     // (value unchanged) so a write-heavy update storm cannot push the
@@ -876,7 +876,7 @@ TEST(MemoryMonitorTest, ExistingKeyUpdateRespectsAdmission) {
 TEST(MemoryMonitorTest, AddReturnsFalseWhenRejected) {
     cache<int, int> c(100);
     memory_monitor::config cfg;
-    // T2.3: cache_item now 24 bytes larger (epoch_ embedded). Bumped
+    // cache_item now 24 bytes larger (epoch_ embedded). Bumped
     // from 1024 → 2048 so the first two keys still fit before critical
     // watermark is hit.
     cfg.max_memory_bytes.store(2048);
@@ -927,7 +927,7 @@ TEST(MemoryMonitorTest, ReplaceReturnsFalseForMissingKey) {
 TEST(MemoryMonitorTest, GetOrFetchWithProviderRespectsAdmission) {
     cache<int, int> c(100);
     memory_monitor::config cfg;
-    // T2.3: cache_item now 24 bytes larger (epoch_ embedded). Bumped
+    // cache_item now 24 bytes larger (epoch_ embedded). Bumped
     // from 1024 → 2048 so the first two keys still fit before critical
     // watermark is hit.
     cfg.max_memory_bytes.store(2048);
@@ -992,7 +992,7 @@ TEST(MemoryMonitorTest, FlushReportsMemoryToMonitor) {
 TEST(MemoryMonitorTest, StripeCacheAdmission) {
     striped_cache<int, int> c(100);
     memory_monitor::config cfg;
-    // T2.3: cache_item now 24 bytes larger (epoch_ embedded). Bumped
+    // cache_item now 24 bytes larger (epoch_ embedded). Bumped
     // from 1024 → 2048 so the first two keys still fit before critical
     // watermark is hit.
     cfg.max_memory_bytes.store(2048);

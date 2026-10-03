@@ -153,38 +153,29 @@ public:
     }
 
     void unlock() {
-        const uint32_t prev =
-            state_.fetch_and(~(kWriterFlag | kWriterWaitFlag), std::memory_order_release);
-        // P0-1: Clear the starvation timer so the next queued writer
-        // records a fresh start time. Without this, the stale timestamp
-        // from a previous queueing episode would make the next queued
-        // writer appear "already starved" and flip the lock to
-        // effectively writer-fair.
+        state_.fetch_and(~(kWriterFlag | kWriterWaitFlag), std::memory_order_release);
+        // Clear the starvation timer so the next queued writer records a fresh
+        // start time. Without this, the stale timestamp from a previous
+        // queueing episode would make the next queued writer appear "already
+        // starved" and flip the lock to effectively writer-fair.
         writer_wait_start_ns_.store(0, std::memory_order_release);
-        // P1-1 (fix.01 方案 A): do_wake_all() is a real kernel call
-        // (WakeByAddressAll on Windows, futex_wake on Linux) and this is a
-        // per-bucket lock, so waking unconditionally costs one syscall on every
-        // write unlock even when nobody is waiting.
+        // Wake unconditionally — the wake cannot be made conditional.
         //
-        // Correctness requires more care than simply mirroring unlock_shared():
-        // a *blocked reader* is not visible in the state word at all (the state
-        // has no "reader waiting" bit), so `prev` alone cannot prove that no
-        // reader is queued. What makes the guard safe is the wait primitive:
+        // The kernel wait primitives (WaitOnAddress / FUTEX_WAIT_PRIVATE /
+        // ulock_wait) are compare-and-wait: they test the value once on entry
+        // and then block until an explicit wake. A change to state_ does NOT
+        // release a parked waiter, so skipping this call strands whoever queued
+        // behind the writer.
         //
-        //   - native wait (WaitOnAddress / futex / ulock) is a compare-and-wait
-        //     on the address, so the state change performed by the fetch_and
-        //     below releases every waiter by itself — no wake is needed;
-        //   - the std::condition_variable fallback is a pure notify/wait, so a
-        //     queued reader (or writer) stays blocked unless we notify.
-        //
-        // Therefore: skip the kernel wake only when no waiter flag is set AND we
-        // are on a self-releasing wait primitive. On the CV fallback keep the
-        // unconditional notify — there is no syscall to save there anyway (the
-        // cost is a mutex, not a kernel transition).
-        const bool waiter_visible = (prev & (kWriterWaitFlag | kReaderMask)) != 0;
-        if (waiter_visible || !native_wait_ops::available()) {
-            do_wake_all();
-        }
+        // No bit in `prev` can prove that nobody is parked. Both reader slow
+        // paths undo the reader-count increment before parking, so
+        // `prev & kReaderMask` is zero while readers are blocked; and this
+        // function is only ever called by the writer that owns kWriterFlag, so
+        // that bit is always set and therefore useless as a discriminator.
+        // Making the wake conditional again requires a dedicated "reader
+        // parked" state bit that every reader sets before it parks — with the
+        // current bit layout (all 32 bits allocated) that is not available.
+        do_wake_all();
     }
 
     bool try_lock() noexcept {
@@ -210,7 +201,7 @@ public:
         // Optimistic path: increment reader count
         uint32_t old = state_.fetch_add(kReaderInc, std::memory_order_acquire);
         if ((old & kWriterFlag) == 0) {
-            // P0-1: Writer-starvation detection under reader_preferred mode.
+            // Writer-starvation detection under reader_preferred mode.
             // If a writer has been queued (kWriterWaitFlag set) for longer
             // than the configured timeout, redirect to the writer_fair slow
             // path so the queued writer is served. Mirrors
@@ -237,7 +228,7 @@ public:
     }
 
     bool try_lock_shared() noexcept {
-        // T-P3-4: Use fetch_add instead of CAS for better scalability under
+        // Use fetch_add instead of CAS for better scalability under
         // contention. The previous CAS-based approach could spuriously fail
         // when concurrent readers updated state_ between the initial load and
         // the compare_exchange, even though no writer was active. fetch_add
@@ -247,7 +238,7 @@ public:
         // contention and matches the pattern used in lock_shared()'s fast path.
         uint32_t old = state_.fetch_add(kReaderInc, std::memory_order_acq_rel);
         if ((old & kWriterFlag) == 0) {
-            // P0-1: Writer-starvation cooperation. A non-blocking
+            // Writer-starvation cooperation. A non-blocking
             // try_lock_shared() must still refuse to admit new readers
             // when a queued writer has exceeded the starvation timeout —
             // otherwise the anti-starvation mechanism in lock_shared()
@@ -295,7 +286,7 @@ private:
     // (non-atomic) member, which was UB under the C++ memory model.
     std::atomic<fairness_mode> fairness_{fairness_mode::reader_preferred};
 
-    // P0-1: Writer-starvation detection under reader_preferred mode.
+    // Writer-starvation detection under reader_preferred mode.
     // A queued writer records its start time in writer_wait_start_ns_;
     // a reader that observes kWriterWaitFlag set for longer than
     // writer_starvation_timeout_ns_ redirects to the writer-fair slow
@@ -312,7 +303,7 @@ private:
     mutable std::atomic<std::size_t> wait_count_{0};    // times lock_slow() was entered
     mutable std::atomic<std::size_t> try_fail_count_{0}; // times try_lock/try_lock_shared failed
 
-    /// P0-1: True when a queued writer has been waiting longer than the
+    /// True when a queued writer has been waiting longer than the
     /// configured starvation timeout. Only meaningful when kWriterWaitFlag
     /// is set. Costs one relaxed load of the timer plus a steady_clock
     /// read — cheap, and only fires when a writer is actually queued.
@@ -349,7 +340,7 @@ private:
                         std::memory_order_acq_rel, std::memory_order_relaxed))
                     continue;
                 s = desired;
-                // P0-1: Record when this writer first started waiting so
+                // Record when this writer first started waiting so
                 // the reader_preferred fast path can detect starvation.
                 // Only set if not already set — multiple writers may race
                 // to set kWriterWaitFlag; the first one's timestamp is the
@@ -520,7 +511,7 @@ static constexpr uint8_t kTagTombstone = 0x01;
 // SIMD tag matching — platform dispatch
 // --------------------------------------------------------------------------
 //
-// T-O2: Memory-ordering safety model for the F14 tag array.
+// Memory-ordering safety model for the F14 tag array.
 //
 // `f14_match_tags()` performs a single 16-byte SIMD load of the `tags[]`
 // array (SSE2 `_mm_loadu_si128` / NEON `vld1q_u8` / scalar fallback).
@@ -656,14 +647,14 @@ public:
 
     static constexpr bool kIsF14 = std::is_same_v<ProbingStyle, f14_probing_tag>;
 
-    // R2: Expose EmbeddedChain setting for compile-time verification by
+    // Expose EmbeddedChain setting for compile-time verification by
     // MM strategies and cache traits. production_sharded_lru_trait asserts
     // this is true to prevent accidental regression to non-EmbeddedChain
     // mode, which degrades to shared-lock reads (use-after-free prevention)
     // and kills read throughput under high concurrency.
     static constexpr bool uses_embedded_chain = EmbeddedChain;
 
-    // T-O2: Compile-time verification that the active platform provides
+    // Compile-time verification that the active platform provides
     // the memory-ordering guarantees required for the F14 SIMD tag read.
     // See the safety-model comment block above `f14_match_tags()`.
     //
@@ -694,7 +685,7 @@ public:
                   "If you see this, the platform dispatch in "
                   "f14_match_tags() is broken.");
 
-    // P2-6 (T2.5): Upper bound on optimistic-read retry attempts before
+    // Upper bound on optimistic-read retry attempts before
     // falling back to the hazptr mid path or shared-lock slow path. Each
     // retry re-issues the seqlock load + version-stamped validation, so
     // an unbounded retry loop could spin indefinitely under sustained
@@ -706,7 +697,7 @@ public:
     // with the writer holding the seqlock.
     static constexpr int kOptimisticReadMaxRetries = 16;
 
-    // C-3: Upper bound on the number of chain nodes a single hazptr/EBR
+    // Upper bound on the number of chain nodes a single hazptr/EBR
     // walk will visit before bailing to the shared-lock path. This is a
     // safety net against the rare case where a concurrent rehash_step()
     // mutates hash_chain_next() pointers mid-walk and briefly forms a
@@ -719,7 +710,7 @@ public:
     // chain length.
     static constexpr int kMaxWalkSteps = 128;
 
-    // G18: Upper bound on the number of dual-array lookup retries in
+    // Upper bound on the number of dual-array lookup retries in
     // find_f14_dual_array() during incremental rehash. Each retry must
     // acquire a per-bucket shared_bucket_lock and re-validate
     // rehash_progress_; if the rehash thread migrates the target bucket
@@ -733,7 +724,7 @@ public:
     // for kOptimisticReadMaxRetries) is the right ceiling.
     static constexpr int kDualArrayMaxRetries = 8;
 
-    // P0-4 (T1.2): Upper bound on the number of buckets/chunks that
+    // Upper bound on the number of buckets/chunks that
     // rehash_finish() will migrate synchronously in a single call. Any
     // remaining work is left for subsequent calls or the background
     // rehash balancer. 64 buckets/chunks per call keeps the worst-case
@@ -925,7 +916,7 @@ public:
         , enable_hazptr_read_(other.enable_hazptr_read_)
         , retired_buckets_(std::move(other.retired_buckets_))
         , retired_chunks_(std::move(other.retired_chunks_))
-        , incremental_rehash_(other.incremental_rehash_)
+        , incremental_rehash_(other.incremental_rehash_.load(std::memory_order_relaxed))
         , rehash_in_progress_(other.rehash_in_progress_.load(std::memory_order_relaxed))
         , rehash_new_buckets_(other.rehash_new_buckets_.load(std::memory_order_relaxed))
         , rehash_new_bucket_count_(other.rehash_new_bucket_count_.load(std::memory_order_relaxed))
@@ -962,7 +953,9 @@ public:
             enable_hazptr_read_ = other.enable_hazptr_read_;
             retired_buckets_ = std::move(other.retired_buckets_);
             retired_chunks_ = std::move(other.retired_chunks_);
-            incremental_rehash_ = other.incremental_rehash_;
+            incremental_rehash_.store(
+                other.incremental_rehash_.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
             rehash_in_progress_.store(other.rehash_in_progress_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             rehash_new_buckets_.store(other.rehash_new_buckets_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             rehash_new_bucket_count_.store(other.rehash_new_bucket_count_.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -991,7 +984,7 @@ public:
         const size_type h = hash_(key);
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware lookup
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 if constexpr (EmbeddedChain) {
                     return find_f14_dual_array(key, h);
                 } else {
@@ -1055,7 +1048,7 @@ public:
             // Incremental rehash path for chain mode: use shared lock with
             // dual-array awareness. Optimistic/hazptr paths are skipped during
             // incremental rehash because items may be split across two arrays.
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -1154,7 +1147,7 @@ public:
         const size_type h = hash_(key);
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware lookup
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 if constexpr (EmbeddedChain) {
                     return find_f14_dual_array(key, h);
                 } else {
@@ -1216,7 +1209,7 @@ public:
             }
         } else {
             // Incremental rehash path for chain mode (const)
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -1364,7 +1357,7 @@ public:
         return find_and_pin_with_hash(key, hash_(key), std::forward<PinFn>(pin_fn));
     }
 
-    /// T16.4: find_and_pin with a pre-computed hash. The hash MUST be the
+    /// find_and_pin with a pre-computed hash. The hash MUST be the
     /// result of `hash_(key)` (i.e., the same `Hash` instance the table
     /// uses). Mismatched hashes lead to undefined behavior (wrong bucket,
     /// silent data loss). Used by bulk_get to avoid re-hashing the same
@@ -1373,7 +1366,7 @@ public:
     Value find_and_pin_with_hash(const Key& key, size_type h, PinFn&& pin_fn) {
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware find-and-pin
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 if constexpr (EmbeddedChain) {
                     Value node = find_f14_dual_array(key, h);
                     if (node && pin_fn(node)) return node;
@@ -1383,7 +1376,7 @@ public:
                 }
                 return nullptr;
             }
-            // P3-1: Use acquire (not relaxed) to pair with the writer's
+            // Use acquire (not relaxed) to pair with the writer's
             // release store on bucket_mask_. This guarantees that if we see
             // the new mask, we also see the new chunks_ array installed by
             // the rehash. Without acquire, the relaxed load could observe
@@ -1402,7 +1395,7 @@ public:
             }
         } else {
             // Incremental rehash path for chain mode find_and_pin
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -1422,7 +1415,7 @@ public:
                             return nullptr;
                         }
                     } else {
-                        // T-P2-1 (R-4): For strictly unmigrated buckets
+                        // For strictly unmigrated buckets
                         // (old_idx > progress), attempt an optimistic
                         // (lock-free) read to detect misses BEFORE acquiring
                         // the bucket shared lock — mirrors the
@@ -1491,7 +1484,7 @@ public:
                     }
                 }
             }
-            // P3-1: Use acquire (not relaxed) — same rationale as the F14
+            // Use acquire (not relaxed) — same rationale as the F14
             // path above. Pairs with the writer's release store on
             // bucket_mask_ to ensure the new buckets_ array is visible when
             // we see the new mask.
@@ -1524,7 +1517,7 @@ public:
     Value find_and_pin_optimistic(const Key& key, PinFn&& pin_fn, UnpinFn&& /*unpin_fn*/) {
         const size_type h = hash_(key);
 
-        // T-P2-6: During incremental rehash, allow optimistic (lock-free)
+        // During incremental rehash, allow optimistic (lock-free)
         // reads for buckets NOT in the current migration window instead of
         // unconditionally falling back to the shared-lock find_and_pin path.
         // For chain mode, a bucket with old_idx > rehash_progress_ has not
@@ -1543,7 +1536,7 @@ public:
         //       the version is unchanged but the bucket is being emptied.
         // `rehash_progress_guard` enables check (2) only on this rehash path.
         bool rehash_progress_guard = false;
-        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+        if (incremental_rehash_active()) {
             if constexpr (kIsF14) {
                 // F14 chunk-based dual-array lookup is handled by find_and_pin.
                 return find_and_pin(key, std::forward<PinFn>(pin_fn));
@@ -1576,7 +1569,7 @@ public:
                         auto v2 = chunks_[idx].version.load(std::memory_order_acquire);
                         auto sl2 = seqlock_.load(std::memory_order_acquire);
                         if (sl1 == sl2 && (v1 == v2) && (v1 & 1u) == 0) {
-                            // T-P2-6: during incremental rehash, re-verify the
+                            // during incremental rehash, re-verify the
                             // target bucket wasn't migrated between v1 and v2.
                             // No-op when rehash_progress_guard is false.
                             if (rehash_progress_guard &&
@@ -1618,7 +1611,7 @@ public:
                         auto v2 = buckets_[idx].version.load(std::memory_order_acquire);
                         auto sl2 = seqlock_.load(std::memory_order_acquire);
                         if (sl1 == sl2 && (v1 == v2) && (v1 & 1u) == 0) {
-                            // T-P2-6: progress re-check for the chain-mode
+                            // progress re-check for the chain-mode
                             // incremental-rehash optimistic read path.
                             if (rehash_progress_guard &&
                                 rehash_progress_.load(std::memory_order_acquire) >= idx) {
@@ -1661,13 +1654,13 @@ public:
     Value find_and_pin_optimistic(const Key& key, PinFn&& pin_fn, UnpinFn&& /*unpin_fn*/) const {
         const size_type h = hash_(key);
 
-        // T-P2-6: mirror the non-const overload — during incremental rehash,
+        // mirror the non-const overload — during incremental rehash,
         // allow optimistic reads for chain-mode buckets NOT in the current
         // migration window (old_idx > rehash_progress_). See the non-const
         // overload for the full safety argument (version check + progress
         // re-check). F14 and already-migrated buckets fall back to find_and_pin.
         bool rehash_progress_guard = false;
-        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+        if (incremental_rehash_active()) {
             if constexpr (kIsF14) {
                 return find_and_pin(key, std::forward<PinFn>(pin_fn));
             } else {
@@ -1692,7 +1685,7 @@ public:
                         auto v2 = chunks_[idx].version.load(std::memory_order_acquire);
                         auto sl2 = seqlock_.load(std::memory_order_acquire);
                         if (sl1 == sl2 && (v1 == v2) && (v1 & 1u) == 0) {
-                            // T-P2-6: progress re-check (no-op outside rehash path).
+                            // progress re-check (no-op outside rehash path).
                             if (rehash_progress_guard &&
                                 rehash_progress_.load(std::memory_order_acquire) >= idx) {
                                 break;
@@ -1732,7 +1725,7 @@ public:
                         auto v2 = buckets_[idx].version.load(std::memory_order_acquire);
                         auto sl2 = seqlock_.load(std::memory_order_acquire);
                         if (sl1 == sl2 && (v1 == v2) && (v1 & 1u) == 0) {
-                            // T-P2-6: progress re-check for chain-mode rehash path.
+                            // progress re-check for chain-mode rehash path.
                             if (rehash_progress_guard &&
                                 rehash_progress_.load(std::memory_order_acquire) >= idx) {
                                 break;
@@ -1796,12 +1789,12 @@ public:
         return find_and_pin_lockfree_with_hash(key, hash_(key), std::forward<PinFn>(pin_fn));
     }
 
-    /// T16.4: find_and_pin_lockfree with a pre-computed hash. The hash
+    /// find_and_pin_lockfree with a pre-computed hash. The hash
     /// MUST be the result of `hash_(key)`. Used by bulk_get to avoid
     /// re-hashing each key for both shard dispatch and hash-table lookup.
     template <typename PinFn>
     Value find_and_pin_lockfree_with_hash(const Key& key, size_type h, PinFn&& pin_fn) {
-        // T2.1: Acquire epoch_guard at entry when EBR is enabled. This
+        // Acquire epoch_guard at entry when EBR is enabled. This
         // protects ALL nodes in the hash table from reclamation during
         // the traversal — concurrent retire() calls defer deletion until
         // all active critical sections exit. In hazptr mode (ebr_domain_
@@ -1818,14 +1811,14 @@ public:
 
         // During incremental rehash, lockfree/optimistic paths are unsafe for
         // chain mode — items may be split across two arrays.
-        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+        if (incremental_rehash_active()) {
             rehash_lockfree_fallback_count_.fetch_add(1, std::memory_order_relaxed);
             return find_and_pin_with_hash(key, h, std::forward<PinFn>(pin_fn));
         }
 
         if constexpr (kIsF14) {
             if constexpr (EmbeddedChain) {
-                // T-P2-8: Read path prefers EBR. When an EBR domain is set,
+                // Read path prefers EBR. When an EBR domain is set,
                 // the epoch_guard at entry protects all nodes from reclamation,
                 // allowing us to skip per-pointer hazptr_holder protection.
                 // The F14 chunk version checks remain for slot validation
@@ -2020,7 +2013,7 @@ public:
             }
         } else {
             if constexpr (EmbeddedChain) {
-                // T-P2-8: Read path prefers EBR. When an EBR domain is set,
+                // Read path prefers EBR. When an EBR domain is set,
                 // the epoch_guard acquired at function entry protects ALL nodes
                 // from reclamation during the traversal. This lets us skip
                 // per-pointer hazptr_holder protection (slot acquire/release +
@@ -2046,7 +2039,7 @@ public:
                     // we are traversing, hanging the while(curr) loop. Bail to
                     // the locked path if a rehash starts, and bound the walk.
                     for (int _retry = 0; _retry < kOptimisticReadMaxRetries; ++_retry) { if (_retry) LRU_SPIN_PAUSE();
-                        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+                        if (incremental_rehash_active()) {
                             return find_and_pin_with_hash(key, h, std::forward<PinFn>(pin_fn));
                         }
                         auto sl1 = seqlock_.load(std::memory_order_acquire);
@@ -2056,7 +2049,7 @@ public:
                         Value found_node = nullptr;
                         int walk_steps = 0;
                         while (curr) {
-                            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+                            if (incremental_rehash_active()) {
                                 return find_and_pin_with_hash(key, h, std::forward<PinFn>(pin_fn));
                             }
                             if (++walk_steps > kMaxWalkSteps) {
@@ -2106,10 +2099,10 @@ public:
                     //          during rehash.
                     hazptr_holder hazslot;
                     for (int _retry = 0; _retry < kOptimisticReadMaxRetries; ++_retry) { if (_retry) LRU_SPIN_PAUSE();
-                        // C-3: re-check at retry boundary — a rehash that
+                        // re-check at retry boundary — a rehash that
                         // started since our entry check must route to the
                         // shared-lock path; the hazptr walk is no longer safe.
-                        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+                        if (incremental_rehash_active()) {
                             return find_and_pin_with_hash(key, h, std::forward<PinFn>(pin_fn));
                         }
                         auto sl1 = seqlock_.load(std::memory_order_acquire);
@@ -2120,11 +2113,11 @@ public:
                         Value found_node = nullptr;
                         int walk_steps = 0;
                         while (curr) {
-                            // C-3 (a): bail if a rehash started mid-walk.
-                            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+                            // bail if a rehash started mid-walk.
+                            if (incremental_rehash_active()) {
                                 return find_and_pin_with_hash(key, h, std::forward<PinFn>(pin_fn));
                             }
-                            // C-3 (b): bound the walk. A chain longer than
+                            // bound the walk. A chain longer than
                             // kMaxWalkSteps under EmbeddedChain+chain mode is
                             // either a degenerate hash collision (rare) or, more
                             // likely, a cycle introduced by concurrent migration.
@@ -2182,7 +2175,7 @@ public:
     Value find_and_pin_lockfree(const Key& key, PinFn&& pin_fn) const {
         const size_type h = hash_(key);
 
-        // T-P2-8: Acquire epoch_guard at entry when EBR is enabled, mirroring
+        // Acquire epoch_guard at entry when EBR is enabled, mirroring
         // the non-const find_and_pin_lockfree_with_hash. This protects ALL
         // nodes from reclamation during the traversal, allowing the EBR fast
         // paths below to skip per-pointer hazptr_holder protection.
@@ -2195,14 +2188,14 @@ public:
             return find_and_pin(key, std::forward<PinFn>(pin_fn));
         }
 
-        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+        if (incremental_rehash_active()) {
             rehash_lockfree_fallback_count_.fetch_add(1, std::memory_order_relaxed);
             return find_and_pin(key, std::forward<PinFn>(pin_fn));
         }
 
         if constexpr (kIsF14) {
             if constexpr (EmbeddedChain) {
-                // T-P2-8: Read path prefers EBR. When EBR is active, the
+                // Read path prefers EBR. When EBR is active, the
                 // epoch_guard at entry protects all nodes, allowing raw pointer
                 // access without per-pointer hazptr_holder protection.
                 const bool use_ebr = (ebr_domain_ != nullptr);
@@ -2363,7 +2356,7 @@ public:
             }
         } else {
             if constexpr (EmbeddedChain) {
-                // T-P2-8: Read path prefers EBR. When EBR is active, the
+                // Read path prefers EBR. When EBR is active, the
                 // epoch_guard at entry protects all nodes, allowing raw pointer
                 // access without per-pointer hazptr_holder protection.
                 const bool use_ebr = (ebr_domain_ != nullptr);
@@ -2371,7 +2364,7 @@ public:
                     // EBR fast path: raw pointer traversal, no hazptr overhead.
                     // C-3 fix: see non-const overload for rationale.
                     for (int _retry = 0; _retry < kOptimisticReadMaxRetries; ++_retry) { if (_retry) LRU_SPIN_PAUSE();
-                        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+                        if (incremental_rehash_active()) {
                             return find_and_pin(key, std::forward<PinFn>(pin_fn));
                         }
                         auto sl1 = seqlock_.load(std::memory_order_acquire);
@@ -2381,7 +2374,7 @@ public:
                         Value found_node = nullptr;
                         int walk_steps = 0;
                         while (curr) {
-                            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+                            if (incremental_rehash_active()) {
                                 return find_and_pin(key, std::forward<PinFn>(pin_fn));
                             }
                             if (++walk_steps > kMaxWalkSteps) {
@@ -2407,7 +2400,7 @@ public:
                     // C-3 fix: see non-const overload for rationale.
                     hazptr_holder hazslot;
                     for (int _retry = 0; _retry < kOptimisticReadMaxRetries; ++_retry) { if (_retry) LRU_SPIN_PAUSE();
-                        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+                        if (incremental_rehash_active()) {
                             return find_and_pin(key, std::forward<PinFn>(pin_fn));
                         }
                         auto sl1 = seqlock_.load(std::memory_order_acquire);
@@ -2418,7 +2411,7 @@ public:
                         Value found_node = nullptr;
                         int walk_steps = 0;
                         while (curr) {
-                            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+                            if (incremental_rehash_active()) {
                                 return find_and_pin(key, std::forward<PinFn>(pin_fn));
                             }
                             if (++walk_steps > kMaxWalkSteps) {
@@ -2473,7 +2466,7 @@ public:
         const size_type h = hash_(key);
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware find-and-pin
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 if constexpr (EmbeddedChain) {
                     Value node = find_f14_dual_array(key, h);
                     if (node && pin_fn(node)) return node;
@@ -2494,7 +2487,7 @@ public:
             }
         } else {
             // Incremental rehash path for chain mode find_and_pin (const)
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -2545,7 +2538,7 @@ public:
         const size_type h = hash_(key);
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware lookup
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 return find_f14_dual_array(key, h) != nullptr;
             }
             if constexpr (EmbeddedChain) {
@@ -2583,7 +2576,7 @@ public:
             }
         } else {
             // Incremental rehash path for chain mode contains
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
                     size_type progress = rehash_progress_.load(std::memory_order_acquire);
@@ -2667,7 +2660,7 @@ public:
         // During incremental rehash F14 chunks migrate differently than
         // chain buckets — mirror contains() by delegating to the dual-array
         // lookup, which is self-locking.
-        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+        if (incremental_rehash_active()) {
             if constexpr (kIsF14) {
                 return find_f14_dual_array(key, h);
             }
@@ -2769,7 +2762,7 @@ public:
     // ========================================================================
 
     auto insert(const Key& key, Value value) {
-        // P0-5 (T1.3): hash is computed next line anyway; rehash only the
+        // hash is computed next line anyway; rehash only the
         // owning segment for segmented tables (no-op for non-segmented).
         const size_type h = hash_(key);
         rehash_if_needed(h);
@@ -2781,7 +2774,7 @@ public:
 
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware insert
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 outer_guard.unlock();
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
@@ -2926,8 +2919,8 @@ public:
             }
         } else {
             // Incremental rehash path for chain mode insert
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
-                // P-FIX (deadlock): Release the bucket lock acquired above before
+            if (incremental_rehash_active()) {
+                // Release the bucket lock acquired above before
                 // entering the dual-array for(;;) loop. The loop re-acquires either
                 // the old-array or new-array bucket lock depending on migration
                 // progress. Without this unlock, the old-array lock acquired at
@@ -3035,7 +3028,7 @@ public:
     }
 
     auto insert_or_assign(const Key& key, Value value) {
-        // P0-5 (T1.3): hash is computed next line anyway; rehash only the
+        // hash is computed next line anyway; rehash only the
         // owning segment for segmented tables (no-op for non-segmented).
         const size_type h = hash_(key);
         rehash_if_needed(h);
@@ -3046,7 +3039,7 @@ public:
 
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware insert_or_assign
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 outer_guard.unlock();
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
@@ -3249,8 +3242,8 @@ public:
             }
         } else {
             // Incremental rehash path for chain mode insert_or_assign
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
-                // P-FIX (deadlock): Release the bucket lock acquired above before
+            if (incremental_rehash_active()) {
+                // Release the bucket lock acquired above before
                 // entering the dual-array for(;;) loop — same fix as insert()/erase().
                 outer_guard.unlock();
                 for (;;) {
@@ -3419,7 +3412,7 @@ public:
 
         if constexpr (kIsF14) {
             // F14 incremental rehash: dual-array aware erase
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+            if (incremental_rehash_active()) {
                 outer_guard.unlock();
                 for (;;) {
                     size_type old_idx = h & bucket_mask_.load(std::memory_order_acquire);
@@ -3683,8 +3676,8 @@ public:
             }
         } else {
             // Incremental rehash path for chain mode erase
-            if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
-                // P-FIX (deadlock): Release the bucket lock acquired above before
+            if (incremental_rehash_active()) {
+                // Release the bucket lock acquired above before
                 // entering the dual-array for(;;) loop — same fix as insert().
                 // Without this, lock_bucket(old_idx) in the not-yet-migrated
                 // branch deadlocks on the already-held bucket lock.
@@ -3995,7 +3988,11 @@ public:
         retired_buckets_.swap(other.retired_buckets_);
         retired_chunks_.swap(other.retired_chunks_);
         // Swap incremental rehash state
-        std::swap(incremental_rehash_, other.incremental_rehash_);
+        const bool my_flag = incremental_rehash_.load(std::memory_order_relaxed);
+        incremental_rehash_.store(
+            other.incremental_rehash_.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        other.incremental_rehash_.store(my_flag, std::memory_order_relaxed);
         bool tmp_rip = rehash_in_progress_.load(std::memory_order_relaxed);
         rehash_in_progress_.store(other.rehash_in_progress_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         other.rehash_in_progress_.store(tmp_rip, std::memory_order_relaxed);
@@ -4045,7 +4042,7 @@ public:
     // Rehash
     // ========================================================================
 
-    /// P0-5 (T1.3): hash-aware rehash entry point. For non-segmented
+    /// hash-aware rehash entry point. For non-segmented
     /// tables this is equivalent to `rehash_if_needed()` — the hash is
     /// ignored. Provided so callers (insert/erase) can use a uniform
     /// `rehash_if_needed(hash)` call site for both segmented and
@@ -4072,7 +4069,7 @@ public:
         // callers should deduplicate inside the callback if they only
         // want one notification per overload episode.
         //
-        // T13.4: The stderr warning is rate-limited to once per overload
+        // The stderr warning is rate-limited to once per overload
         // episode (via hash_overload_warned_) to prevent log spam when
         // the table is persistently overloaded. The flag is cleared when
         // load_factor drops back below the threshold.
@@ -4081,7 +4078,7 @@ public:
         const bool overloaded = current_lf > threshold;
         if (overloaded) {
             hash_overload_events_.fetch_add(1, std::memory_order_relaxed);
-            // P2-4 (T2.4): Async mode enqueues {current_lf, threshold} for
+            // Async mode enqueues {current_lf, threshold} for
             // later draining by the event drain worker, so user callbacks
             // performing IO/logging cannot block the rehash hot path.
             // Sync mode preserves the original inline-invocation semantics.
@@ -4095,7 +4092,7 @@ public:
                     // break the rehash path.
                 }
             }
-            // T13.4: Rate-limited stderr warning — only print once per
+            // Rate-limited stderr warning — only print once per
             // overload episode to avoid log spam under sustained overload.
             bool expected = false;
             if (hash_overload_warned_.compare_exchange_strong(
@@ -4113,7 +4110,7 @@ public:
         }
 
         // If already rehashing incrementally, just make progress.
-        if (incremental_rehash_ && rehash_in_progress_.load(std::memory_order_acquire)) {
+        if (incremental_rehash_active()) {
             if constexpr (kIsF14) {
                 rehash_step_f14(1);
             } else {
@@ -4131,12 +4128,12 @@ public:
         const bool mandatory_rehash = current_lf > max_load_factor_;
         if (!overloaded && !mandatory_rehash) return;
 
-        // T13.3: For emergency rehash, double the bucket count. For
+        // For emergency rehash, double the bucket count. For
         // mandatory rehash, the same doubling applies.
         rehash(bucket_count() * 2);
     }
 
-    /// P2-4 (T2.4): Hot-path helper — pushes {current_lf, threshold} onto
+    /// Hot-path helper — pushes {current_lf, threshold} onto
     /// the async overload queue. Mutex hold time is bounded by a single
     /// `push_back` (amortized O(1)). To avoid unbounded memory growth
     /// under sustained overload (when the drain worker cannot keep up),
@@ -4153,7 +4150,7 @@ public:
         overload_queue_.emplace_back(current_lf, threshold);
     }
 
-    /// T13.2: Register a callback invoked when load_factor exceeds the
+    /// Register a callback invoked when load_factor exceeds the
     /// overload threshold. The callback receives (current_load_factor,
     /// threshold) and is invoked from the rehash hot path — it must be
     /// cheap and non-blocking. Exceptions thrown by the callback are
@@ -4162,7 +4159,7 @@ public:
         hash_overload_callback_ = std::move(cb);
     }
 
-    /// P2-4 (T2.4): Toggle async mode for the overload callback.
+    /// Toggle async mode for the overload callback.
     ///
     /// When enabled, the rehash hot path enqueues `{current_lf, threshold}`
     /// into a mutex-protected queue instead of invoking the callback inline.
@@ -4182,7 +4179,7 @@ public:
         return overload_callback_async_.load(std::memory_order_acquire);
     }
 
-    /// P2-4 (T2.4): Drain pending overload events and dispatch the
+    /// Drain pending overload events and dispatch the
     /// registered callback for each. Designed to be called from a
     /// background worker (e.g. the event drain worker in `unified_cache`)
     /// rather than from a rehash hot path.
@@ -4207,14 +4204,14 @@ public:
         return local.size();
     }
 
-    /// P2-4 (T2.4): Number of overload events currently buffered in the
+    /// Number of overload events currently buffered in the
     /// async queue (best-effort snapshot, no lock).
     std::size_t pending_overload_events() const {
         std::lock_guard<std::mutex> lock(overload_queue_mutex_);
         return overload_queue_.size();
     }
 
-    /// T13.1: Set the load factor threshold above which the overload
+    /// Set the load factor threshold above which the overload
     /// callback fires and hash_overload_events is incremented.
     /// Default: 2.0 (matches historical hardcoded warning threshold).
     /// Lower for latency-sensitive workloads, raise for memory-frugal.
@@ -4269,13 +4266,13 @@ public:
         new_bucket_count = next_power_of_two(new_bucket_count);
         if (new_bucket_count <= bucket_count()) return;
 
-        // P1-1: Record rehash start time and item count for diagnostics.
+        // Record rehash start time and item count for diagnostics.
         const auto rehash_t0 = std::chrono::steady_clock::now();
         const std::size_t items_before = size_.load(std::memory_order_relaxed);
         rehash_count_.fetch_add(1, std::memory_order_relaxed);
 
         if constexpr (kIsF14) {
-            if (incremental_rehash_) {
+            if (incremental_rehash_.load(std::memory_order_relaxed)) {
                 // Incremental rehash: allocate new array, set state, don't block.
                 // Progress is made incrementally by subsequent operations via
                 // rehash_step_f14() (invoked from rehash_if_needed, insert, erase).
@@ -4289,7 +4286,7 @@ public:
                                                 std::memory_order_relaxed);
                 return;
             }
-            // T11.3: Blocking rehash — every concurrent writer will stall on
+            // Blocking rehash — every concurrent writer will stall on
             // the chunk locks acquired below. Count this so users can detect
             // that they should enable incremental rehash.
             blocking_rehash_claim claim(rehash_migrating_);
@@ -4394,7 +4391,7 @@ public:
                 }
             }
 
-            // P3-1: Swap chunks_ atomically (never null) before publishing the
+            // Swap chunks_ atomically (never null) before publishing the
             // new bucket_mask_. The previous code did:
             //   retired_chunks_.push_back(std::move(chunks_));  // chunks_ = null
             //   bucket_mask_.store(new_mask, release);
@@ -4423,7 +4420,7 @@ public:
             seqlock_.fetch_add(1, std::memory_order_release);
         } else {
             // Chain mode rehash
-            if (incremental_rehash_) {
+            if (incremental_rehash_.load(std::memory_order_relaxed)) {
                 // C-1 / Defect C fix: Atomically claim the rehash start via
                 // CAS to prevent two threads from both allocating a new array
                 // and racing on rehash_new_buckets_owner_ (the second would
@@ -4457,7 +4454,7 @@ public:
                 // rehash_in_progress_ already set true by CAS above
                 seqlock_.fetch_add(1, std::memory_order_release);
             } else {
-                // T11.3: Blocking rehash — every concurrent writer will stall
+                // Blocking rehash — every concurrent writer will stall
                 // on the bucket locks acquired below. Count this so users can
                 // detect that they should enable incremental rehash.
                 blocking_rehash_claim claim(rehash_migrating_);
@@ -4502,7 +4499,7 @@ public:
                     }
                 }
 
-                // P3-1: Swap buckets_ atomically (never null) before publishing
+                // Swap buckets_ atomically (never null) before publishing
                 // the new bucket_mask_. See the F14 path above for the full
                 // rationale — the same TOCTOU on `buckets_ == null` between
                 // `std::move(buckets_)` and `buckets_ = std::move(new_buckets)`
@@ -4515,7 +4512,7 @@ public:
             }
         }
 
-        // P1-1: Record rehash diagnostics for blocking rehash paths.
+        // Record rehash diagnostics for blocking rehash paths.
         // (Incremental rehash paths record stats at their begin_* entry
         // points above.) We record migrated items and total duration here
         // to capture the full blocking cost.
@@ -4581,33 +4578,40 @@ public:
 
     /// Enable/disable optimistic read (lock-free, version-based).
     ///
-    /// P0-1 Safety Note:
-    ///   - EmbeddedChain = true: 乐观读是安全的（节点由 refcount + hazptr 保护）。
-    ///     默认启用，可获得最高读吞吐量。
-    ///   - EmbeddedChain = false: 乐观读存在 use-after-free 风险。node_type 独立
-    ///     分配且无 refcount 保护，另一个线程可能在 TOCTOU 窗口内删除节点。
-    ///     默认禁用。仅在以下所有条件满足时才可安全启用：
-    ///       1. 调用方保证不会在 find() 返回后持有指针跨线程切换
-    ///       2. 调用方使用 find_and_pin() 在锁内完成 refcount 递增
-    ///       3. 或调用方接受 UAF 风险（如只读工作负载，无并发 erase）
+    /// Safety note.
+    ///   - EmbeddedChain = true: optimistic reads are safe (the node IS the value
+    ///     and is protected by refcount + hazptr). Enabled by default, and gives
+    ///     the highest read throughput.
+    ///   - EmbeddedChain = false: optimistic reads can use-after-free. node_type is
+    ///     separately allocated with no refcount protection, so another thread can
+    ///     delete the node inside the TOCTOU window. Disabled by default; safe to
+    ///     enable only when ALL of the following hold:
+    ///       1. the caller never carries the pointer across a thread boundary after
+    ///          find() returns;
+    ///       2. the caller uses find_and_pin(), which increments the refcount under
+    ///          the lock; or
+    ///       3. the caller accepts the use-after-free risk (read-only workload with
+    ///          no concurrent erase).
     void set_optimistic_read(bool enabled) noexcept {
-        // P0-1: 非 EmbeddedChain 模式下启用乐观读需要用户显式确认风险。
-        // 这里不阻止启用（保持向后兼容），但在文档中明确警告。
+        // Enabling optimistic reads outside EmbeddedChain mode requires the user
+        // to accept the risk explicitly. This does not block it, but the
+        // documentation warns plainly.
         enable_optimistic_read_ = enabled;
     }
     bool optimistic_read_enabled() const noexcept { return enable_optimistic_read_; }
 
-    /// P0-1: 查询当前模式是否为安全乐观读模式（EmbeddedChain + 乐观读）。
-    /// 生产环境推荐在 safe_optimistic_read() == true 时才依赖乐观读路径。
+    /// True when the current mode has safe optimistic reads (EmbeddedChain plus
+    /// optimistic reads). Production code should rely on the optimistic path only
+    /// when this returns true.
     bool safe_optimistic_read() const noexcept {
         return enable_optimistic_read_ && EmbeddedChain;
     }
 
     // --------------------------------------------------------------------
-    // T2.1 / T2.4: EBR (Epoch-Based Reclamation) integration
+    // EBR (Epoch-Based Reclamation) integration
     // --------------------------------------------------------------------
 
-    /// T2.1: Set the EBR domain for this hash table. When non-null,
+    /// Set the EBR domain for this hash table. When non-null,
     /// find_and_pin_lockfree*() acquires an epoch_guard at entry,
     /// protecting all nodes from reclamation during traversal. When
     /// null (default), the hash table operates in hazptr mode.
@@ -4622,14 +4626,14 @@ public:
 
     detail::epoch_domain* get_ebr_domain() const noexcept { return ebr_domain_; }
 
-    /// T2.4: Check whether this hash table is operating in EBR mode
+    /// Check whether this hash table is operating in EBR mode
     /// (i.e., an EBR domain has been set). In EBR mode, the read path
     /// is protected by an epoch_guard acquired at find_and_pin_lockfree
     /// entry; the per-pointer hazptr_holder calls inside the traversal
     /// become redundant (but harmless — they just add a small overhead).
     bool is_ebr_mode() const noexcept { return ebr_domain_ != nullptr; }
 
-    /// T2.4: Unified guard type for read-path protection. Resolves to
+    /// Unified guard type for read-path protection. Resolves to
     /// `epoch_guard` in EBR mode (protects all nodes in the critical
     /// section) and to a no-op guard in hazptr mode (per-pointer
     /// protection is handled by hazptr_holder inside the traversal).
@@ -4696,7 +4700,7 @@ public:
     bool hazptr_read_enabled() const noexcept { return enable_hazptr_read_; }
 
     // ========================================================================
-    // P1-1: Rehash diagnostics accessors
+    // Rehash diagnostics accessors
     // ========================================================================
 
     std::size_t rehash_count() const noexcept {
@@ -4708,14 +4712,14 @@ public:
     std::size_t rehash_migrated_items() const noexcept {
         return rehash_migrated_items_.load(std::memory_order_relaxed);
     }
-    /// T11.3: Number of writes blocked by a non-incremental (blocking) rehash.
+    /// Number of writes blocked by a non-incremental (blocking) rehash.
     /// Non-zero values indicate the user should enable incremental rehash to
     /// avoid stalling writers during hash table expansion.
     std::size_t rehash_blocked_writes_count() const noexcept {
         return rehash_blocked_writes_count_.load(std::memory_order_relaxed);
     }
 
-    /// P0-4 (T1.2): Number of times rehash_finish() returned early because
+    /// Number of times rehash_finish() returned early because
     /// the per-call migration budget (kRehashFinishMaxBucketsPerCall) was
     /// exhausted before all buckets/chunks could be migrated. Non-zero
     /// values indicate the workload is producing large rehash bursts that
@@ -4724,7 +4728,7 @@ public:
     std::size_t rehash_finish_stall_count() const noexcept {
         return rehash_finish_stall_count_.load(std::memory_order_relaxed);
     }
-    /// P0-4 (T1.2): High-water mark of remaining buckets/chunks at the
+    /// High-water mark of remaining buckets/chunks at the
     /// moment a stalled rehash_finish() returned. Useful for sizing the
     /// per-call budget: if this stays above zero under load, the budget
     /// is too small for the workload's rehash volume.
@@ -4732,7 +4736,7 @@ public:
         return rehash_finish_max_backlog_.load(std::memory_order_relaxed);
     }
 
-    /// P1-5: Number of times find_and_pin_lockfree fell back to the
+    /// Number of times find_and_pin_lockfree fell back to the
     /// lock-protected path because the segment was in incremental rehash.
     /// Non-zero values indicate the lock-free read path is being degraded
     /// by rehash activity — operators should consider pre-reserving capacity
@@ -4767,17 +4771,31 @@ public:
     /// When enabled, rehash() starts an incremental migration instead of
     /// blocking all readers. Only effective for chain mode (non-F14).
     ///
-    /// T19.2: Effective for ALL hash table modes:
+    /// Effective for ALL hash table modes:
     ///   - **Chain mode** (`chain_probing_tag`): migrates one bucket at a time
     ///     via rehash_step().
     ///   - **F14 SIMD mode** (`f14_probing_tag`): migrates one 14-slot chunk
     ///     at a time via rehash_step_f14() (dual-array lookup).
     ///   - **Segmented mode** (`Segmented=true`): applies chain-mode incremental
     ///     rehash independently per segment (1/64 stall at any moment).
-    void set_incremental_rehash(bool enabled) noexcept { incremental_rehash_ = enabled; }
-    bool incremental_rehash_enabled() const noexcept { return incremental_rehash_; }
+    void set_incremental_rehash(bool enabled) noexcept {
+        incremental_rehash_.store(enabled, std::memory_order_relaxed);
+    }
+    bool incremental_rehash_enabled() const noexcept {
+        return incremental_rehash_.load(std::memory_order_relaxed);
+    }
 
-    /// T11.5: Set the rehash strategy by name. String-based API for
+    /// True when incremental rehash is enabled AND a migration is currently
+    /// in flight — the predicate every lookup/insert fast path needs. Kept as
+    /// one helper so the two-flag check is written once instead of at each of
+    /// the ~30 call sites, and so the runtime toggle only has to be an atomic
+    /// relaxed load.
+    bool incremental_rehash_active() const noexcept {
+        return incremental_rehash_.load(std::memory_order_relaxed) &&
+               rehash_in_progress_.load(std::memory_order_acquire);
+    }
+
+    /// Set the rehash strategy by name. String-based API for
     /// configuration files / CLI flags. Equivalent to:
     ///   - "incremental": set_incremental_rehash(true)
     ///   - "blocking":    set_incremental_rehash(false)
@@ -4805,9 +4823,10 @@ public:
         return false;
     }
 
-    /// T11.5: Query the current rehash strategy by name.
+    /// Query the current rehash strategy by name.
     std::string_view rehash_strategy() const noexcept {
-        return incremental_rehash_ ? std::string_view{"incremental"}
+        return incremental_rehash_.load(std::memory_order_relaxed)
+                   ? std::string_view{"incremental"}
                                    : std::string_view{"blocking"};
     }
 
@@ -4816,7 +4835,7 @@ public:
         return rehash_in_progress_.load(std::memory_order_acquire);
     }
 
-    /// P0-D: Ratio of the hash table currently in an incremental rehash.
+    /// Ratio of the hash table currently in an incremental rehash.
     /// For non-segmented tables: 0.0f (idle) or 1.0f (rehashing). The
     /// segmented_concurrent_hash_table overrides this to return the
     /// fraction of its 64 segments currently rehashing.
@@ -4922,7 +4941,7 @@ public:
     /// Complete any ongoing incremental rehash, migrating all remaining
     /// buckets and installing the new array.
     ///
-    /// P0-4 (T1.2): To bound the worst-case stall, we cap the number of
+    /// To bound the worst-case stall, we cap the number of
     /// buckets migrated in a single rehash_finish() call at
     /// `kRehashFinishMaxBucketsPerCall`. If more work remains, we leave
     /// the rehash in progress and return without installing the new
@@ -4940,7 +4959,7 @@ public:
 
         const size_type old_bucket_count = bucket_mask_.load(std::memory_order_relaxed) + 1;
 
-        // P0-4 (T1.2): Cap synchronous migration to bound tail latency.
+        // Cap synchronous migration to bound tail latency.
         // Migrate at most kRehashFinishMaxBucketsPerCall buckets per call;
         // if more remain, leave rehash in progress and let subsequent
         // writes / the background rehash balancer make further progress.
@@ -4980,7 +4999,7 @@ public:
 
         const size_type new_mask = rehash_new_bucket_count_.load(std::memory_order_relaxed) - 1;
 
-        // P3-1: Swap buckets_ atomically (never null) before publishing the
+        // Swap buckets_ atomically (never null) before publishing the
         // new bucket_mask_. See the blocking-rehash path above for rationale.
         buckets_.swap(rehash_new_buckets_owner_);
         bucket_mask_.store(new_mask, std::memory_order_release);
@@ -5173,7 +5192,7 @@ public:
     /// install the new chunks array as the primary. Uses a CAS on
     /// rehash_in_progress_ to ensure only one thread performs the installation.
     ///
-    /// P0-4 (T1.2): As in chain mode, we cap the synchronous chunk
+    /// As in chain mode, we cap the synchronous chunk
     /// migration at kRehashFinishMaxBucketsPerCall chunks per call to
     /// bound the worst-case tail latency. If more work remains, we leave
     /// the rehash in progress and return; subsequent writes or the
@@ -5184,7 +5203,7 @@ public:
 
         const size_type old_chunk_count = bucket_mask_.load(std::memory_order_relaxed) + 1;
 
-        // P0-4 (T1.2): Cap synchronous migration to bound tail latency.
+        // Cap synchronous migration to bound tail latency.
         size_type migrated_this_call = 0;
         while (rehash_progress_.load(std::memory_order_acquire) < old_chunk_count) {
             if (migrated_this_call >= kRehashFinishMaxBucketsPerCall) {
@@ -5219,7 +5238,7 @@ public:
 
         const size_type new_mask = rehash_new_bucket_count_.load(std::memory_order_relaxed) - 1;
 
-        // P3-1: Swap chunks_ atomically (never null) before publishing the
+        // Swap chunks_ atomically (never null) before publishing the
         // new bucket_mask_. See the blocking-rehash path above for rationale.
         chunks_.swap(rehash_new_chunks_owner_);
         bucket_mask_.store(new_mask, std::memory_order_release);
@@ -5253,7 +5272,7 @@ private:
     // Bucket type — chain mode (head pointer + cacheline-aligned shared spinlock)
     // ========================================================================
 
-    // P2-C: `version` co-located with the chain head atomics so the
+    // `version` co-located with the chain head atomics so the
     // optimistic-read path (v1 → embed_head/node_head → v2) touches a
     // single cache line. Shrinks the bucket from 192 → 128 bytes.
     struct bucket_type {
@@ -5284,7 +5303,7 @@ private:
         static constexpr int kCapacity = f14_detail::kChunkCapacity;
 
         // ----------------------------------------------------------------
-        // P2-C: Cache-line aware layout for the F14 chunk.
+        // Cache-line aware layout for the F14 chunk.
         //
         // The seqlock `version` is bumped twice per writer critical section
         // (odd = write in progress, even = write published) and loaded twice
@@ -5321,7 +5340,7 @@ private:
         aligned_shared_spinlock spin;
 
         // ------------------------------------------------------------
-        // P1-8 (T-B3): Atomic access helpers for tags[] and occupied_mask.
+        // Atomic access helpers for tags[] and occupied_mask.
         // ------------------------------------------------------------
         // The optimistic-read path (find_f14_*) reads `tags[]` via SIMD
         // and `occupied_mask` via a plain load, then re-checks `version`
@@ -5584,7 +5603,7 @@ private:
     /// EmbeddedChain, node_type* for non-EmbeddedChain) or nullptr.
     /// Uses shared_bucket_lock on whichever array owns the key's bucket.
     ///
-    /// G18: The retry loop is bounded by kDualArrayMaxRetries. If the
+    /// The retry loop is bounded by kDualArrayMaxRetries. If the
     /// rehash thread migrates the target bucket between the initial
     /// progress read and the in-lock re-check on every attempt, an
     /// unbounded loop would spin indefinitely — wasting CPU on lock
@@ -5620,7 +5639,7 @@ private:
             }
         }
 
-        // G18: Bounded retries exhausted — rehash progress is advancing
+        // Bounded retries exhausted — rehash progress is advancing
         // faster than the per-bucket shared-lock retry loop can converge.
         // Continuing to retry would spin indefinitely, wasting CPU on
         // lock acquisitions that never settle. Fall back to a
@@ -5883,7 +5902,7 @@ private:
     // F14 mode storage
     std::unique_ptr<f14_chunk_type[]> chunks_;
 
-    // P0-3 (T1.1): Hot-path atomic counter padded to its own cache line.
+    // Hot-path atomic counter padded to its own cache line.
     // Every insert/erase performs fetch_add/fetch_sub here; on 64+ core
     // machines an unpadded `size_` would false-share with adjacent members
     // and concentrate RMW traffic on a single cache line. Padding isolates
@@ -5896,20 +5915,22 @@ private:
     allocate_fn    alloc_fn_ = nullptr;
     deallocate_fn  dealloc_fn_ = nullptr;
 
-    // P0-1: 乐观读默认值取决于 EmbeddedChain 模式。
-    //  - EmbeddedChain = true: 节点即 Value，由 MM 的 refcount + hazptr 保护，
-    //    乐观读返回的指针在被 refcount 递增前可能被驱逐，但 hazptr 保护
-    //    确保节点内存不会在乐观读窗口内被释放。默认启用。
-    //  - EmbeddedChain = false: node_type 独立分配，其生命周期由哈希表
-    //    管理（无 refcount）。乐观读返回 node->value 指针后，另一个线程
-    //    可能在 TOCTOU 窗口内删除该节点，导致 use-after-free。默认禁用，
-    //    仅在用户显式调用 set_optimistic_read(true) 且接受 UAF 风险时启用。
+    // The default for optimistic reads depends on the EmbeddedChain mode.
+    //  - EmbeddedChain = true: the node IS the value and the MM's refcount +
+    //    hazptr protect it. The pointer an optimistic read returns may be evicted
+    //    before the refcount is incremented, but hazptr guarantees the memory is
+    //    not freed inside the optimistic-read window. Enabled by default.
+    //  - EmbeddedChain = false: node_type is separately allocated and its
+    //    lifetime is owned by the hash table (no refcount). After an optimistic
+    //    read returns node->value, another thread can delete that node inside the
+    //    TOCTOU window, which is a use-after-free. Disabled by default; enable
+    //    only via an explicit set_optimistic_read(true) that accepts the risk.
     bool enable_optimistic_read_ = EmbeddedChain;
     bool enable_hazptr_read_ = true;
 
     std::atomic<uint64_t> seqlock_{0};
 
-    // P1-1: Rehash diagnostics — atomically track rehash frequency,
+    // Rehash diagnostics — atomically track rehash frequency,
     // duration, and migration volume. Read by unified_cache::stats_snapshot()
     // and exported via Prometheus. These are local to the hash table to
     // preserve layering (hash table does not depend on cache_stats).
@@ -5917,7 +5938,7 @@ private:
     alignas(64) std::atomic<std::uint64_t> rehash_total_time_ns_{0};
     alignas(64) std::atomic<std::size_t> rehash_migrated_items_{0};
 
-    // T11.3: Counter of write operations that arrived while a blocking
+    // Counter of write operations that arrived while a blocking
     // (non-incremental) rehash was in progress and had to wait for it
     // to finish before acquiring the bucket lock. Incremented once per
     // affected write. Non-zero values indicate the user should enable
@@ -5926,7 +5947,7 @@ private:
     // rehash path mutates it while concurrent readers poll it.
     alignas(64) std::atomic<std::size_t> rehash_blocked_writes_count_{0};
 
-    // P0-4 (T1.2): Rehash-finish stall metrics. rehash_finish_stall_count
+    // Rehash-finish stall metrics. rehash_finish_stall_count
     // is incremented each time rehash_finish() returns early because it hit
     // the kRehashFinishMaxBucketsPerCall budget — i.e., the rehash could
     // not be completed synchronously. rehash_finish_max_backlog tracks the
@@ -5936,7 +5957,7 @@ private:
     alignas(64) std::atomic<std::size_t> rehash_finish_stall_count_{0};
     alignas(64) std::atomic<std::size_t> rehash_finish_max_backlog_{0};
 
-    // P1-5: Count of times find_and_pin_lockfree fell back to the
+    // Count of times find_and_pin_lockfree fell back to the
     // lock-protected path because the segment was in incremental rehash.
     // Per-segment counter — aggregated by segmented_concurrent_hash_table.
     // Operators monitor this to detect sustained rehash activity that
@@ -5946,10 +5967,10 @@ private:
     // the diagnostic counters).
     alignas(64) mutable std::atomic<std::size_t> rehash_lockfree_fallback_count_{0};
 
-    // F14: ~10 items per 14-slot chunk ≈ 71% inline utilization
+    // ~10 items per 14-slot chunk ≈ 71% inline utilization
     float max_load_factor_ = kIsF14 ? 10.0f : 4.0f;
 
-    // T13.1: Configurable overload threshold and counter. Padded to
+    // Configurable overload threshold and counter. Padded to
     // avoid false sharing with the rehash counters above (which are
     // updated on every rehash, while these are read on every insert).
     //
@@ -5960,18 +5981,18 @@ private:
     // Keep the two in step via max_load_factor(float).
     alignas(64) std::atomic<float> hash_overload_threshold_{max_load_factor_ * 0.8f};
     alignas(64) std::atomic<std::size_t> hash_overload_events_{0};
-    // T13.2: User-registered callback invoked when load_factor exceeds
+    // User-registered callback invoked when load_factor exceeds
     // the overload threshold. Invoked from the rehash hot path, so it
     // must be cheap. Exceptions are swallowed by the caller.
     std::function<void(float, float)> hash_overload_callback_;
-    // T13.4: Rate-limit flag for the stderr warning. Set when the warning
+    // Rate-limit flag for the stderr warning. Set when the warning
     // is printed; cleared when load_factor drops back below the threshold.
     // This prevents log spam when the table is persistently overloaded
     // (e.g. during stress tests). The callback above still fires on every
     // overloaded insert — only the stderr message is deduplicated.
     alignas(64) std::atomic<bool> hash_overload_warned_{false};
 
-    // P2-4 (T2.4): Async overload-callback queue. When
+    // Async overload-callback queue. When
     // `overload_callback_async_` is true, the rehash hot path enqueues
     // {current_lf, threshold} pairs into `overload_queue_` (guarded by
     // `overload_queue_mutex_`) instead of invoking the user callback
@@ -5990,7 +6011,7 @@ private:
     std::vector<std::unique_ptr<bucket_type[]>> retired_buckets_;
     std::vector<std::unique_ptr<f14_chunk_type[]>> retired_chunks_;
 
-    // T2.1: EBR (Epoch-Based Reclamation) domain pointer. When non-null,
+    // EBR (Epoch-Based Reclamation) domain pointer. When non-null,
     // find_and_pin_lockfree_with_hash() acquires an epoch_guard at entry,
     // protecting all nodes from reclamation during the traversal. This is
     // the correct place for the guard (at the hash table entry, per the
@@ -6000,13 +6021,17 @@ private:
     // When null (default), the hash table operates in hazptr mode: each
     // traversal uses hazptr_holder for per-pointer protection.
     //
-    // T2.4: Callers can use the `reclaim_guard` type alias below to write
+    // Callers can use the `reclaim_guard` type alias below to write
     // mode-agnostic code — it resolves to epoch_guard in EBR mode and to
     // a no-op guard in hazptr mode.
     detail::epoch_domain* ebr_domain_ = nullptr;
 
     // Incremental rehash state (chain mode only)
-    bool incremental_rehash_{false};
+    /// Atomic: set_incremental_rehash() may run concurrently with the hot
+    /// path, which reads this flag on every bucket access. A plain bool made
+    /// that toggle a data race (and apply_config() calls the setter on every
+    /// invocation).
+    std::atomic<bool> incremental_rehash_{false};
     std::atomic<bool> rehash_in_progress_{false};
     std::atomic<bucket_type*> rehash_new_buckets_{nullptr};
     std::atomic<size_type> rehash_new_bucket_count_{0};
@@ -6058,7 +6083,7 @@ public:
         "segmented_concurrent_hash_table supports at most 64 segments "
         "(the per-segment diagnostics cache is a fixed 64-entry array)");
 
-    // R2: Expose EmbeddedChain setting for compile-time verification.
+    // Expose EmbeddedChain setting for compile-time verification.
     static constexpr bool uses_embedded_chain = EmbeddedChain;
 
     // Same type aliases as concurrent_hash_table for compatibility
@@ -6073,13 +6098,13 @@ private:
     std::size_t segment_mask_;  // num_segments_ - 1
     Hash hash_;
 
-    // P0-3 (T1.1): Aggregate size counter — padded to its own cache line to
+    // Aggregate size counter — padded to its own cache line to
     // avoid false sharing with hash_ and the segments_ vector. Every
     // per-segment insert/erase does fetch_add/fetch_sub here; on 64+ core
     // machines the unpadded layout causes measurable contention.
     alignas(64) std::atomic<size_type> total_size_{0};
 
-    // T-B4 (P2-10): Diagnostics snapshot cache — periodically refreshed by
+    // Diagnostics snapshot cache — periodically refreshed by
     // the background rehash balancer (1s cadence by default). Without this
     // cache, every prometheus_text() / diagnostics() scrape triggers an
     // O(total_buckets) scan across all 64 segments, which dominates scrape
@@ -6212,7 +6237,7 @@ public:
         , segment_mask_(other.segment_mask_)
         , hash_(std::move(other.hash_))
         , total_size_(other.total_size_.load(std::memory_order_relaxed))
-        // T-B4: move the diagnostics cache snapshot. Snapshot is best-effort;
+        // move the diagnostics cache snapshot. Snapshot is best-effort;
         // the moved-from cache will be empty, the moved-to cache will see the
         // pre-move snapshot (which may be stale if the balancer hasn't run
         // since the move). The next balancer sweep will refresh it.
@@ -6303,7 +6328,7 @@ public:
         return segments_[segment_for_key(key)]->find_and_pin(key, std::forward<PinFn>(pin_fn));
     }
 
-    /// T16.4: find_and_pin with a pre-computed hash. Delegates to the
+    /// find_and_pin with a pre-computed hash. Delegates to the
     /// appropriate segment using the hash (avoids re-hashing for segment
     /// dispatch). The hash MUST be from the same Hash function the table
     /// was constructed with.
@@ -6340,7 +6365,7 @@ public:
         return segments_[segment_for_key(key)]->find_and_pin_lockfree(key, std::forward<PinFn>(pin_fn));
     }
 
-    /// T16.4: Lockfree find-and-pin with a pre-computed hash. Delegates
+    /// Lockfree find-and-pin with a pre-computed hash. Delegates
     /// to the appropriate segment using the hash. Used by bulk_get to
     /// avoid re-hashing for segment dispatch + per-segment hash-table lookup.
     template <typename PinFn>
@@ -6419,7 +6444,7 @@ public:
     // Rehash — per-segment, no global stall
     // ========================================================================
 
-    /// P0-5 (T1.3): Sweep all segments and rehash any that need it.
+    /// Sweep all segments and rehash any that need it.
     /// This is the legacy "scan-all-segments" entry point and is kept
     /// for compatibility with code paths that have no specific hash
     /// available (e.g. `flush()`, periodic maintenance). On the write
@@ -6430,7 +6455,7 @@ public:
         for (std::size_t i = 0; i < num_segments_; ++i) segments_[i]->rehash_if_needed();
     }
 
-    /// P0-5 (T1.3): Rehash only the segment owning `hash`. This is the
+    /// Rehash only the segment owning `hash`. This is the
     /// hot-path entry point used by insert/erase — those operations
     /// already know the key's hash, so they can route directly to the
     /// owning segment and avoid stalling on the other 63 segments.
@@ -6441,7 +6466,7 @@ public:
         segments_[segment_for_hash(hash)]->rehash_if_needed();
     }
 
-    /// P0-5 (T1.3): Rehash only the segment owning `key`. Convenience
+    /// Rehash only the segment owning `key`. Convenience
     /// overload for callers that don't have a precomputed hash.
     void rehash_if_needed_for_key(const Key& key) {
         segments_[segment_for_key(key)]->rehash_if_needed();
@@ -6465,7 +6490,7 @@ public:
     // Chain length diagnostics
     // ========================================================================
     //
-    // T-B4 (P2-10): max_chain_length() and per_segment_load_factors() now
+    // max_chain_length() and per_segment_load_factors() now
     // serve from the cached snapshot when available, falling back to a live
     // O(buckets) scan on the first call (before the balancer has run) or
     // when the cache has never been refreshed. Callers that require the
@@ -6519,7 +6544,7 @@ public:
         return live;
     }
 
-    /// T-B4 (P2-10): Compute fresh diagnostics and update the cached
+    /// Compute fresh diagnostics and update the cached
     /// snapshot. O(total_buckets) scan — call only from the background
     /// rehash balancer or other low-frequency paths. After this call,
     /// `max_chain_length()` and `per_segment_load_factors()` return the
@@ -6545,7 +6570,7 @@ public:
         cached_snapshot_ns_.store(ns, std::memory_order_release);
     }
 
-    /// T-B4 (P2-10): Age of the cached snapshot in milliseconds. Returns
+    /// Age of the cached snapshot in milliseconds. Returns
     /// `std::numeric_limits<std::uint64_t>::max()` if the cache has never
     /// been refreshed. Operators can use this to detect a stalled balancer
     /// (age >> balancer interval typically indicates the worker thread
@@ -6564,7 +6589,7 @@ public:
         return (now_ns - cached_ns) / 1'000'000u;
     }
 
-    /// T-B4 (P2-10): Number of segments captured in the last snapshot.
+    /// Number of segments captured in the last snapshot.
     /// Useful for sanity-checking per_segment_load_factors() output size
     /// against the live num_segments_.
     std::size_t cached_segment_count() const noexcept {
@@ -6572,7 +6597,7 @@ public:
     }
 
     // ========================================================================
-    // P1-1: Rehash diagnostics — aggregate across all segments
+    // Rehash diagnostics — aggregate across all segments
     // ========================================================================
 
     std::size_t rehash_count() const noexcept {
@@ -6596,7 +6621,7 @@ public:
         }
         return total;
     }
-    /// T11.3: Aggregate blocked-writes count across all segments.
+    /// Aggregate blocked-writes count across all segments.
     std::size_t rehash_blocked_writes_count() const noexcept {
         std::size_t total = 0;
         for (std::size_t i = 0; i < num_segments_; ++i) {
@@ -6604,7 +6629,7 @@ public:
         }
         return total;
     }
-    /// P0-4 (T1.2): Aggregate rehash_finish stall count across all segments.
+    /// Aggregate rehash_finish stall count across all segments.
     std::size_t rehash_finish_stall_count() const noexcept {
         std::size_t total = 0;
         for (std::size_t i = 0; i < num_segments_; ++i) {
@@ -6612,7 +6637,7 @@ public:
         }
         return total;
     }
-    /// P1-5: Aggregate rehash_lockfree_fallback_count across all segments.
+    /// Aggregate rehash_lockfree_fallback_count across all segments.
     /// Non-zero values indicate the lock-free read path is being degraded
     /// by rehash activity in one or more segments.
     std::size_t rehash_lockfree_fallback_count() const noexcept {
@@ -6622,7 +6647,7 @@ public:
         }
         return total;
     }
-    /// P0-D: Ratio of segments with an in-progress incremental rehash,
+    /// Ratio of segments with an in-progress incremental rehash,
     /// in [0.0, 1.0]. Returns 0.0 when no segments are rehashing; 1.0
     /// when every segment is rehashing. Useful as a Prometheus gauge
     /// (`lru_rehash_in_progress_ratio`) to detect sustained rehash
@@ -6643,7 +6668,7 @@ public:
         return static_cast<float>(in_progress) /
                static_cast<float>(num_segments_);
     }
-    /// P0-4 (T1.2): Maximum backlog across segments — the worst-case
+    /// Maximum backlog across segments — the worst-case
     /// high-water mark for tail-latency analysis.
     std::size_t rehash_finish_max_backlog() const noexcept {
         std::size_t max_b = 0;
@@ -6652,7 +6677,7 @@ public:
         }
         return max_b;
     }
-    /// P0-5 (T1.3): Advance any in-progress incremental rehash in every
+    /// Advance any in-progress incremental rehash in every
     /// segment. Called by the background rehash balancer via
     /// `mm_lru::advance_incremental_rehash()`. Each segment's
     /// `rehash_finish()` migrates at most `kRehashFinishMaxBucketsPerCall`
@@ -6664,10 +6689,10 @@ public:
             segments_[i]->rehash_finish();
         }
     }
-    /// T13.4: Per-segment load factor for prometheus shard label export.
+    /// Per-segment load factor for prometheus shard label export.
     /// Returns a vector of (segment_index, load_factor) pairs.
     ///
-    /// T-B4 (P2-10): Now serves from the cached snapshot (populated by
+    /// Now serves from the cached snapshot (populated by
     /// `refresh_diagnostics_cache()`). If the cache is cold, falls back to
     /// a live per-segment `load_factor()` scan and warms the cache as a
     /// side effect. Use `refresh_diagnostics_cache()` first if you need
@@ -6714,9 +6739,9 @@ public:
     }
 
     // ========================================================================
-    // T13.1: Hash overload threshold / events — aggregate across segments.
+    // Hash overload threshold / events — aggregate across segments.
     //
-    // P1-13: These wrappers were missing on segmented_concurrent_hash_table,
+    // These wrappers were missing on segmented_concurrent_hash_table,
     // which caused mm_lru::refresh_hash_stats() (and therefore
     // stats_snapshot() / prometheus_text()) to fail to compile for any
     // Segmented=true cache alias (production_cache, segmented_striped_cache,
@@ -6758,7 +6783,7 @@ public:
     }
 
     // ========================================================================
-    // P2-4 (T2.4): Overload-callback forwarding — propagate to every
+    // Overload-callback forwarding — propagate to every
     // segment so that a cache-wide `set_async_overload_callback(true)`
     // covers the entire segmented table without requiring per-segment
     // setup. `drain_overload_callbacks()` aggregates across segments so
@@ -6839,10 +6864,10 @@ public:
     bool optimistic_read_enabled() const noexcept { return segments_[0]->optimistic_read_enabled(); }
 
     // --------------------------------------------------------------------
-    // T2.1 / T2.4: EBR integration — propagate to all segments
+    // EBR integration — propagate to all segments
     // --------------------------------------------------------------------
 
-    /// T2.1: Set the EBR domain for all segments. See
+    /// Set the EBR domain for all segments. See
     /// concurrent_hash_table::set_ebr_domain for details.
     void set_ebr_domain(detail::epoch_domain* domain) noexcept {
         for (std::size_t i = 0; i < num_segments_; ++i) {
@@ -6870,7 +6895,7 @@ public:
         }
         return true;
     }
-    /// T11.5: String-based strategy setter — propagates to all segments.
+    /// String-based strategy setter — propagates to all segments.
     bool set_rehash_strategy(std::string_view strategy) noexcept {
         bool ok = true;
         for (std::size_t i = 0; i < num_segments_; ++i) {

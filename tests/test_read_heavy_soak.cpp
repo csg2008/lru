@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// T-M2: Minute-level read-heavy soak test with memory growth monitoring.
+// Minute-level read-heavy soak test with memory growth monitoring.
 //
 // Validates that read-heavy aliases can sustain a 95% read / 5% write
 // workload across 16 threads for a configurable duration (default 5s for
@@ -59,7 +59,7 @@ inline std::size_t sample_rss_bytes() {
     HMODULE psapi = ::LoadLibraryW(L"psapi.dll");
     if (!psapi) return 0;
     using GetProcessMemoryInfo_t = BOOL(WINAPI*)(HANDLE, void*, DWORD);
-    // P0-3: GetProcAddress returns FARPROC (int(*)()), an incompatible
+    // GetProcAddress returns FARPROC (int(*)()), an incompatible
     // function-pointer type; launder the address through memcpy rather than a
     // function-pointer cast, which trips GCC's -Wcast-function-type (and, for
     // the two-step void(*)() form, Clang's -Wcast-function-type-strict).
@@ -270,7 +270,7 @@ constexpr double kRssGrowthThreshold = 0.10;  // 10% per M-2-B spec
 }  // namespace
 
 // ============================================================================
-// M-2-A / M-2-B: read_heavy_striped_cache soak
+// read_heavy_striped_cache soak
 // ============================================================================
 TEST(ReadHeavySoak, ReadHeavyStripedCacheSoak) {
     // Direct construction — unified_cache is non-movable (contains mutexes/atomics)
@@ -309,7 +309,7 @@ TEST(ReadHeavySoak, ReadHeavyStripedCacheSoak) {
 }
 
 // ============================================================================
-// M-2-A / M-2-B: safe_cache soak
+// safe_cache soak
 // ============================================================================
 TEST(ReadHeavySoak, SafeCacheSoak) {
     safe_cache<int, int> c(5000);

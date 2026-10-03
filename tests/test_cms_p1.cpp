@@ -27,7 +27,7 @@ namespace {
 using lru::detail::count_min_sketch;
 
 // ---------------------------------------------------------------------------
-// P1-25: sizing is capacity-driven
+// sizing is capacity-driven
 // ---------------------------------------------------------------------------
 
 TEST(CmsP1, CounterCountScalesWithCapacity) {
@@ -60,7 +60,7 @@ TEST(CmsP1, ErrorThresholdControlsAccuracy) {
 }
 
 // ---------------------------------------------------------------------------
-// P1-26: whole-table decay with a geometrically shrinking window
+// whole-table decay with a geometrically shrinking window
 // ---------------------------------------------------------------------------
 
 TEST(CmsP1, WindowStartsAtCapacityTimesMultiplier) {

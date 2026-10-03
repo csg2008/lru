@@ -187,7 +187,7 @@ public:
 private:
     /// Resolve an exported symbol into a typed function pointer.
     ///
-    /// P0-3: GetProcAddress returns FARPROC (`int(*)()`), whose type is
+    /// GetProcAddress returns FARPROC (`int(*)()`), whose type is
     /// incompatible with every real target signature, so a function-pointer
     /// cast trips GCC's -Wcast-function-type (and, via the two-step
     /// void(*)() form, Clang's -Wcast-function-type-strict). Launder the address

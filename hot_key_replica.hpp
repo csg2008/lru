@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// T-C1 (P1-2): Hot key replica manager — opt-in utility for automatic
+// Hot key replica manager — opt-in utility for automatic
 // hot-key replication across cache shards.
 //
 // Design rationale
@@ -77,7 +77,7 @@
 
 namespace lru {
 
-/// T-C1 (P1-2): Opt-in hot key replica manager.
+/// Opt-in hot key replica manager.
 ///
 /// Wraps a `unified_cache<K, V>` reference and provides transparent
 /// replication for keys the application explicitly registers via
@@ -107,7 +107,7 @@ public:
     using value_type = typename Cache::value_type;
     using size_type = std::size_t;
 
-    /// T-G9: Replica key transform function. Maps (original_key, index)
+    /// Replica key transform function. Maps (original_key, index)
     /// to a distinct replica key. The default transform handles
     /// std::string and integral key types; for other key types the
     /// caller MUST supply a custom transform via `config.replica_key_fn`.
@@ -132,19 +132,19 @@ public:
         /// silently until existing keys are unregistered).
         size_type max_replicated_keys = 1024;
 
-        /// T-G9: Optional custom replica key transform. If unset, the
+        /// Optional custom replica key transform. If unset, the
         /// manager uses the default transform for std::string and
         /// integral key types (see `default_replica_key()`).
         replica_key_fn_t replica_key_fn;
 
-        /// T-G9: QPS threshold for auto_subscribe. A candidate key
+        /// QPS threshold for auto_subscribe. A candidate key
         /// whose estimated hit count over the poll interval exceeds
         /// this threshold is auto-registered; one that falls below
         /// `qps_unregister_ratio * threshold` is auto-unregistered.
         /// Default: 1000 hits/sec — typical shard-sustainable QPS.
         std::size_t auto_qps_threshold = 1000;
 
-        /// T-G9: Ratio of `auto_qps_threshold` below which a replicated
+        /// Ratio of `auto_qps_threshold` below which a replicated
         /// key is auto-unregistered. Default: 0.5 (i.e., 500 hits/sec
         /// when threshold is 1000).
         double auto_unregister_ratio = 0.5;
@@ -200,7 +200,7 @@ public:
     }
 
     // ----------------------------------------------------------------
-    // T-G9: Candidate registry + auto_subscribe
+    // Candidate registry + auto_subscribe
     // ----------------------------------------------------------------
     //
     // The event_tracker stores only key hashes (uint64_t) for memory
@@ -215,7 +215,7 @@ public:
     // storing full keys in the event_tracker (which would multiply
     // memory cost ~10x for typical key sizes).
 
-    /// T-G9: Add `key` to the candidate registry. Candidates are keys
+    /// Add `key` to the candidate registry. Candidates are keys
     /// the application is willing to replicate if they become hot.
     /// Does NOT immediately replicate — call `auto_subscribe()` (or
     /// start the background worker) to evaluate candidates against the
@@ -235,7 +235,7 @@ public:
         candidates_.insert(key);
     }
 
-    /// T-G9: Remove `key` from the candidate registry. If the key is
+    /// Remove `key` from the candidate registry. If the key is
     /// currently replicated, it is also unregistered (replicas
     /// deleted). Idempotent.
     void unregister_candidate(const key_type& key) {
@@ -246,19 +246,19 @@ public:
         unregister_hot_key(key);
     }
 
-    /// T-G9: Snapshot of the candidate registry.
+    /// Snapshot of the candidate registry.
     std::vector<key_type> candidates() const {
         std::shared_lock<std::shared_mutex> lock(candidate_mutex_);
         return {candidates_.begin(), candidates_.end()};
     }
 
-    /// T-G9: Number of registered candidates.
+    /// Number of registered candidates.
     size_type candidate_count() const noexcept {
         std::shared_lock<std::shared_mutex> lock(candidate_mutex_);
         return candidates_.size();
     }
 
-    /// T-G9: One-shot evaluation of candidates against `tracker`'s
+    /// One-shot evaluation of candidates against `tracker`'s
     /// hot-key list. For each candidate whose estimated hit count over
     /// `poll_interval` exceeds `config.auto_qps_threshold`, the key is
     /// auto-registered (if not already). For each currently-replicated
@@ -336,7 +336,7 @@ public:
         return result;
     }
 
-    /// T-G9: Start a background worker that periodically calls
+    /// Start a background worker that periodically calls
     /// `auto_subscribe()` with the given poll interval. Replaces any
     /// previously-running worker. The worker uses a `std::jthread` +
     /// `stop_token` so `stop_auto_subscribe()` (or destruction) signals
@@ -362,7 +362,7 @@ public:
             });
     }
 
-    /// T-G9: Stop the background auto_subscribe worker (if running).
+    /// Stop the background auto_subscribe worker (if running).
     /// Blocks until the worker has exited.
     void stop_auto_subscribe() {
         if (auto_thread_.joinable()) {
@@ -372,12 +372,12 @@ public:
         auto_worker_running_.store(false, std::memory_order_release);
     }
 
-    /// T-G9: Is the background auto_subscribe worker running?
+    /// Is the background auto_subscribe worker running?
     bool auto_subscribe_running() const noexcept {
         return auto_worker_running_.load(std::memory_order_acquire);
     }
 
-    /// T-C1 (P1-2): Explicitly register a key as a candidate for
+    /// Explicitly register a key as a candidate for
     /// replication. The manager will create `config.replica_factor`
     /// replicas of the key's current value and route subsequent
     /// `replicated_get(key)` calls to a random replica.
@@ -416,7 +416,7 @@ public:
         promote_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    /// T-C1 (P1-2): Unregister a key from replication. Deletes all
+    /// Unregister a key from replication. Deletes all
     /// replicas. Idempotent.
     void unregister_hot_key(const key_type& key) {
         std::unique_lock<std::shared_mutex> lock(metadata_mutex_);
@@ -439,7 +439,7 @@ public:
     }
 
     // ================================================================
-    // G13: Closed-loop batch maintenance API
+    // Closed-loop batch maintenance API
     // ================================================================
     //
     // Problem (G13): the replica mechanism was not closed-loop —
@@ -483,7 +483,7 @@ public:
     // future work (it requires the cross-file refactor above plus a
     // hash→key resolution mechanism in event_tracker.hpp).
 
-    /// G13: Batch-register hot keys for replication.
+    /// Batch-register hot keys for replication.
     ///
     /// For each key in `hot_keys`, calls `register_hot_key()`.
     /// `register_hot_key()` is idempotent and silently skips keys that
@@ -506,7 +506,7 @@ public:
         return promote_total() - before;
     }
 
-    /// G13: Batch-unregister keys that are no longer hot.
+    /// Batch-unregister keys that are no longer hot.
     ///
     /// Snapshots the currently-replicated key set, then unregisters
     /// every replicated key NOT present in `current_hot_keys`. This
@@ -580,8 +580,16 @@ public:
         thread_local std::mt19937 rng{
             static_cast<std::uint32_t>(
                 std::hash<std::thread::id>{}(std::this_thread::get_id()))};
-        std::uniform_int_distribution<size_type> dist(0, md.replica_count - 1);
-        size_type idx = dist(rng);
+        // replica_count is 0 when the key was registered while replica_factor
+        // was 0; `replica_count - 1` would then underflow the unsigned bound and
+        // make the distribution degenerate. Sampling is skipped in that case,
+        // so idx stays 0 and the replica lookup below simply misses and falls
+        // back to the original key.
+        size_type idx = 0;
+        if (md.replica_count > 0) {
+            std::uniform_int_distribution<size_type> dist(0, md.replica_count - 1);
+            idx = dist(rng);
+        }
         // Try the chosen replica first; on miss, fall back to the
         // original key (which the manager also maintains). This gives
         // us a fallback path when a replica has been evicted by the
@@ -609,24 +617,26 @@ public:
     /// consistent — concurrent readers may see a mix of old and new
     /// values across replicas during the update.
     void replicated_set(const key_type& key, const value_type& value) {
-        replica_metadata md;
-        bool replicated;
-        {
-            std::shared_lock<std::shared_mutex> lock(metadata_mutex_);
-            auto it = metadata_.find(key);
-            replicated = (it != metadata_.end());
-            if (replicated) md = it->second;
-        }
-        if (!replicated) {
+        // The metadata lock is held across the ENTIRE write, not just the
+        // lookup. Releasing it after copying `md` let a concurrent
+        // unregister_hot_key() (which takes the same lock exclusively) delete
+        // the replicas and erase the metadata in the gap, after which this
+        // function re-created `replica_count` orphan keys that no unregister
+        // would ever clean up — a permanent leak, plus a copy set that
+        // disagrees with the metadata. register_hot_key() already takes the
+        // lock in this same order (metadata -> cache), so this adds no new
+        // lock-order edge.
+        std::shared_lock<std::shared_mutex> lock(metadata_mutex_);
+        auto it = metadata_.find(key);
+        auto c = acquire_cache();
+        if (!c) return;  // cache destroyed (shared mode)
+        if (it == metadata_.end()) {
             // Not replicated — direct write.
-            auto c = acquire_cache();
-            if (!c) return;  // cache destroyed (shared mode)
             c->set(key, value);
             return;
         }
         // Write all replicas. Count the amplification for metrics.
-        auto c = acquire_cache();
-        if (!c) return;  // cache destroyed (shared mode)
+        const replica_metadata& md = it->second;
         c->set(key, value);
         for (size_type i = 0; i < md.replica_count; ++i) {
             key_type replica_key = make_replica_key(key, i);
@@ -644,24 +654,21 @@ public:
     bool replicated_cas(const key_type& key,
                         const value_type& expected,
                         const value_type& desired) {
-        replica_metadata md;
-        bool replicated;
-        {
-            std::shared_lock<std::shared_mutex> lock(metadata_mutex_);
-            auto it = metadata_.find(key);
-            replicated = (it != metadata_.end());
-            if (replicated) md = it->second;
-        }
-        if (!replicated) {
-            auto c = acquire_cache();
-            if (!c) return false;  // cache destroyed (shared mode)
+        // Same reasoning as replicated_set(): the metadata lock is held for the
+        // whole operation so a concurrent unregister_hot_key() cannot erase the
+        // metadata and delete the replicas part-way through, leaving this call
+        // to re-create orphans.
+        std::shared_lock<std::shared_mutex> lock(metadata_mutex_);
+        auto it = metadata_.find(key);
+        auto c = acquire_cache();
+        if (!c) return false;  // cache destroyed (shared mode)
+        if (it == metadata_.end()) {
             return c->cas(key, expected, desired);
         }
         // CAS all replicas. Track failures — return false if any fail,
         // but continue updating the rest (best-effort) so a subsequent
         // read sees a consistent value across all replicas.
-        auto c = acquire_cache();
-        if (!c) return false;  // cache destroyed (shared mode)
+        const replica_metadata& md = it->second;
         bool all_ok = true;
         all_ok = all_ok && c->cas(key, expected, desired);
         for (size_type i = 0; i < md.replica_count; ++i) {
@@ -762,7 +769,7 @@ private:
         return cfg_.replica_key_fn(key, idx);
     }
 
-    /// T-G9: Default replica-key transform.
+    /// Default replica-key transform.
     ///
     /// For `std::string` keys, appends a 0xFF marker + 4-byte big-endian
     /// index. The 0xFF byte avoids collisions with legitimate key
@@ -859,7 +866,7 @@ private:
     mutable std::shared_mutex metadata_mutex_;
     std::unordered_map<key_type, replica_metadata> metadata_;
 
-    /// T-G9: Candidate registry — keys the application is willing to
+    /// Candidate registry — keys the application is willing to
     /// auto-replicate. Protected by candidate_mutex_ (independent from
     /// metadata_mutex_ so candidate updates don't block replica reads).
     mutable std::shared_mutex candidate_mutex_;
@@ -868,7 +875,7 @@ private:
 
     std::unordered_set<key_type> candidates_;
 
-    /// T-G9: Background auto_subscribe worker.
+    /// Background auto_subscribe worker.
     std::jthread auto_thread_;
     std::atomic<bool> auto_worker_running_{false};
 

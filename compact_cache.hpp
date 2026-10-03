@@ -53,19 +53,20 @@ namespace lru {
 
 /// A single slot in the compact cache. Stores one key-value pair.
 /// The slot is pre-sized; key and value are stored in-place via placement new.
-/// @tparam kAlignment 对齐粒度，默认 alignof(std::max_align_t) 适合大多数场景。
-///                    对 NUMA/高争用场景可设为 std::hardware_destructive_interference_size。
+/// @tparam kAlignment Alignment granularity. The default (alignof(std::max_align_t))
+///                    suits most workloads; for NUMA or high-contention deployments,
+///                    std::hardware_destructive_interference_size is a better choice.
 template <typename Key, typename Value,
           std::size_t kAlignment = alignof(std::max_align_t)>
 struct alignas(kAlignment) compact_slot {
-    // 嵌入侵入式钩子，取代手动的 prev/next/update_time/flags
+    // Embedded intrusive hook, replacing hand-rolled prev/next/update_time/flags.
     detail::intrusive_hook hook;
 
     // Inline storage for key and value (placement-new'd)
     alignas(Key) char key_storage[sizeof(Key)];
     alignas(Value) char value_storage[sizeof(Value)];
 
-    // 仅标志 slot 是否被占用（hook.is_linked() = 是否在 LRU 链表中）
+    // Only marks whether the slot is occupied (hook.is_linked() == on the LRU list).
     bool occupied = false;
 
     // Accessors
@@ -74,7 +75,7 @@ struct alignas(kAlignment) compact_slot {
     Value* value_ptr() noexcept { return reinterpret_cast<Value*>(value_storage); }
     const Value* value_ptr() const noexcept { return reinterpret_cast<const Value*>(value_storage); }
 
-    // Hook 访问器，供 intrusive_list 使用
+    // Hook accessor used by intrusive_list.
     auto& get_hook() noexcept { return hook; }
     const auto& get_hook() const noexcept { return hook; }
 
@@ -229,7 +230,7 @@ public:
     using size_type = std::size_t;
     using slot_type = compact_slot<Key, Value, kSlotAlignment>;
     using thread_policy = ThreadPolicy;
-    // 使用 get_hook 函数指针（隐式转换自 default_get_hook<slot_type>）
+    // Uses a get_hook function pointer (implicitly converted from default_get_hook<slot_type>).
     static detail::intrusive_hook& get_slot_hook(slot_type& s) noexcept { return s.get_hook(); }
     using slot_list = detail::intrusive_list<slot_type, detail::intrusive_hook, get_slot_hook>;
 
@@ -269,7 +270,7 @@ public:
     }
 
     ~compact_cache() {
-        // 使用 pop_tail 安全销毁所有 slot（复用 intrusive_list 的 ASAN/TSAN 支持）
+        // Destroy every slot via pop_tail, which reuses intrusive_list's ASan/TSan support.
         while (auto* slot = lru_list_.pop_tail()) {
             destroy_slot(slot);
         }
@@ -360,7 +361,7 @@ public:
         stats_.register_insertion();
         callbacks_.collect_insert(key, *slot->value_ptr());
         callbacks_.flush_pending();
-        // T13/T14: monitor hash table load factor for overload events.
+        // monitor hash table load factor for overload events.
         check_hash_overload_locked();
     }
 
@@ -398,7 +399,7 @@ public:
 
     /// Peek without promoting.
     ///
-    /// P0-2 (fix.01): takes the SAME lock as the mutating paths
+    /// takes the SAME lock as the mutating paths
     /// (`acquire_read_lock()` shares `write_mutex_`). It previously used a
     /// per-key stripe lock from a *separate* mutex object, so `map_.find()`
     /// could run concurrently with `map_[key] = slot` / `map_.erase()` on the
@@ -423,7 +424,7 @@ public:
     }
 
     bool contains(const key_type& key) const {
-        // P0-2 (fix.01): share the write path's mutex (see peek()).
+        // share the write path's mutex (see peek()).
         auto lock = acquire_read_lock();
         return map_.contains(key);
     }
@@ -489,14 +490,14 @@ public:
     callback_mgr& callbacks() noexcept { return callbacks_; }
     const callback_mgr& callbacks() const noexcept { return callbacks_; }
 
-    /// 设置访问记录的刷新间隔（秒），默认 60 秒
+    /// Access-record flush interval in seconds (default 60).
     void set_refresh_time(uint32_t seconds) {
         auto lock = acquire_write_lock();
         refresh_time_ = seconds;
     }
 
     // ========================================================================
-    // T14: Production-grade observability & controllability APIs
+    // Production-grade observability & controllability APIs
     //
     // These methods mirror the unified_cache production API surface so that
     // compact_cache can be dropped into the same monitoring/control pipeline
@@ -826,7 +827,7 @@ public:
     }
 
 private:
-    /// T13: invoked under the write lock on each set()/add() to detect
+    /// invoked under the write lock on each set()/add() to detect
     /// load-factor overloads. Returns true if an overload event fired.
     bool check_hash_overload_locked() {
         const float threshold = hash_overload_threshold_.load(std::memory_order_acquire);
@@ -866,11 +867,11 @@ private:
     // Helpers
     // --------------------------------------------------------------------
 
-    /// 延迟提升（通过 intrusive_hook 的 update_time）
+    /// Deferred promotion, driven by intrusive_hook's update_time.
     void record_access(slot_type* slot) {
         auto curr = current_time_sec();
         if (curr < slot->hook.update_time + refresh_time_) return;
-        // 使用 intrusive_list 的 move_to_head 代替手动链表操作
+        // Use intrusive_list::move_to_head instead of hand-rolled relinking.
         lru_list_.move_to_head(*slot);
         slot->hook.update_time = curr;
         slot->hook.set_accessed();
@@ -995,7 +996,7 @@ private:
         stats_.register_insertion();
         callbacks_.collect_insert(key, *slot->value_ptr());
         callbacks_.flush_pending();
-        // T13/T14: monitor hash table load factor for overload events.
+        // monitor hash table load factor for overload events.
         check_hash_overload_locked();
     }
 
@@ -1046,7 +1047,7 @@ private:
     }
 
     // --- Members ---
-    // 使用 intrusive_list 接管 LRU 链表管理，复用其 ASAN/TSAN 集成
+    // intrusive_list owns the LRU list, reusing its ASan/TSan integration.
     slot_list lru_list_;
 
     map_type map_;
@@ -1054,7 +1055,7 @@ private:
 
     /// Mutex for thread safety. Empty tuple for single-threaded policies.
     ///
-    /// P0-2 (fix.01): every lock in this class (read AND write) now goes
+    /// every lock in this class (read AND write) now goes
     /// through `write_mutex_`. The previous separate per-key stripe mutex
     /// protected reads of `map_` that the write path did not take, which is
     /// exactly the race this fix removes. A single mutex also means readers
@@ -1069,7 +1070,7 @@ private:
     callback_mgr callbacks_;
     uint32_t refresh_time_ = 60;
 
-    // T14: graceful shutdown flag. When true, mutating operations reject
+    // graceful shutdown flag. When true, mutating operations reject
     // new work. Reads remain permitted so in-flight handles can drain.
     alignas(64) std::atomic<bool> shutdown_{false};
 
@@ -1097,7 +1098,7 @@ private:
 /// on the distributed_shared_mutex, allowing concurrent reads with each other
 /// but blocking during writes.
 ///
-/// 用法：lru::safe_compact_cache<int, int> c(10000);
+/// Usage: lru::safe_compact_cache<int, int> c(10000);
 template <typename Key, typename Value,
           typename Hash = std::hash<Key>,
           typename KeyEqual = std::equal_to<Key>,
@@ -1107,7 +1108,7 @@ using safe_compact_cache = compact_cache<Key, Value, Hash, KeyEqual,
                                          kMaxItemSize, kSlotAlignment,
                                          thread_safe_policy>;
 
-/// T14: Striped thread-safe compact cache convenience alias.
+/// Striped thread-safe compact cache convenience alias.
 ///
 /// Uses compact_cache with striped_thread_safe_policy, which inherits the
 /// same distributed_shared_mutex + striped_mutex layout as safe_compact_cache
@@ -1116,7 +1117,7 @@ using safe_compact_cache = compact_cache<Key, Value, Hash, KeyEqual,
 /// unified_cache's striped_cache / production_cache aliases so that
 /// monitoring code can treat compact_cache as a drop-in replacement.
 ///
-/// 用法：lru::striped_compact_cache<int, int> c(10000);
+/// Usage: lru::striped_compact_cache<int, int> c(10000);
 template <typename Key, typename Value,
           typename Hash = std::hash<Key>,
           typename KeyEqual = std::equal_to<Key>,

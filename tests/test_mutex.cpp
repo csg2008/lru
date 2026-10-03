@@ -10,7 +10,7 @@
 //   - RAII guard interoperability (std::lock_guard, std::shared_lock)
 //   - Reentrancy / deadlock detection under ASan/TSan
 //
-// P0-2: This file was previously empty (1-line comment). The spec identified
+// This file was previously empty (1-line comment). The spec identified
 // the mutex as a critical concurrency primitive with zero test coverage, so
 // these tests provide the safety net required before P1 work on rehash/eviction
 // decoupling.
@@ -318,7 +318,7 @@ TEST(DistributedMutexTest, ContendedExclusiveLockProgress) {
 }
 
 // ============================================================================
-// T-O6: try_fail_count per-thread TLS counter
+// try_fail_count per-thread TLS counter
 // Validates that try_lock/try_lock_shared failures are accumulated in a
 // per-thread TLS counter and flushed to the global atomic in batches
 // (kTryFailFlushThreshold = 64), reducing cache-line ping-pong under

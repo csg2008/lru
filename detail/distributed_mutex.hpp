@@ -29,7 +29,7 @@
 #include <thread>
 
 // ============================================================================
-// Platform-specific NUMA detection (T-B2 / P0-1-补)
+// Platform-specific NUMA detection.
 // ============================================================================
 // On multi-socket NUMA systems (2+ sockets, common on server hardware),
 // reader counter contention on a single node causes inter-socket cache
@@ -83,7 +83,7 @@ namespace lru::detail {
 
 // ============================================================================
 // current_numa_node() — return the NUMA node index of the calling thread's
-// current CPU, or 0 if unknown (T-B2 / P0-1-补).
+// current CPU, or 0 if unknown .
 //
 // Used by distributed_shared_mutex::pick_reader_node() to route reader
 // counter modifications to per-NUMA-node slots, keeping modifications
@@ -169,7 +169,7 @@ enum class fairness_mode {
     writer_fair,
 };
 
-/// P1-2: String representation of fairness_mode for diagnostics /
+/// String representation of fairness_mode for diagnostics /
 /// prometheus / logging. Returns a stable, human-readable name that
 /// matches the enum identifier so operators can grep for it.
 inline const char* fairness_mode_to_string(fairness_mode mode) noexcept {
@@ -243,7 +243,7 @@ public:
     void set_lock_rank(int rank) noexcept { lock_rank_ = rank; }
     int lock_rank() const noexcept { return lock_rank_; }
 
-    /// P2-2: Runtime toggle for lock order validation. When enabled,
+    /// Runtime toggle for lock order validation. When enabled,
     /// lock acquisitions are checked against the rank ordering. When
     /// disabled, the check is skipped (zero overhead on hot path).
     /// Default: false (even in debug builds, to avoid overhead unless
@@ -259,7 +259,7 @@ public:
 
     /// Change the fairness mode at runtime.
     ///
-    /// P0-3: fairness_ is now std::atomic<fairness_mode> to eliminate the
+    /// fairness_ is now std::atomic<fairness_mode> to eliminate the
     /// data race between set_fairness_mode() and concurrent lock_shared()
     /// readers. The operation is still O(1) (single relaxed store), but
     /// is now well-defined under the C++ memory model.
@@ -270,14 +270,14 @@ public:
     /// here prevents UB / TSan reports; it does not change the
     /// semantic recommendation.
     ///
-    /// T3.3: Debug builds assert no active readers or writers exist when
+    /// Debug builds assert no active readers or writers exist when
     /// the mode is switched. This catches callers that flip fairness under
     /// load — a timing-dependent pattern that is hard to reproduce. The
     /// check is best-effort: there is an inherent race between the assert
     /// and a concurrent lock acquisition, but in practice a quiescent
     /// cache at the call site will satisfy the assert reliably.
     void set_fairness_mode(fairness_mode mode) noexcept {
-        // T3.3: Debug-only quiescent-state assertion. state_ == 0 means
+        // Debug-only quiescent-state assertion. state_ == 0 means
         // no writer holding (kWriterFlag clear) and no writer waiting
         // (kWriterWaitFlag clear). Readers are tracked in reader_nodes_
         // (T3.1); the assert does not catch active readers — use
@@ -303,7 +303,7 @@ public:
         return fairness_.load(std::memory_order_acquire);
     }
 
-    /// P0-1-补 (T-B2): Enable or disable NUMA-aware reader counter
+    /// Enable or disable NUMA-aware reader counter
     /// routing at runtime. When enabled, `pick_reader_node()` derives
     /// the per-thread reader slot index from the calling thread's
     /// current NUMA node (via `current_numa_node()`) instead of a
@@ -319,10 +319,19 @@ public:
     ///
     /// Thread-safety: may be called concurrently with lock_shared() /
     /// unlock_shared(). The toggle takes effect on the next call to
-    /// pick_reader_node() from each thread (the per-thread TLS cache
-    /// is invalidated by bumping `numa_aware_generation_`). Existing
-    /// in-flight critical sections are unaffected — they continue to
-    /// use their already-acquired slot for the duration of the CS.
+    /// pick_reader_node() from each thread (the per-thread TLS cache is
+    /// invalidated by bumping `numa_aware_generation_`).
+    ///
+    /// CAUTION: an in-flight critical section does NOT keep its slot. Both
+    /// lock_shared() and unlock_shared() derive the slot from the current
+    /// global state, so a toggle between the two moves the decrement to a
+    /// different node: the original node keeps a stale +1, the new one
+    /// underflows, and the per-node counters no longer describe the readers
+    /// that hold the lock. Mutual exclusion is preserved only because
+    /// `try_lock()`/`lock_slow()` test the SUM of the nodes, which each reader
+    /// still changes by exactly +1/-1 — but the wake logic in unlock_shared()
+    /// (which keys off its own node draining to zero) can then miss a queued
+    /// writer. Toggle during a quiescent period.
     ///
     /// Recommendation: toggle during a quiescent state (e.g., before
     /// warming up the cache) so all threads observe the new routing
@@ -339,13 +348,13 @@ public:
         numa_aware_generation_.fetch_add(1, std::memory_order_release);
     }
 
-    /// P0-1-补 (T-B2): Query whether NUMA-aware reader counter routing
+    /// Query whether NUMA-aware reader counter routing
     /// is currently enabled.
     bool numa_aware() const noexcept {
         return numa_aware_.load(std::memory_order_acquire);
     }
 
-    /// P0-1-补 (T-B2): Number of NUMA nodes detected on the system.
+    /// Number of NUMA nodes detected on the system.
     /// Returns 1 if NUMA is not supported or only one node exists.
     /// Useful for diagnostics: if `numa_aware()` is true but this
     /// returns 1, NUMA routing adds overhead with no benefit and
@@ -357,7 +366,7 @@ public:
         return n;
     }
 
-    /// P1-5 (T1.5): Quiescent variant of set_fairness_mode(). Acquires
+    /// Quiescent variant of set_fairness_mode(). Acquires
     /// the exclusive write lock to drain all in-flight readers and
     /// writers before atomically switching the fairness mode. This
     /// guarantees no in-flight operation observes a mode change mid-
@@ -408,7 +417,7 @@ public:
 
     /// Acquire exclusive ownership.  Blocks until the lock is available.
     ///
-    /// T3.1: Fast path delegates to try_lock(), which CASes state_ from 0
+    /// Fast path delegates to try_lock(), which CASes state_ from 0
     /// to kWriterFlag and then spin-waits (with yield) for outstanding
     /// readers to drain (sum_readers() == 0). On CAS failure falls back
     /// to lock_slow(), which sets kWriterWaitFlag and waits for the
@@ -428,7 +437,7 @@ public:
     /// rare and need prompt service.
     void unlock() {
         uint32_t prev = state_.fetch_and(~kWriterFlag, std::memory_order_release);
-        // P1-1: Clear the writer wait start timestamp defensively —
+        // Clear the writer wait start timestamp defensively —
         // it should already have been cleared when the writer acquired
         // the lock, but clearing here covers the case where a writer
         // was queued (kWriterWaitFlag set) but never acquired the lock
@@ -446,7 +455,7 @@ public:
 
     /// Try to acquire exclusive ownership without blocking.
     ///
-    /// T3.1: Reader count is tracked per-node, not in `state_`. This
+    /// Reader count is tracked per-node, not in `state_`. This
     /// means `try_lock()` can no longer rely on the CAS alone to detect
     /// active readers — the CAS would succeed even when readers are
     /// holding the lock, and the subsequent drain loop would block
@@ -467,7 +476,7 @@ public:
     /// a successful CAS, deadlocking with any active reader (e.g. the
     /// `SharedLockBlocksWriter` test).
     bool try_lock() {
-        // P0-1/B: Read hot path no longer maintains a shared aggregate
+        // Read hot path no longer maintains a shared aggregate
         // counter (see lock_shared). try_lock() is rare in read-heavy
         // workloads, so the O(kNumReaderNodes) sum_readers() is the
         // correct trade-off: pay O(64) only on the rare write attempt,
@@ -518,7 +527,7 @@ public:
     /// for the queued writer to be served before entering.  This prevents
     /// writer starvation under sustained read load.
     ///
-    /// T3.1: Reader count is tracked per-node (reader_nodes_). Each thread
+    /// Reader count is tracked per-node (reader_nodes_). Each thread
     /// increments only its own node's counter, eliminating cache-line
     /// ping-pong on state_ under high read contention. The re-check of
     /// kWriterFlag after the increment catches the race where a writer
@@ -532,7 +541,7 @@ public:
                 return;
             }
         } else {
-            // P1-1: reader_preferred mode — check the writer starvation
+            // reader_preferred mode — check the writer starvation
             // detector before entering. If a writer has been queued
             // (kWriterWaitFlag set) for longer than the configured
             // timeout, redirect to the writer_fair slow path so the
@@ -568,7 +577,7 @@ public:
             }
         }
         // Optimistic path: increment per-node reader count.
-        // P0-1/B: only the per-node counter is touched on the hot path —
+        // only the per-node counter is touched on the hot path —
         // no shared aggregate RMW. The per-node counter lives on its own
         // cache line, so concurrent readers on different nodes do not
         // ping-pong a shared line.
@@ -604,7 +613,7 @@ public:
     /// is the last active reader, or chains the wake to the next
     /// waiting reader (Task 6: thundering-herd avoidance).
     ///
-    /// T3.1: Decrements this thread's per-node counter. If the node is
+    /// Decrements this thread's per-node counter. If the node is
     /// now empty, we may be the last reader overall — call sum_readers()
     /// to check. The sum is only computed on the (rare) case where this
     /// thread's node drained to zero, so most unlock_shared() calls are
@@ -643,7 +652,7 @@ public:
             // writer_fair mode readers may also be waiting on the same CV
             // (blocked by kWriterWaitFlag), and notify_one could wake one of
             // them instead of the writer, leaving the writer starved.
-            // P0-1/B: pay O(kNumReaderNodes) only when our own node drained
+            // pay O(kNumReaderNodes) only when our own node drained
             // AND a writer is queued — the rarest case in read-heavy
             // workloads.
             if (sum_readers() == 0) {
@@ -663,7 +672,7 @@ public:
 
     /// Try to acquire shared ownership without blocking.
     ///
-    /// T3.1: Uses the same per-node counter fast path as lock_shared().
+    /// Uses the same per-node counter fast path as lock_shared().
     /// The re-check of kWriterFlag after the increment catches writers
     /// that acquired the lock between the initial check and the increment.
     bool try_lock_shared() {
@@ -673,7 +682,7 @@ public:
             return false;
         }
         // Optimistic increment on per-node counter.
-        // P0-1/B: no shared aggregate RMW on the read hot path.
+        // no shared aggregate RMW on the read hot path.
         std::size_t my_node = pick_reader_node();
         reader_nodes_[my_node].value.fetch_add(1, std::memory_order_acquire);
         // Re-check state_ for kWriterFlag — if set, decrement and fail
@@ -690,7 +699,7 @@ public:
 
     /// Number of times try_lock() or try_lock_shared() failed.
     ///
-    /// T-D3 (P1-9): Now aggregates from per-thread TLS counters for the
+    /// Now aggregates from per-thread TLS counters for the
     /// fast path. The hot path (try_lock failure under contention) was
     /// previously a `fetch_add(1)` on a single shared atomic — under
     /// heavy try_lock contention from many threads, this caused cache-
@@ -723,7 +732,7 @@ public:
         return try_fail_count_.load(std::memory_order_relaxed);
     }
 
-    /// T-D3 (P1-9): Force-flush the calling thread's TLS try-fail
+    /// Force-flush the calling thread's TLS try-fail
     /// counter for this mutex to the global atomic. Useful for tests
     /// that need exact counts, and for the background drain worker to
     /// ensure metrics are fresh before a prometheus scrape. Idempotent.
@@ -741,7 +750,7 @@ public:
         try_fail_count_.fetch_add(to_flush, std::memory_order_relaxed);
     }
 
-    /// T-D3 (P1-9): Threshold at which the TLS try-fail counter
+    /// Threshold at which the TLS try-fail counter
     /// auto-flushes to the global atomic. Higher values reduce cache-
     /// line traffic but increase the staleness window. 64 is a
     /// reasonable default: ~64ns per flush vs ~10ns per fetch_add,
@@ -762,7 +771,7 @@ public:
         return per_thread_fail;
     }
 
-    /// T-D3 (P1-9): Increment the try-fail counter via TLS. Called
+    /// Increment the try-fail counter via TLS. Called
     /// from the hot path (try_lock / try_lock_shared failure). The
     /// TLS counter accumulates until it crosses the threshold, then
     /// flushes to the global atomic in a single fetch_add. This
@@ -796,7 +805,7 @@ public:
     bool is_latency_tracking_enabled() const noexcept { return latency_tracking_enabled_.load(std::memory_order_relaxed); }
 
     // ----------------------------------------------------------------
-    // P1-1: Writer starvation detector API
+    // Writer starvation detector API
     // ----------------------------------------------------------------
     //
     // In reader_preferred mode, writers can starve indefinitely under
@@ -811,20 +820,20 @@ public:
     // In writer_fair mode (default for all cache aliases) the detector
     // is a no-op — writers are already served promptly.
 
-    /// P1-1: Set the writer starvation timeout. 0 disables detection
+    /// Set the writer starvation timeout. 0 disables detection
     /// (pure reader_preferred behavior — writers can starve). Default
     /// is 100ms. Only effective in reader_preferred mode.
     void set_writer_starvation_timeout(uint64_t timeout_ns) noexcept {
         writer_starvation_timeout_ns_.store(timeout_ns, std::memory_order_release);
     }
 
-    /// P1-1: Query the configured writer starvation timeout (ns).
+    /// Query the configured writer starvation timeout (ns).
     /// 0 means detection is disabled.
     uint64_t writer_starvation_timeout() const noexcept {
         return writer_starvation_timeout_ns_.load(std::memory_order_acquire);
     }
 
-    /// P1-1: Number of times a reader was redirected to the writer_fair
+    /// Number of times a reader was redirected to the writer_fair
     /// slow path because a writer had been queued longer than the
     /// configured timeout. Non-zero in reader_preferred mode under
     /// sustained read load — operators should consider switching to
@@ -833,20 +842,20 @@ public:
         return writer_starvation_events_.load(std::memory_order_acquire);
     }
 
-    /// P1-1: Maximum observed writer wait time (ns). Updated when a
+    /// Maximum observed writer wait time (ns). Updated when a
     /// writer acquires the lock after waiting in lock_slow(). Reset
     /// via reset_writer_max_wait_ns().
     uint64_t writer_max_wait_ns() const noexcept {
         return writer_max_wait_ns_.load(std::memory_order_acquire);
     }
 
-    /// P1-1: Reset the maximum observed writer wait time to 0. Useful
+    /// Reset the maximum observed writer wait time to 0. Useful
     /// for benchmark baselines or after a transient stall.
     void reset_writer_max_wait_ns() noexcept {
         writer_max_wait_ns_.store(0, std::memory_order_release);
     }
 
-    /// P0-1-补 (T-B2): Lazily probe the number of NUMA nodes on the
+    /// Lazily probe the number of NUMA nodes on the
     /// system. Returns 1 if NUMA is not supported or only one node
     /// exists. Called once at first `num_numa_nodes()` invocation
     /// and cached for the process lifetime — NUMA topology does not
@@ -932,7 +941,7 @@ private:
     /// and caches the result in a static thread_local variable; subsequent
     /// calls are O(1) (a single thread_local load).
     ///
-    /// P0-1-补 (T-B2): when `numa_aware_` is enabled, the index is
+    /// when `numa_aware_` is enabled, the index is
     /// derived from the calling thread's current NUMA node (via
     /// current_numa_node()) instead of thread-id hash. This keeps
     /// reader counter modifications within a single socket's L3 cache
@@ -987,7 +996,7 @@ private:
         return total;
     }
 
-    // P0-1/B: Removed `active_reader_count_` — the shared aggregate
+    // Removed `active_reader_count_` — the shared aggregate
     // counter that was previously maintained alongside the per-node
     // counters. It was added by T-P2-1 to give try_lock() an O(1)
     // fast reject, but it reintroduced a single cache-line ping-pong
@@ -1004,12 +1013,12 @@ private:
     // critical section.
 
     alignas(64) std::atomic<uint32_t> state_{0};
-    // P0-3: fairness_ is atomic to avoid data races with set_fairness_mode().
+    // fairness_ is atomic to avoid data races with set_fairness_mode().
     // Placed on the same 64-byte line as state_ would cause false sharing,
     // so it gets its own aligned slot.
     alignas(64) std::atomic<fairness_mode> fairness_{fairness_mode::writer_fair};
 
-    // P0-1-补 (T-B2): NUMA-aware reader counter routing toggle.
+    // NUMA-aware reader counter routing toggle.
     // When true, pick_reader_node() derives the per-thread slot index
     // from the calling thread's NUMA node instead of thread-id hash.
     // Default: false (off) — adds overhead with no benefit on single-
@@ -1017,7 +1026,7 @@ private:
     // Paired with `numa_aware_generation_` (below) to invalidate per-
     // thread TLS caches after a toggle.
     alignas(64) std::atomic<bool> numa_aware_{false};
-    // P0-1-补 (T-B2): bumped on each set_numa_aware() call so per-thread
+    // bumped on each set_numa_aware() call so per-thread
     // TLS caches in pick_reader_node() re-detect the NUMA node on the
     // next call. Acquire-load in pick_reader_node(), release-store here.
     alignas(64) std::atomic<std::size_t> numa_aware_generation_{0};
@@ -1031,7 +1040,7 @@ private:
     mutable latency_histogram write_wait_latency_;
     mutable latency_histogram read_wait_latency_;
 
-    // P1-1: Writer starvation detector. Active only in reader_preferred
+    // Writer starvation detector. Active only in reader_preferred
     // mode — when a writer has been queued (kWriterWaitFlag set) for
     // longer than `writer_starvation_timeout_ns_`, new readers are
     // redirected to the writer_fair slow path so the queued writer can
@@ -1046,7 +1055,7 @@ private:
     alignas(64) std::atomic<uint64_t> writer_wait_start_ns_{0};
     alignas(64) std::atomic<uint64_t> writer_starvation_timeout_ns_{100'000'000};
     alignas(64) std::atomic<std::size_t> writer_starvation_events_{0};
-    // P1-1: Maximum observed writer wait time (ns). Updated when a
+    // Maximum observed writer wait time (ns). Updated when a
     // writer acquires the lock after waiting. Reset via
     // reset_writer_max_wait_ns(). Used by diagnostics/prometheus so
     // operators can alert on writer latency spikes without enabling
@@ -1055,7 +1064,7 @@ private:
 
 #ifdef LRU_DEBUG_LOCK_ORDER
     int lock_rank_ = 0;
-    // P2-2: Runtime toggle for lock order validation. When false (default),
+    // Runtime toggle for lock order validation. When false (default),
     // lock acquisitions skip the rank check entirely (single relaxed atomic
     // load on hot path). When true, rank violations trigger std::abort().
     std::atomic<bool> runtime_lock_check_{false};
@@ -1066,7 +1075,7 @@ private:
     // Slow paths
     // ----------------------------------------------------------------
 
-    /// T3.1: Writer slow path. Sets kWriterWaitFlag so the last reader
+    /// Writer slow path. Sets kWriterWaitFlag so the last reader
     /// knows to wake us, then loops: if no writer currently holds the
     /// lock, attempt CAS to kWriterFlag (clearing kWriterWaitFlag). On
     /// success, spin-wait for outstanding readers (sum_readers() == 0)
@@ -1086,7 +1095,7 @@ private:
                     continue;
                 }
                 state = desired;
-                // P1-1: Record when this writer first started waiting so
+                // Record when this writer first started waiting so
                 // the reader_preferred fast path can detect starvation.
                 // Only set if not already set (multiple writers may race
                 // to set kWriterWaitFlag — the first one's timestamp is
@@ -1109,11 +1118,11 @@ private:
                 if (state_.compare_exchange_weak(state, kWriterFlag,
                         std::memory_order_seq_cst, std::memory_order_relaxed)) {
                     // Acquired — drain outstanding readers before returning.
-                    // T-P3-2: bounded spin with yield + periodic sleep to
+                    // bounded spin with yield + periodic sleep to
                     // avoid unbounded CPU burn if a reader is preempted by
                     // the OS scheduler. After kMaxReaderDrainSpins yield()
                     // calls, switch to 1µs sleeps to reduce CPU waste.
-                    // P0-1/B: sum_readers() is O(kNumReaderNodes) — but
+                    // sum_readers() is O(kNumReaderNodes) — but
                     // this is the writer drain path, which is rare in
                     // read-heavy workloads, so the cost is acceptable.
                     constexpr int kMaxReaderDrainSpins = 1024;
@@ -1123,7 +1132,7 @@ private:
                             std::this_thread::yield();
                             ++drain_spins;
                         } else {
-                            // T-P3-2: after exhausting the spin budget,
+                            // after exhausting the spin budget,
                             // sleep briefly to avoid burning CPU. This
                             // handles the case where a reader thread was
                             // preempted and won't run for milliseconds.
@@ -1137,7 +1146,7 @@ private:
                         auto elapsed = std::chrono::steady_clock::now() - t0;
                         auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
                         write_wait_latency_.record(static_cast<uint64_t>(ns));
-                        // P1-1: Update the max writer wait gauge so
+                        // Update the max writer wait gauge so
                         // operators can alert on writer latency spikes
                         // without enabling full latency histograms. CAS
                         // loop keeps the max monotonic without locks.
@@ -1150,7 +1159,7 @@ private:
                             // prev_max reloaded by CAS failure.
                         }
                     }
-                    // P1-1: Clear the writer wait start timestamp — the
+                    // Clear the writer wait start timestamp — the
                     // writer has acquired the lock, so starvation
                     // detection is no longer relevant until the next
                     // writer queues.
@@ -1167,7 +1176,7 @@ private:
         }
     }
 
-    /// T3.1: Reader slow path (reader_preferred semantics). The optimistic
+    /// Reader slow path (reader_preferred semantics). The optimistic
     /// per-node increment from lock_shared() has already been undone by the
     /// caller, so we simply wait for the writer to release, then re-enter
     /// via the per-node fast-path sequence (increment + re-check). The
@@ -1208,7 +1217,7 @@ private:
     /// this path also waits for kWriterWaitFlag to clear, ensuring that queued
     /// writers are served before new readers enter.
     ///
-    /// T3.1: Same per-node counter fast-path sequence as lock_shared_slow(),
+    /// Same per-node counter fast-path sequence as lock_shared_slow(),
     /// but the re-check also backs out if a writer queues (kWriterWaitFlag)
     /// between the state load and the increment.
     void lock_shared_writer_fair_slow() {
@@ -1329,7 +1338,7 @@ private:
     /// True if a writer can acquire: no writer holding and no outstanding
     /// readers. T3.1: reader count is now the sum of per-node counters,
     /// so this is a non-static member function (it reads reader_nodes_).
-    /// P0-1/B: uses O(kNumReaderNodes) sum_readers() instead of a shared
+    /// uses O(kNumReaderNodes) sum_readers() instead of a shared
     /// aggregate counter. This is only called on the write path (rare in
     /// read-heavy workloads), so the cost is acceptable and eliminates
     /// the read-path cache-line ping-pong that the aggregate counter caused.
@@ -1358,7 +1367,7 @@ private:
     }
 
     /// Writer path: wait until predicate becomes true (same semantics).
-    /// T3.1: writer_can_acquire() now reads reader_nodes_, so we pass a
+    /// writer_can_acquire() now reads reader_nodes_, so we pass a
     /// lambda capturing `this` instead of a free function pointer.
     void cv_wait_writer() {
         cv_wait_until([this](uint32_t s) { return writer_can_acquire(s); });

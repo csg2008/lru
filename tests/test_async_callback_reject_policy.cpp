@@ -42,7 +42,7 @@ using namespace lru;
 using namespace std::chrono_literals;
 
 // ============================================================================
-// G7: kReject preserves previously-enqueued events
+// kReject preserves previously-enqueued events
 // ============================================================================
 TEST(AsyncCallbackRejectPolicy, kRejectPreservesPriorEvents) {
     cache<int, std::string> c(100);
@@ -130,7 +130,7 @@ TEST(AsyncCallbackRejectPolicy, kRejectPreservesPriorEvents) {
 }
 
 // ============================================================================
-// G7: kReject with empty queue does not lose the rejected batch (sync fallback)
+// kReject with empty queue does not lose the rejected batch (sync fallback)
 // ============================================================================
 TEST(AsyncCallbackRejectPolicy, kRejectEmptyQueueSyncFallback) {
     cache<int, std::string> c(100);
@@ -162,7 +162,7 @@ TEST(AsyncCallbackRejectPolicy, kRejectEmptyQueueSyncFallback) {
 }
 
 // ============================================================================
-// G7: kDropNewest and kDropOldest do not lose prior events either
+// kDropNewest and kDropOldest do not lose prior events either
 // (sanity check — these policies were already correct, but verify the
 //  overall event-delivery guarantee holds under overflow.)
 // ============================================================================

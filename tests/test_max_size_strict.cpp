@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
-// P2-1 / P1-30: capacity amplification policy + set_max_size_strict API.
+// capacity amplification policy + set_max_size_strict API.
 //
 // Validates:
 //   1. P1-30: an undersized striped capacity is never silently amplified —
 //      the shard/stripe count is derived from the requested capacity instead
-//      (方案 B), and an EXPLICIT shard layout that cannot be honoured throws
-//      (方案 A).
+//      (option B), and an EXPLICIT shard layout that cannot be honoured throws
+//      (option A).
 //   2. max_size_strict(N) with N < num_shards throws std::invalid_argument.
 //   3. max_size_strict(N) with N >= num_shards succeeds and applies.
 //   4. max_size_strict(unlimited) succeeds (no amplification check).
@@ -25,12 +25,12 @@ using namespace lru;
 // TC-P2-1a: P1-30 — undersized capacity is never silently amplified
 // ============================================================================
 TEST(MaxSizeStrict, ShrinksShardCountInsteadOfAmplifying) {
-    // P1-30 (fix.01 方案 A + 方案 B): `striped_cache<int,int> c{10}` used to be
+    // `striped_cache<int,int> c{10}` used to be
     // laid out over `default_num_stripes` (64) shards, which silently raised
     // the effective capacity to 64 (6.4x the request) and made max_size()
     // report a value the caller never asked for.
     //
-    // 方案 A makes silent amplification a hard error; 方案 B removes the need
+    // Option A makes silent amplification a hard error; option B removes the need
     // for it in the common one-argument case by deriving the SHARD count from
     // the requested capacity (stripes stay as requested — they are the lock
     // granularity, not a capacity bound).

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// T-G14: ttl_cache + external cleaner concurrent correctness.
+// ttl_cache + external cleaner concurrent correctness.
 //
 // Verifies that the TTL cleaner (either background or manual
 // evict_expired_now()) runs correctly under concurrent set/get
@@ -88,7 +88,7 @@ TEST(TtlCacheConcurrentCleanup, ManualEvictExpiredNowProcessesAllShards) {
     EXPECT_EQ(cache.size(), 0u);
 }
 
-// T-G17: Background cleaner round-robin processes ONE shard per cycle.
+// Background cleaner round-robin processes ONE shard per cycle.
 // Over N cycles (N = num_shards), all expired items are eventually evicted.
 TEST(TtlCacheConcurrentCleanup, BackgroundRoundRobinEventuallyEvictsAll) {
     using namespace std::chrono_literals;
@@ -116,7 +116,7 @@ TEST(TtlCacheConcurrentCleanup, BackgroundRoundRobinEventuallyEvictsAll) {
     EXPECT_EQ(cache.size(), 0u);
 }
 
-// T-G17: Disabling round-robin restores "scan all shards per cycle".
+// Disabling round-robin restores "scan all shards per cycle".
 TEST(TtlCacheConcurrentCleanup, DisableRoundRobinScansAllShardsPerCycle) {
     using namespace std::chrono_literals;
     lru::striped_cache<int, std::string> cache(10'000, 8);

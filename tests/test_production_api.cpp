@@ -51,7 +51,7 @@ TEST(ProductionDeferPromotion, RuntimeToggle) {
 // ============================================================================
 // Task 2: fairness mode
 // ============================================================================
-// T-P3: striped_cache (and safe_cache) now default to reader_preferred via
+// striped_cache (and safe_cache) now default to reader_preferred via
 // safe_sharded_lru_trait / safe_lru_trait. Tests below verify the new
 // default and that the mode is still runtime-switchable.
 TEST(ProductionFairness, DefaultReaderPreferred) {
@@ -86,7 +86,7 @@ TEST(ProductionStripes, DefaultNumStripes) {
 }
 
 // ============================================================================
-// P10: fast_get — ultra-light read path
+// fast_get — ultra-light read path
 // ============================================================================
 TEST(ProductionFastGet, HitReturnsHandle) {
     cache<int, std::string> c(10);
@@ -164,7 +164,7 @@ TEST(ProductionFastGet, ProductionCachePath) {
 }
 
 // ============================================================================
-// O11: Exception hierarchy — cache_closed / cache_oom / cache_config
+// Exception hierarchy — cache_closed / cache_oom / cache_config
 // ============================================================================
 TEST(ProductionException, GetOnShutdownThrowsCacheClosed) {
     cache<int, std::string> c(10);
@@ -557,9 +557,9 @@ TEST(ProductionOverflowPolicy, ForceEvictBeyondTolerance) {
 }
 
 // ============================================================================
-// P2-4: native_wait_ops macOS support + fallback warning
+// native_wait_ops macOS support + fallback warning
 //
-// Acceptance criteria from spec.md:
+// Acceptance criteria:
 //   1. macOS: distributed_shared_mutex no longer busy-waits (uses ulock)
 //   2. Fallback path emits a one-time stderr warning on first entry
 //
@@ -595,7 +595,7 @@ TEST(ProductionNativeWaitOps, AvailabilityIsConsistent) {
 }
 
 // ============================================================================
-// O2: Slow query logging (threshold-based)
+// Slow query logging (threshold-based)
 // ============================================================================
 //
 // Validates the slow-query callback hook on get()/set(). The fast path
@@ -725,7 +725,7 @@ TEST(ProductionSlowQuery, CallbackExceptionSwallowed) {
 }
 
 // ============================================================================
-// O1: Distributed tracing callback (OpenTelemetry / Jaeger / Zipkin hook)
+// Distributed tracing callback (OpenTelemetry / Jaeger / Zipkin hook)
 // ============================================================================
 
 TEST(ProductionTrace, DefaultDisabled) {
@@ -895,9 +895,9 @@ TEST(ProductionTrace, ConcurrentCallbacksAreSafe) {
 }
 
 // ============================================================================
-// P2-5: Fix TTL const-cast
+// Fix TTL const-cast
 //
-// Acceptance criteria from spec.md:
+// Acceptance criteria:
 //   - `peek()` const method no longer modifies any state.
 //
 // Before P2-5, `peek()` / `contains()` / `get()` used `const_cast` to
@@ -937,7 +937,7 @@ TEST(ProductionTtlConstCast, PeekReturnsNulloptForExpiredEntry) {
 }
 
 TEST(ProductionTtlConstCast, TtlEntryIsPureValueType) {
-    // P2-5: ttl_entry no longer has an `expired` atomic field. Verify
+    // ttl_entry no longer has an `expired` atomic field. Verify
     // that the entry can be copied/moved like a pure value type.
     using entry = ttl_entry<std::string>;
     entry e1{"value", std::chrono::steady_clock::now() + std::chrono::seconds(1)};
