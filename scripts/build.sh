@@ -38,6 +38,23 @@ fi
 export CC="${CC:-ccache clang}"
 export CXX="${CXX:-ccache clang++}"
 
+# --- Generator / build-tool selection ---------------------------------------
+# Windows (MSYS2) uses the MinGW Makefiles generator driven by mingw32-make.
+# Everywhere else prefer Ninja, falling back to Unix Makefiles. The build step
+# always goes through `cmake --build`, which is generator-agnostic, so only the
+# configure step needs to know the generator.
+if [[ -d /clang64/bin ]] || command -v mingw32-make >/dev/null 2>&1; then
+    LRU_GENERATOR="MinGW Makefiles"
+else
+    if command -v ninja >/dev/null 2>&1; then
+        LRU_GENERATOR="Ninja"
+    else
+        LRU_GENERATOR="Unix Makefiles"
+    fi
+fi
+# Normalise the parallel argument to a job count for `cmake --build`.
+LRU_JOBS=2
+
 cd "${REPO_ROOT}"
 
 # --- Parse arguments --------------------------------------------------------
@@ -54,7 +71,7 @@ for arg in "$@"; do
         asan-ubsan|asan+ubsan) PROFILE="asan-ubsan" ;;
         bench|benchmarks)    PROFILE="bench" ;;
         examples|example)    PROFILE="examples" ;;
-        -j*)                 PARALLEL="$arg" ;;
+        -j*)                 PARALLEL="$arg"; LRU_JOBS="${arg#-j}" ;;
         -h|--help)
             sed -n '3,30p' "$0"
             exit 0 ;;
@@ -156,15 +173,15 @@ fi
 
 # --- Configure (if needed) -------------------------------------------------
 NEEDS_CONFIGURE=0
-if [[ ! -f "${BUILD_DIR}/Makefile" ]]; then
+if [[ ! -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
     NEEDS_CONFIGURE=1
 elif [[ "${LRU_FORCE_CONFIGURE:-0}" == "1" ]]; then
     NEEDS_CONFIGURE=1
 fi
 
 if [[ $NEEDS_CONFIGURE -eq 1 ]]; then
-    echo "=== [build.sh] Configuring ${PROFILE} (BUILD_DIR=${BUILD_DIR}) ==="
-    cmake -B "${BUILD_DIR}" -G "MinGW Makefiles" \
+    echo "=== [build.sh] Configuring ${PROFILE} (BUILD_DIR=${BUILD_DIR}, generator=${LRU_GENERATOR}) ==="
+    cmake -B "${BUILD_DIR}" -G "${LRU_GENERATOR}" \
         -DCMAKE_CXX_COMPILER="${CXX##* }" \
         -DCMAKE_C_COMPILER="${CC##* }" \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
@@ -182,12 +199,12 @@ if [[ $NEEDS_CONFIGURE -eq 1 ]]; then
         exit $rc
     fi
 else
-    echo "=== [build.sh] Using existing ${BUILD_DIR}/Makefile ==="
+    echo "=== [build.sh] Using existing CMake cache in ${BUILD_DIR} ==="
 fi
 
 # --- Build -----------------------------------------------------------------
-echo "=== [build.sh] Building ${PARALLEL} ==="
-mingw32-make -C "${BUILD_DIR}" "${PARALLEL}"
+echo "=== [build.sh] Building -j${LRU_JOBS} ==="
+cmake --build "${BUILD_DIR}" --parallel "${LRU_JOBS}"
 rc=$?
 if [[ $rc -ne 0 ]]; then
     echo "[build.sh] build failed (exit $rc)" >&2

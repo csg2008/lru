@@ -30,6 +30,33 @@ Both toolchains must build all targets with zero warnings under `-Werror`; GCC-o
 - Do not auto-install missing tools or libraries; output a prompt instead.
 - **Clang64 is required** (not UCRT64): MSYS2 UCRT64 GCC lacks `libasan` runtime, so AddressSanitizer is unavailable. Clang64 provides both ASan and superior diagnostics.
 
+**Linux / other non-Windows hosts**
+
+The library builds and its full test suite runs on a native Linux toolchain
+(clang or gcc + Ninja or Make). `scripts/build.sh` and `scripts/test.sh`
+auto-select the generator: `MinGW Makefiles` when the MSYS2 Clang64 tree is
+present, otherwise Ninja (falling back to Unix Makefiles), and they drive the
+build through `cmake --build`, so the same commands work on both hosts.
+
+```bash
+./scripts/build.sh asan && ./scripts/test.sh asan   # ASan + LSan (Linux)
+./scripts/build.sh ubsan && ./scripts/test.sh ubsan
+./scripts/build.sh asan-ubsan && ./scripts/test.sh asan-ubsan
+./scripts/build.sh tsan && ./scripts/test.sh tsan   # TSan (Linux only)
+./scripts/build.sh lsan && ./scripts/test.sh lsan   # LSan standalone (Linux only)
+```
+
+Two host requirements are worth checking before a sanitizer run, because both
+fail *before* `main()` with a sanitizer-runtime FATAL and no test output:
+
+- **On Linux, ASan's LeakSanitizer is enabled by default** by `test.sh`
+  (`detect_leaks=1`), since MinGW is the only host where LSan is unavailable.
+- **TSan needs ASLR entropy ≤ 28 bits.** If `vm.mmap_rnd_bits` is higher (the
+  default on some distributions) and the host blocks `personality(2)` (e.g. a
+  sandboxed container), the TSan runtime cannot re-exec with ASLR disabled and
+  aborts with `unable to disable ASLR`. Fix with `sysctl vm.mmap_rnd_bits=28`
+  or run under `setarch -R`.
+
 ### Configure and build tests
 
 ```bash
@@ -167,7 +194,7 @@ mingw32-make -C build/tsan -j2
 
 | Profile | Variable | Default | Meaning |
 |---|---|---|---|
-| `asan` / `asan-ubsan` | `ASAN_OPTIONS` | `detect_leaks=0:abort_on_error=1:halt_on_error=0:print_stacktrace=1` | MinGW: LSan unavailable so `detect_leaks=0`; on Linux set `detect_leaks=1` |
+| `asan` / `asan-ubsan` | `ASAN_OPTIONS` | `detect_leaks=0:…` on MinGW, `detect_leaks=1:…` on Linux | `scripts/test.sh` picks the default by host: LSan is unavailable on MinGW, but ASan embeds it on Linux |
 | `tsan` | `TSAN_OPTIONS` | `halt_on_error=0:second_deadlock_stack=1:report_bugs=1` | Continue after first race to report all findings |
 | `ubsan` / `asan-ubsan` | `UBSAN_OPTIONS` | `print_stacktrace=1:halt_on_error=0` | UB is already fatal via `-fno-sanitize-recover=undefined` compile flag |
 | `lsan` | `LSAN_OPTIONS` | `exitcode=23:report_objects=1` | Exit 23 = leak (distinct from gtest's exit 1) |
@@ -225,6 +252,7 @@ The library is header-only. The key headers and their roles:
 - `detail/distributed_mutex.hpp` — Custom shared mutex used instead of `std::shared_mutex` on MinGW to avoid `pthread_rwlock_t` bugs. Default fairness mode is `writer_fair`; runtime-switchable to `reader_preferred`. Includes lock wait latency histograms, try-lock failure counters, and debug lock order validation (`LRU_DEBUG_LOCK_ORDER`).
 - `detail/concurrent_hash_table.hpp` — Concurrent hash table backing the MM maps. Supports chain mode and F14 SIMD probing. Non-EmbeddedChain mode uses shared lock fallback (not lock-free reads) to prevent use-after-free. Optional incremental rehash (chain mode and F14 mode).
 - `detail/native_wait_ops.hpp` — Native wait/wake wrappers (runtime-selected): Windows WaitOnAddress, Linux futex, macOS ulock, CV fallback.
+- `detail/tsan_annotations.hpp` — ThreadSanitizer annotation helpers (`LRU_TSAN_IGNORE_READS_BEGIN/END`). Used by the deliberately lock-free/seqlock read paths (`intrusive_list` update-time, the TLS access ring's dormant-thread drain, the F14 tag probe) whose reads are validated before use and therefore benign. Compiles to nothing when TSan is off.
 - `detail/space_saving.hpp` — Space-Saving Top-K streaming heavy-hitter detection (Metwally et al., 2005). O(1) amortized update, O(K log K) query.
 - `ttl.hpp`, `memory.hpp` (slab allocator + memory monitor), `admission.hpp`, `serialization.hpp`, `chained_item.hpp`, `compact_cache.hpp`, `compressed_ptr.hpp`, `event_tracker.hpp`, `event_types.hpp`, `pooled_cache.hpp`, `shared_memory_backend.hpp`, `tiered_storage.hpp`, `tls_ring.hpp`, `warm_cache.hpp` — Specialized subsystems.
 
@@ -308,7 +336,9 @@ Convenience aliases wire common combinations:
 
 ### `read_handle`
 
-`get()` returns a `read_handle<Value>` that pins the item via refcount, preventing eviction while the handle is alive. `peek()` returns a read-only view without promotion. `get_shared()` returns a `std::shared_ptr<Value>` copy and does not change LRU order. `try_get()` is the non-throwing variant returning `std::optional<read_handle<Value>>`.
+`get()` returns a `read_handle<Value>` that pins the item via refcount, preventing eviction while the handle is alive.
+
+**Liveness, not immutability (hard constraint).** The refcount pin guarantees the item is neither unlinked nor freed while a handle is outstanding — it does **not** guarantee the *value* is stable. `set()` on a key that already exists updates the value **in place** (`mm_lru::update_existing`), because an item with a live handle must never be handed to the reclaimer (`replace_node()` / `erase_impl()` both bail out on `has_active_handle()`). Consequently a thread that dereferences a handle's value while another thread calls `set()` on the same key is reading an object being mutated — a data race, and TSan reports it. Either finish with the handle before allowing a concurrent `set()` of the same key, or have writers use `replace()`-style replacement (which still refuses while a handle is live). `peek()` has the same constraint via the shared lock it takes. `get_shared()` is the safe option when the value must be observed concurrently: it returns a `std::shared_ptr<Value>` copy taken under the lock. `get_shared()` returns a `std::shared_ptr<Value>` copy and does not change LRU order. `try_get()` is the non-throwing variant returning `std::optional<read_handle<Value>>`.
 
 ### Specialized subsystems
 

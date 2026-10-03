@@ -850,8 +850,11 @@ TEST(ProductionTrace, CallbackExceptionSwallowed) {
 
 TEST(ProductionTrace, ConcurrentCallbacksAreSafe) {
     // Verify the trace callback can be invoked concurrently from many
-    // threads without crashing or corrupting the counter.
-    cache<int, std::string> c(256);
+    // threads without crashing or corrupting the counter. The cache itself
+    // must be thread-safe: `cache` is the single-threaded alias whose lock
+    // policy is a documented no-op, so driving it from several threads would
+    // be a data race on the cache regardless of the callback.
+    safe_cache<int, std::string> c(256);
 
     std::atomic<int> total_events{0};
     c.set_trace_callback(

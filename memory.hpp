@@ -2229,7 +2229,12 @@ private:
     std::atomic<std::uint64_t> peak_bytes_{0};
     std::atomic<std::uint64_t> alloc_failures_{0};
     std::atomic<std::uint8_t> last_failure_reason_{0};
-    std::atomic<tagged_ptr> free_list_{};  ///< 128-bit tagged pointer + ABA counter
+    /// 128-bit tagged pointer + ABA counter. Initialized with an explicit
+    /// value rather than `{}`: std::atomic's default ctor is constrained on
+    /// is_default_constructible_v<T>, which is false for a nested class while
+    /// its enclosing class is still incomplete (the implicit default ctor of
+    /// tagged_ptr is not yet defined at that point on GCC's libstdc++).
+    std::atomic<tagged_ptr> free_list_{tagged_ptr{}};
     // 16-byte atomics should be lock-free (cmpxchg16b) for the free-list
     // Treiber stack to scale under contention. Compile with -mcx16 on GCC/Clang
     // (x86-64 v2 baseline); MSVC emits cmpxchg16b by default.

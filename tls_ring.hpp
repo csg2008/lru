@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "ankerl/unordered_dense.h"
+#include "detail/tsan_annotations.hpp"
 #include "event_types.hpp"
 
 namespace lru {
@@ -2276,6 +2277,14 @@ public:
                 batch.reserve(count);
                 const std::size_t target_mask = target_cap - 1;
                 const std::size_t start = tail1 & target_mask;
+                // These reads are deliberately tolerant of a concurrent
+                // writer: the seqlock validation below discards the batch
+                // unless head_/tail_ are unchanged across the whole copy, so a
+                // batch that overlapped a writer's slot is never used. That is
+                // safe by construction but is still a formal data race on the
+                // non-atomic buf_[] elements, which TSan reports — annotate it
+                // the same way CacheLib annotates its benign lock-free reads.
+                LRU_TSAN_IGNORE_READS_BEGIN();
                 for (std::size_t i = 0; i < count; ++i) {
                     // Copy (not move) — the owning thread may still
                     // wake up and read these slots. Move would leave
@@ -2283,6 +2292,7 @@ public:
                     // for std::vector but not for arbitrary Key types.
                     batch.push_back(ring->buf_[(start + i) & target_mask]);
                 }
+                LRU_TSAN_IGNORE_READS_END();
 
                 // Seqlock validation: re-read head_/tail_. If they
                 // changed, the thread woke up and wrote to buf_[] —

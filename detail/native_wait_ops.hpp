@@ -185,6 +185,7 @@ public:
     }
 
 private:
+#if LRU_NATIVE_HAS_WIN32
     /// Resolve an exported symbol into a typed function pointer.
     ///
     /// GetProcAddress returns FARPROC (`int(*)()`), whose type is
@@ -205,6 +206,7 @@ private:
         std::memcpy(&fn, &raw, sizeof(fn));
         return fn;
     }
+#endif // LRU_NATIVE_HAS_WIN32
 
     static bool probe() {
 #if LRU_NATIVE_HAS_WIN32

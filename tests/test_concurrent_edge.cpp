@@ -429,7 +429,14 @@ TEST(ConcurrentEdge, SingleflightDistinctKeysAreNotCoalesced) {
 
     auto provider = [&](const int& key) {
         provider_invocations.fetch_add(1, std::memory_order_relaxed);
-        std::this_thread::sleep_for(20ms);
+        // The window must exceed the worst-case time for the other threads of
+        // the same key to reach get_or_fetch(). With 8 keys x 4 threads
+        // released together, a short window (this used to be 20 ms) loses
+        // coalescing whenever a follower is descheduled past the leader's
+        // return: it then starts a new singleflight and the follower count
+        // comes up short. Sanitizer builds (ASan/TSan) slow thread startup
+        // enough to make that the norm rather than the exception.
+        std::this_thread::sleep_for(250ms);
         return std::string("val_") + std::to_string(key);
     };
 

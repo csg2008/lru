@@ -1014,13 +1014,13 @@ TEST(UnifiedCompactCacheTest, StripedVariantConcurrentReadWrite) {
 
 template <typename Cache>
 void RunApiCompatibilitySuite(Cache& c) {
-    using key_t = typename Cache::key_type;
-    using val_t = typename Cache::mapped_type;
-    using remove_res_t = typename Cache::RemoveRes;
+    using key_t_ = typename Cache::key_type;
+    using val_t_ = typename Cache::mapped_type;
+    using remove_res_t_ = typename Cache::RemoveRes;
 
     // set + get
-    c.set(key_t{1}, val_t{42});
-    c.set(key_t{2}, val_t{99});
+    c.set(key_t_{1}, val_t_{42});
+    c.set(key_t_{2}, val_t_{99});
     ASSERT_EQ(c.size(), 2u);
 
     // Scope-limit the get() handle so it releases its pin on key=1 before
@@ -1028,37 +1028,37 @@ void RunApiCompatibilitySuite(Cache& c) {
     // the item via refcount; if the handle outlives the call to remove(),
     // mm_.del() returns false and remove() reports kNotFound.
     {
-        auto h = c.get(key_t{1});
+        auto h = c.get(key_t_{1});
         ASSERT_TRUE(static_cast<bool>(h));
-        EXPECT_EQ(*h, val_t{42});
+        EXPECT_EQ(*h, val_t_{42});
     }
 
     // try_get (scope-limited for the same reason)
     {
-        auto opt = c.try_get(key_t{2});
+        auto opt = c.try_get(key_t_{2});
         ASSERT_TRUE(opt.has_value());
-        EXPECT_EQ(**opt, val_t{99});
+        EXPECT_EQ(**opt, val_t_{99});
     }
 
     {
-        auto miss = c.try_get(key_t{999});
+        auto miss = c.try_get(key_t_{999});
         EXPECT_FALSE(miss.has_value());
     }
 
     // peek (scope-limited)
     {
-        auto p = c.peek(key_t{1});
+        auto p = c.peek(key_t_{1});
         ASSERT_TRUE(static_cast<bool>(p));
-        EXPECT_EQ(*p, val_t{42});
+        EXPECT_EQ(*p, val_t_{42});
     }
 
     // contains
-    EXPECT_TRUE(c.contains(key_t{1}));
-    EXPECT_FALSE(c.contains(key_t{999}));
+    EXPECT_TRUE(c.contains(key_t_{1}));
+    EXPECT_FALSE(c.contains(key_t_{999}));
 
     // bulk_get (scope-limited)
     {
-        std::vector<key_t> keys{1, 2, 999};
+        std::vector<key_t_> keys{1, 2, 999};
         auto results = c.bulk_get(keys.begin(), keys.end());
         ASSERT_EQ(results.size(), 3u);
         EXPECT_TRUE(results[0].has_value());
@@ -1067,9 +1067,9 @@ void RunApiCompatibilitySuite(Cache& c) {
     }
 
     // remove — now safe because all handles above have been released.
-    EXPECT_EQ(c.remove(key_t{1}), remove_res_t::kSuccess);
-    EXPECT_FALSE(c.contains(key_t{1}));
-    EXPECT_EQ(c.remove(key_t{999}), remove_res_t::kNotFound);
+    EXPECT_EQ(c.remove(key_t_{1}), remove_res_t_::kSuccess);
+    EXPECT_FALSE(c.contains(key_t_{1}));
+    EXPECT_EQ(c.remove(key_t_{999}), remove_res_t_::kNotFound);
 
     // flush
     c.flush();

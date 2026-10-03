@@ -55,6 +55,7 @@
 #include "distributed_mutex.hpp"
 #include "hazptr.hpp"
 #include "epoch_reclamation.hpp"
+#include "tsan_annotations.hpp"
 
 #include <array>
 #include <atomic>
@@ -558,16 +559,27 @@ static constexpr uint8_t kTagTombstone = 0x01;
 #include <emmintrin.h>
 
 inline uint16_t f14_match_tags(const uint8_t* tags, uint8_t target_tag) {
+    // Optimistic read of tags[] while a concurrent writer may be filling a
+    // different slot of the same chunk. Safe by construction — the caller
+    // re-checks chunk.version and discards the whole probe on a mismatch (see
+    // the rationale above) — but still a formal data race on non-atomic bytes,
+    // so silence it for TSan the same way CacheLib annotates its benign
+    // lock-free reads.
+    LRU_TSAN_IGNORE_READS_BEGIN();
     __m128i tag_vec = _mm_set1_epi8(static_cast<char>(target_tag));
     __m128i chunk_tags = _mm_loadu_si128(reinterpret_cast<const __m128i*>(tags));
     __m128i cmp = _mm_cmpeq_epi8(tag_vec, chunk_tags);
-    return static_cast<uint16_t>(_mm_movemask_epi8(cmp));
+    const auto mask = static_cast<uint16_t>(_mm_movemask_epi8(cmp));
+    LRU_TSAN_IGNORE_READS_END();
+    return mask;
 }
 
 #elif defined(__aarch64__)
 #include <arm_neon.h>
 
 inline uint16_t f14_match_tags(const uint8_t* tags, uint8_t target_tag) {
+    // Benign optimistic read — see the SSE2 variant above for the rationale.
+    LRU_TSAN_IGNORE_READS_BEGIN();
     uint8x16_t tag_vec = vdupq_n_u8(target_tag);
     uint8x16_t chunk_tags = vld1q_u8(tags);
     uint8x16_t cmp = vceqq_u8(tag_vec, chunk_tags);
@@ -577,16 +589,20 @@ inline uint16_t f14_match_tags(const uint8_t* tags, uint8_t target_tag) {
     for (int i = 0; i < kChunkCapacity; ++i) {
         if (tmp[i]) mask |= static_cast<uint16_t>(1u << i);
     }
+    LRU_TSAN_IGNORE_READS_END();
     return mask;
 }
 
 #else
 
 inline uint16_t f14_match_tags(const uint8_t* tags, uint8_t target_tag) {
+    // Benign optimistic read — see the SSE2 variant above for the rationale.
+    LRU_TSAN_IGNORE_READS_BEGIN();
     uint16_t mask = 0;
     for (int i = 0; i < kChunkCapacity; ++i) {
         if (tags[i] == target_tag) mask |= static_cast<uint16_t>(1u << i);
     }
+    LRU_TSAN_IGNORE_READS_END();
     return mask;
 }
 
@@ -2794,7 +2810,7 @@ public:
                                 if (slot >= 0) {
                                     new_chunks[new_idx].tags[slot] = f14_detail::f14_tag(h);
                                     new_chunks[new_idx].slots[slot] = value;
-                                    new_chunks[new_idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                                    new_chunks[new_idx].set_occupied_bit_acq_rel(slot);
                                 } else {
                                     value->set_hash_chain_next(new_chunks[new_idx].embed_head.load(std::memory_order_acquire));
                                     new_chunks[new_idx].embed_head.store(value, std::memory_order_release);
@@ -2814,7 +2830,7 @@ public:
                                     new_node = allocate_node(key, std::move(value), h, nullptr);
                                     new_chunks[new_idx].tags[slot] = f14_detail::f14_tag(h);
                                     new_chunks[new_idx].slots[slot] = new_node;
-                                    new_chunks[new_idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                                    new_chunks[new_idx].set_occupied_bit_acq_rel(slot);
                                 } else {
                                     new_node = allocate_node(key, std::move(value), h, new_chunks[new_idx].node_head.load(std::memory_order_acquire));
                                     new_chunks[new_idx].node_head.store(new_node, std::memory_order_release);
@@ -2838,7 +2854,7 @@ public:
                                 if (slot >= 0) {
                                     chunks_[old_idx].tags[slot] = f14_detail::f14_tag(h);
                                     chunks_[old_idx].slots[slot] = value;
-                                    chunks_[old_idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                                    chunks_[old_idx].set_occupied_bit_acq_rel(slot);
                                 } else {
                                     value->set_hash_chain_next(chunks_[old_idx].embed_head.load(std::memory_order_acquire));
                                     chunks_[old_idx].embed_head.store(value, std::memory_order_release);
@@ -2858,7 +2874,7 @@ public:
                                     new_node = allocate_node(key, std::move(value), h, nullptr);
                                     chunks_[old_idx].tags[slot] = f14_detail::f14_tag(h);
                                     chunks_[old_idx].slots[slot] = new_node;
-                                    chunks_[old_idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                                    chunks_[old_idx].set_occupied_bit_acq_rel(slot);
                                 } else {
                                     new_node = allocate_node(key, std::move(value), h, chunks_[old_idx].node_head.load(std::memory_order_acquire));
                                     chunks_[old_idx].node_head.store(new_node, std::memory_order_release);
@@ -2884,7 +2900,7 @@ public:
                 if (slot >= 0) {
                     chunks_[idx].tags[slot] = tag;
                     chunks_[idx].slots[slot] = value;
-                    chunks_[idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                    chunks_[idx].set_occupied_bit_acq_rel(slot);
                 } else {
                     value->set_hash_chain_next(chunks_[idx].embed_head.load(std::memory_order_acquire));
                     chunks_[idx].embed_head.store(value, std::memory_order_release);
@@ -2906,7 +2922,7 @@ public:
                     node_type* new_node = allocate_node(key, std::move(value), h, nullptr);
                     chunks_[idx].tags[slot] = tag;
                     chunks_[idx].slots[slot] = new_node;
-                    chunks_[idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                    chunks_[idx].set_occupied_bit_acq_rel(slot);
                 } else {
                     node_type* new_node = allocate_node(key, std::move(value), h, chunks_[idx].node_head.load(std::memory_order_acquire));
                     chunks_[idx].node_head.store(new_node, std::memory_order_release);
@@ -3065,7 +3081,7 @@ public:
                                 if (slot >= 0) {
                                     new_chunks[new_idx].tags[slot] = f14_detail::f14_tag(h);
                                     new_chunks[new_idx].slots[slot] = value;
-                                    new_chunks[new_idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                                    new_chunks[new_idx].set_occupied_bit_acq_rel(slot);
                                 } else {
                                     value->set_hash_chain_next(new_chunks[new_idx].embed_head.load(std::memory_order_acquire));
                                     new_chunks[new_idx].embed_head.store(value, std::memory_order_release);
@@ -3090,7 +3106,7 @@ public:
                                     new_node = allocate_node(key, std::move(value), h, nullptr);
                                     new_chunks[new_idx].tags[slot] = f14_detail::f14_tag(h);
                                     new_chunks[new_idx].slots[slot] = new_node;
-                                    new_chunks[new_idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                                    new_chunks[new_idx].set_occupied_bit_acq_rel(slot);
                                 } else {
                                     new_node = allocate_node(key, std::move(value), h, new_chunks[new_idx].node_head.load(std::memory_order_acquire));
                                     new_chunks[new_idx].node_head.store(new_node, std::memory_order_release);
@@ -3120,7 +3136,7 @@ public:
                                 if (slot >= 0) {
                                     chunks_[old_idx].tags[slot] = f14_detail::f14_tag(h);
                                     chunks_[old_idx].slots[slot] = value;
-                                    chunks_[old_idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                                    chunks_[old_idx].set_occupied_bit_acq_rel(slot);
                                 } else {
                                     value->set_hash_chain_next(chunks_[old_idx].embed_head.load(std::memory_order_acquire));
                                     chunks_[old_idx].embed_head.store(value, std::memory_order_release);
@@ -3145,7 +3161,7 @@ public:
                                     new_node = allocate_node(key, std::move(value), h, nullptr);
                                     chunks_[old_idx].tags[slot] = f14_detail::f14_tag(h);
                                     chunks_[old_idx].slots[slot] = new_node;
-                                    chunks_[old_idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                                    chunks_[old_idx].set_occupied_bit_acq_rel(slot);
                                 } else {
                                     new_node = allocate_node(key, std::move(value), h, chunks_[old_idx].node_head.load(std::memory_order_acquire));
                                     chunks_[old_idx].node_head.store(new_node, std::memory_order_release);
@@ -3164,7 +3180,7 @@ public:
                 // Search inline slots for existing key
                 uint8_t tag = f14_detail::f14_tag(h);
                 uint16_t match_mask = f14_detail::f14_match_tags(chunks_[idx].tags, tag)
-                                    & chunks_[idx].occupied_mask;
+                                    & chunks_[idx].load_occupied_mask_acquire();
                 while (match_mask) {
                     int slot = f14_detail::ctz16(match_mask);
                     match_mask &= static_cast<uint16_t>(match_mask - 1);
@@ -3206,7 +3222,7 @@ public:
                 if (slot >= 0) {
                     chunks_[idx].tags[slot] = tag;
                     chunks_[idx].slots[slot] = value;
-                    chunks_[idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                    chunks_[idx].set_occupied_bit_acq_rel(slot);
                 } else {
                     value->set_hash_chain_next(chunks_[idx].embed_head.load(std::memory_order_acquire));
                     chunks_[idx].embed_head.store(value, std::memory_order_release);
@@ -3230,7 +3246,7 @@ public:
                     node_type* new_node = allocate_node(key, std::move(value), h, nullptr);
                     chunks_[idx].tags[slot] = tag;
                     chunks_[idx].slots[slot] = new_node;
-                    chunks_[idx].occupied_mask |= static_cast<uint16_t>(1u << slot);
+                    chunks_[idx].set_occupied_bit_acq_rel(slot);
                 } else {
                     node_type* new_node = allocate_node(key, std::move(value), h, chunks_[idx].node_head.load(std::memory_order_acquire));
                     chunks_[idx].node_head.store(new_node, std::memory_order_release);
@@ -3426,7 +3442,7 @@ public:
                             if constexpr (EmbeddedChain) {
                                 uint8_t tag = f14_detail::f14_tag(h);
                                 uint16_t match_mask = f14_detail::f14_match_tags(new_chunks[new_idx].tags, tag)
-                                                    & new_chunks[new_idx].occupied_mask;
+                                                    & new_chunks[new_idx].load_occupied_mask_acquire();
                                 while (match_mask) {
                                     int slot = f14_detail::ctz16(match_mask);
                                     match_mask &= static_cast<uint16_t>(match_mask - 1);
@@ -3435,7 +3451,7 @@ public:
                                         new_chunks[new_idx].version.fetch_add(1, std::memory_order_release);
                                         new_chunks[new_idx].tags[slot] = f14_detail::kTagTombstone;
                                         new_chunks[new_idx].slots[slot] = nullptr;
-                                        new_chunks[new_idx].occupied_mask &= static_cast<uint16_t>(~(1u << slot));
+                                        new_chunks[new_idx].clear_occupied_bit_acq_rel(slot);
                                         node->set_hash_chain_next(nullptr);
                                         size_.fetch_sub(1, std::memory_order_relaxed);
                                         new_chunks[new_idx].version.fetch_add(1, std::memory_order_release);
@@ -3465,7 +3481,7 @@ public:
                             } else {
                                 uint8_t tag = f14_detail::f14_tag(h);
                                 uint16_t match_mask = f14_detail::f14_match_tags(new_chunks[new_idx].tags, tag)
-                                                    & new_chunks[new_idx].occupied_mask;
+                                                    & new_chunks[new_idx].load_occupied_mask_acquire();
                                 while (match_mask) {
                                     int slot = f14_detail::ctz16(match_mask);
                                     match_mask &= static_cast<uint16_t>(match_mask - 1);
@@ -3474,7 +3490,7 @@ public:
                                         new_chunks[new_idx].version.fetch_add(1, std::memory_order_release);
                                         new_chunks[new_idx].tags[slot] = f14_detail::kTagTombstone;
                                         new_chunks[new_idx].slots[slot] = nullptr;
-                                        new_chunks[new_idx].occupied_mask &= static_cast<uint16_t>(~(1u << slot));
+                                        new_chunks[new_idx].clear_occupied_bit_acq_rel(slot);
                                         deallocate_node(node);
                                         size_.fetch_sub(1, std::memory_order_relaxed);
                                         new_chunks[new_idx].version.fetch_add(1, std::memory_order_release);
@@ -3512,7 +3528,7 @@ public:
                             if constexpr (EmbeddedChain) {
                                 uint8_t tag = f14_detail::f14_tag(h);
                                 uint16_t match_mask = f14_detail::f14_match_tags(chunks_[old_idx].tags, tag)
-                                                    & chunks_[old_idx].occupied_mask;
+                                                    & chunks_[old_idx].load_occupied_mask_acquire();
                                 while (match_mask) {
                                     int slot = f14_detail::ctz16(match_mask);
                                     match_mask &= static_cast<uint16_t>(match_mask - 1);
@@ -3521,7 +3537,7 @@ public:
                                         chunks_[old_idx].version.fetch_add(1, std::memory_order_release);
                                         chunks_[old_idx].tags[slot] = f14_detail::kTagTombstone;
                                         chunks_[old_idx].slots[slot] = nullptr;
-                                        chunks_[old_idx].occupied_mask &= static_cast<uint16_t>(~(1u << slot));
+                                        chunks_[old_idx].clear_occupied_bit_acq_rel(slot);
                                         node->set_hash_chain_next(nullptr);
                                         size_.fetch_sub(1, std::memory_order_relaxed);
                                         chunks_[old_idx].version.fetch_add(1, std::memory_order_release);
@@ -3551,7 +3567,7 @@ public:
                             } else {
                                 uint8_t tag = f14_detail::f14_tag(h);
                                 uint16_t match_mask = f14_detail::f14_match_tags(chunks_[old_idx].tags, tag)
-                                                    & chunks_[old_idx].occupied_mask;
+                                                    & chunks_[old_idx].load_occupied_mask_acquire();
                                 while (match_mask) {
                                     int slot = f14_detail::ctz16(match_mask);
                                     match_mask &= static_cast<uint16_t>(match_mask - 1);
@@ -3560,7 +3576,7 @@ public:
                                         chunks_[old_idx].version.fetch_add(1, std::memory_order_release);
                                         chunks_[old_idx].tags[slot] = f14_detail::kTagTombstone;
                                         chunks_[old_idx].slots[slot] = nullptr;
-                                        chunks_[old_idx].occupied_mask &= static_cast<uint16_t>(~(1u << slot));
+                                        chunks_[old_idx].clear_occupied_bit_acq_rel(slot);
                                         deallocate_node(node);
                                         size_.fetch_sub(1, std::memory_order_relaxed);
                                         chunks_[old_idx].version.fetch_add(1, std::memory_order_release);
@@ -3608,7 +3624,7 @@ public:
                         chunks_[idx].version.fetch_add(1, std::memory_order_release);
                         chunks_[idx].tags[slot] = f14_detail::kTagTombstone;
                         chunks_[idx].slots[slot] = nullptr;
-                        chunks_[idx].occupied_mask &= static_cast<uint16_t>(~(1u << slot));
+                        chunks_[idx].clear_occupied_bit_acq_rel(slot);
                         node->set_hash_chain_next(nullptr);
                         size_.fetch_sub(1, std::memory_order_relaxed);
                         chunks_[idx].version.fetch_add(1, std::memory_order_release);
@@ -3646,7 +3662,7 @@ public:
                         chunks_[idx].version.fetch_add(1, std::memory_order_release);
                         chunks_[idx].tags[slot] = f14_detail::kTagTombstone;
                         chunks_[idx].slots[slot] = nullptr;
-                        chunks_[idx].occupied_mask &= static_cast<uint16_t>(~(1u << slot));
+                        chunks_[idx].clear_occupied_bit_acq_rel(slot);
                         deallocate_node(node);
                         size_.fetch_sub(1, std::memory_order_relaxed);
                         chunks_[idx].version.fetch_add(1, std::memory_order_release);
@@ -3915,7 +3931,7 @@ public:
             for (size_type i = 0; i <= mask; ++i) {
                 chunks_[i].version.fetch_add(1, std::memory_order_release);
                 for (int s = 0; s < f14_detail::kChunkCapacity; ++s) {
-                    if (chunks_[i].occupied_mask & (1u << s)) {
+                    if ((chunks_[i].load_occupied_mask_acquire() & (1u << s))) {
                         if constexpr (!EmbeddedChain) {
                             node_type* node = static_cast<node_type*>(chunks_[i].slots[s]);
                             deallocate_node(node);
@@ -3924,7 +3940,7 @@ public:
                         chunks_[i].slots[s] = nullptr;
                     }
                 }
-                chunks_[i].occupied_mask = 0;
+                chunks_[i].store_occupied_mask_release(0);
                 // Clear overflow chain
                 if constexpr (EmbeddedChain) {
                     Value curr = chunks_[i].embed_head.load(std::memory_order_acquire);
@@ -4310,7 +4326,7 @@ public:
                     auto& old_chunk = chunks_[i];
                     // Redistribute inline slots
                     for (int s = 0; s < f14_detail::kChunkCapacity; ++s) {
-                        if (old_chunk.occupied_mask & (1u << s)) {
+                        if ((old_chunk.load_occupied_mask_acquire() & (1u << s))) {
                             Value node = static_cast<Value>(old_chunk.slots[s]);
                             size_type new_idx = node->cached_hash() & new_mask;
                             auto& nc = new_chunks[new_idx];
@@ -4318,7 +4334,7 @@ public:
                             if (new_slot >= 0) {
                                 nc.tags[new_slot] = old_chunk.tags[s];
                                 nc.slots[new_slot] = node;
-                                nc.occupied_mask |= static_cast<uint16_t>(1u << new_slot);
+                                nc.set_occupied_bit_acq_rel(new_slot);
                             } else {
                                 node->set_hash_chain_next(nc.embed_head.load(std::memory_order_acquire));
                                 nc.embed_head.store(node, std::memory_order_release);
@@ -4327,7 +4343,7 @@ public:
                         }
                         old_chunk.tags[s] = f14_detail::kTagEmpty;
                     }
-                    old_chunk.occupied_mask = 0;
+                    old_chunk.store_occupied_mask_release(0);
                     // Redistribute overflow chain
                     Value curr = old_chunk.embed_head.load(std::memory_order_acquire);
                     while (curr) {
@@ -4338,7 +4354,7 @@ public:
                         if (new_slot >= 0) {
                             nc.tags[new_slot] = f14_detail::f14_tag(curr->cached_hash());
                             nc.slots[new_slot] = curr;
-                            nc.occupied_mask |= static_cast<uint16_t>(1u << new_slot);
+                            nc.set_occupied_bit_acq_rel(new_slot);
                             curr->set_hash_chain_next(nullptr);
                         } else {
                             curr->set_hash_chain_next(nc.embed_head.load(std::memory_order_acquire));
@@ -4352,7 +4368,7 @@ public:
                 for (size_type i = 0; i <= old_mask; ++i) {
                     auto& old_chunk = chunks_[i];
                     for (int s = 0; s < f14_detail::kChunkCapacity; ++s) {
-                        if (old_chunk.occupied_mask & (1u << s)) {
+                        if ((old_chunk.load_occupied_mask_acquire() & (1u << s))) {
                             node_type* node = static_cast<node_type*>(old_chunk.slots[s]);
                             size_type new_idx = node->hash & new_mask;
                             auto& nc = new_chunks[new_idx];
@@ -4360,7 +4376,7 @@ public:
                             if (new_slot >= 0) {
                                 nc.tags[new_slot] = old_chunk.tags[s];
                                 nc.slots[new_slot] = node;
-                                nc.occupied_mask |= static_cast<uint16_t>(1u << new_slot);
+                                nc.set_occupied_bit_acq_rel(new_slot);
                             } else {
                                 node->next = nc.node_head.load(std::memory_order_acquire);
                                 nc.node_head.store(node, std::memory_order_release);
@@ -4369,7 +4385,7 @@ public:
                         }
                         old_chunk.tags[s] = f14_detail::kTagEmpty;
                     }
-                    old_chunk.occupied_mask = 0;
+                    old_chunk.store_occupied_mask_release(0);
                     node_type* node = old_chunk.node_head.load(std::memory_order_acquire);
                     while (node) {
                         node_type* next = node->next;
@@ -4379,7 +4395,7 @@ public:
                         if (new_slot >= 0) {
                             nc.tags[new_slot] = f14_detail::f14_tag(node->hash);
                             nc.slots[new_slot] = node;
-                            nc.occupied_mask |= static_cast<uint16_t>(1u << new_slot);
+                            nc.set_occupied_bit_acq_rel(new_slot);
                             node->next = nullptr;
                         } else {
                             node->next = nc.node_head.load(std::memory_order_acquire);
@@ -4535,7 +4551,7 @@ public:
                 size_type len = 0;
                 // Count inline slots
                 len += static_cast<size_type>(
-                    f14_detail::popcount16(chunks_[i].occupied_mask));
+                    f14_detail::popcount16(chunks_[i].load_occupied_mask_acquire()));
                 // Count overflow chain
                 if constexpr (EmbeddedChain) {
                     Value curr = chunks_[i].embed_head.load(std::memory_order_acquire);
@@ -5090,7 +5106,7 @@ public:
             if constexpr (EmbeddedChain) {
                 // Redistribute inline slots
                 for (int s = 0; s < f14_detail::kChunkCapacity; ++s) {
-                    if (chunks_[current].occupied_mask & (1u << s)) {
+                    if ((chunks_[current].load_occupied_mask_acquire() & (1u << s))) {
                         Value node = static_cast<Value>(chunks_[current].slots[s]);
                         size_type new_idx = node->cached_hash() & new_mask;
                         exclusive_bucket_lock new_guard(new_chunks[new_idx].spin);
@@ -5098,7 +5114,7 @@ public:
                         if (new_slot >= 0) {
                             new_chunks[new_idx].tags[new_slot] = chunks_[current].tags[s];
                             new_chunks[new_idx].slots[new_slot] = node;
-                            new_chunks[new_idx].occupied_mask |= static_cast<uint16_t>(1u << new_slot);
+                            new_chunks[new_idx].set_occupied_bit_acq_rel(new_slot);
                         } else {
                             node->set_hash_chain_next(new_chunks[new_idx].embed_head.load(std::memory_order_acquire));
                             new_chunks[new_idx].embed_head.store(node, std::memory_order_release);
@@ -5107,7 +5123,7 @@ public:
                     }
                     chunks_[current].tags[s] = f14_detail::kTagEmpty;
                 }
-                chunks_[current].occupied_mask = 0;
+                chunks_[current].store_occupied_mask_release(0);
                 // Redistribute overflow chain
                 Value curr = chunks_[current].embed_head.load(std::memory_order_acquire);
                 while (curr) {
@@ -5118,7 +5134,7 @@ public:
                     if (new_slot >= 0) {
                         new_chunks[new_idx].tags[new_slot] = f14_detail::f14_tag(curr->cached_hash());
                         new_chunks[new_idx].slots[new_slot] = curr;
-                        new_chunks[new_idx].occupied_mask |= static_cast<uint16_t>(1u << new_slot);
+                        new_chunks[new_idx].set_occupied_bit_acq_rel(new_slot);
                         curr->set_hash_chain_next(nullptr);
                     } else {
                         curr->set_hash_chain_next(new_chunks[new_idx].embed_head.load(std::memory_order_acquire));
@@ -5130,7 +5146,7 @@ public:
             } else {
                 // Non-EmbeddedChain: redistribute inline slots
                 for (int s = 0; s < f14_detail::kChunkCapacity; ++s) {
-                    if (chunks_[current].occupied_mask & (1u << s)) {
+                    if ((chunks_[current].load_occupied_mask_acquire() & (1u << s))) {
                         node_type* node = static_cast<node_type*>(chunks_[current].slots[s]);
                         size_type new_idx = node->hash & new_mask;
                         exclusive_bucket_lock new_guard(new_chunks[new_idx].spin);
@@ -5138,7 +5154,7 @@ public:
                         if (new_slot >= 0) {
                             new_chunks[new_idx].tags[new_slot] = chunks_[current].tags[s];
                             new_chunks[new_idx].slots[new_slot] = node;
-                            new_chunks[new_idx].occupied_mask |= static_cast<uint16_t>(1u << new_slot);
+                            new_chunks[new_idx].set_occupied_bit_acq_rel(new_slot);
                         } else {
                             node->next = new_chunks[new_idx].node_head.load(std::memory_order_acquire);
                             new_chunks[new_idx].node_head.store(node, std::memory_order_release);
@@ -5147,7 +5163,7 @@ public:
                     }
                     chunks_[current].tags[s] = f14_detail::kTagEmpty;
                 }
-                chunks_[current].occupied_mask = 0;
+                chunks_[current].store_occupied_mask_release(0);
                 // Redistribute overflow chain
                 node_type* node = chunks_[current].node_head.load(std::memory_order_acquire);
                 while (node) {
@@ -5158,7 +5174,7 @@ public:
                     if (new_slot >= 0) {
                         new_chunks[new_idx].tags[new_slot] = f14_detail::f14_tag(node->hash);
                         new_chunks[new_idx].slots[new_slot] = node;
-                        new_chunks[new_idx].occupied_mask |= static_cast<uint16_t>(1u << new_slot);
+                        new_chunks[new_idx].set_occupied_bit_acq_rel(new_slot);
                         node->next = nullptr;
                     } else {
                         node->next = new_chunks[new_idx].node_head.load(std::memory_order_acquire);
@@ -5535,7 +5551,7 @@ private:
     /// indistinguishable to tag matching.
     int find_f14_empty_slot(size_type chunk_idx) const {
         const uint16_t empty_mask = static_cast<uint16_t>(
-            ~chunks_[chunk_idx].occupied_mask & f14_detail::kFullMask);
+            ~chunks_[chunk_idx].load_occupied_mask_acquire() & f14_detail::kFullMask);
         return empty_mask ? f14_detail::ctz16(empty_mask) : -1;
     }
 

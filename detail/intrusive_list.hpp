@@ -36,12 +36,7 @@ class slab_allocator;
 #endif
 
 // TSan annotations, under conditional compilation.
-#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
-#if __has_include(<sanitizer/tsan_interface.h>)
-#include <sanitizer/tsan_interface.h>
-#define LRU_HAS_TSAN 1
-#endif
-#endif
+#include "tsan_annotations.hpp"
 
 namespace lru::detail {
 
@@ -122,14 +117,10 @@ struct intrusive_hook {
 
     // TSan-safe update_time read (mirrors CacheLib DList.h:69-75).
     uint32_t get_update_time() const noexcept {
-#if defined(LRU_HAS_TSAN)
-        AnnotateIgnoreReadsBegin(__FILE__, __LINE__);
+        LRU_TSAN_IGNORE_READS_BEGIN();
         auto t = update_time;
-        AnnotateIgnoreReadsEnd(__FILE__, __LINE__);
+        LRU_TSAN_IGNORE_READS_END();
         return t;
-#else
-        return update_time;
-#endif
     }
 };
 
@@ -616,8 +607,8 @@ public:
     // Accessors
     // ========================================================================
 
-    bool empty() const noexcept { return size_ == 0; }
-    size_type size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_.load(std::memory_order_relaxed) == 0; }
+    size_type size() const noexcept { return size_.load(std::memory_order_relaxed); }
 
     T& front() { assert(head_ptr_); return *static_cast<T*>(head_ptr_); }
     T& back()  { assert(tail_ptr_); return *static_cast<T*>(tail_ptr_); }
@@ -673,7 +664,7 @@ public:
         }
         head_ptr_ = nullptr;
         tail_ptr_ = nullptr;
-        size_ = 0;
+        size_.store(0, std::memory_order_relaxed);
     }
 
     /// Pop the tail item and return it (caller is responsible for deletion)
@@ -711,7 +702,13 @@ private:
     void* head_ptr_ = nullptr;  // First item; nullptr when empty.
     void* tail_ptr_ = nullptr;  // Last item; nullptr when empty.
     void* base_     = nullptr;  // Compressed-pointer base (ignored for raw).
-    size_type size_;
+    // Element count. Atomic so that the lock-free size()/empty() queries of a
+    // thread-safe cache (e.g. unified_cache::size(), reached from
+    // pooled_cache's const accessors under only a shared lock) do not race
+    // with a concurrent link/unlink that increments or decrements it. All
+    // structural mutations happen under the MM's write lock; only these
+    // counter updates are exposed to unsynchronised readers.
+    std::atomic<size_type> size_;
 };
 
 

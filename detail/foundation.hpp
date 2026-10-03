@@ -909,9 +909,30 @@ struct striped_mutex_read_all_guard {
 // Provides graceful stop with condition variable wake-up.
 class periodic_worker {
 public:
+    /// Tag selecting the self-referencing task overload below. A distinct tag
+    /// (rather than relying on overload resolution) keeps the choice explicit
+    /// and avoids ambiguity with generic task lambdas.
+    struct self_task_tag {};
+
     explicit periodic_worker(std::function<void()> task,
                              std::chrono::milliseconds interval)
         : task_(std::move(task))
+        , interval_(interval)
+        , running_(true)
+        , interval_changed_at_(std::chrono::steady_clock::now()) {
+        thread_ = std::thread([this] { run(); });
+    }
+
+    /// Construct with a task that receives a reference to the worker itself.
+    ///
+    /// A task that wants to re-anchor its own cadence (e.g. an adaptive drain
+    /// interval) would otherwise have to reach back through the owning
+    /// object's worker handle, which other threads may be resetting
+    /// concurrently — a data race on that handle. Passing the worker by
+    /// reference removes that access entirely.
+    periodic_worker(self_task_tag, std::function<void(periodic_worker&)> task,
+                    std::chrono::milliseconds interval)
+        : task_([this, task = std::move(task)] { task(*this); })
         , interval_(interval)
         , running_(true)
         , interval_changed_at_(std::chrono::steady_clock::now()) {
@@ -984,8 +1005,19 @@ private:
             // the task runs only once the deadline has genuinely passed.
             auto deadline = interval_changed_at_ + interval_;
             while (running_.load()) {
-                if (cv_.wait_until(lock, deadline,
-                                   [this] { return !running_.load(); })) {
+                // Deliberately the 2-argument wait_until. The 3-argument
+                // overload with a predicate does NOT return on notify_all()
+                // unless the predicate is already true — it keeps re-waiting
+                // until the absolute deadline. That made a notification from
+                // set_interval() a no-op whenever the worker was already
+                // parked (the common case: the worker wins the race to the
+                // mutex right after construction), so shortening the interval
+                // only took effect once the *old* deadline expired. Waiting
+                // without a predicate lets any notification fall through to
+                // the deadline re-evaluation below, which is exactly the
+                // documented contract.
+                cv_.wait_until(lock, deadline);
+                if (!running_.load()) {
                     return;  // stopped
                 }
                 if (std::chrono::steady_clock::now() >= deadline) {

@@ -9181,6 +9181,7 @@ public:
     ///                  increase CPU wake-ups. Use 100ms for latency-
     ///                  sensitive scenarios.
     void start_event_drain(std::chrono::milliseconds interval = std::chrono::seconds(1)) {
+        std::lock_guard<std::mutex> worker_lock(drain_worker_mutex_);
         if (reclaim_drain_worker_ || callback_drain_worker_) return;  // Already running
         // Mark the hazptr domain's drain worker as started so
         // retire_obj() stops emitting the one-shot stderr warning.
@@ -9208,7 +9209,8 @@ public:
 
         // ----- Reclaim worker (memory safety) -----
         reclaim_drain_worker_ = std::make_unique<detail::periodic_worker>(
-            [this, reclaim_normal, reclaim_aggressive] {
+            detail::periodic_worker::self_task_tag{},
+            [this, reclaim_normal, reclaim_aggressive](detail::periodic_worker& self) {
                 // C-2 fix: also call maybe_time_advance() on the EBR
                 // domain(s) to force epoch advancement in read-heavy-write-
                 // light workloads where the TLS retire buffer rarely
@@ -9237,18 +9239,17 @@ public:
                 // aggressive interval so items released by ~read_handle
                 // are reclaimed promptly; otherwise use the normal
                 // interval to save CPU.
-                if (reclaim_drain_worker_) {
-                    const std::size_t live_handles = active_handle_count();
-                    const std::chrono::milliseconds next_interval =
-                        (live_handles > 0) ? reclaim_aggressive : reclaim_normal;
-                    reclaim_drain_worker_->set_interval(next_interval);
-                }
+                const std::size_t live_handles = active_handle_count();
+                const std::chrono::milliseconds next_interval =
+                    (live_handles > 0) ? reclaim_aggressive : reclaim_normal;
+                self.set_interval(next_interval);
             },
             reclaim_normal);
 
         // ----- Callback worker (user-visible dispatch) -----
         callback_drain_worker_ = std::make_unique<detail::periodic_worker>(
-            [this, callback_normal, callback_aggressive] {
+            detail::periodic_worker::self_task_tag{},
+            [this, callback_normal, callback_aggressive](detail::periodic_worker& self) {
                 drain_access_ring();
                 tls_callback_ring<Key, Value>::flush_all_registered();
                 // Force-flush dormant threads' TLS rings.
@@ -9292,12 +9293,10 @@ public:
                 // aggressive interval so deferred promotions are
                 // applied sooner (reducing stale LRU ordering window);
                 // otherwise use the normal interval to save CPU.
-                if (callback_drain_worker_) {
-                    const std::size_t live_handles = active_handle_count();
-                    const std::chrono::milliseconds next_interval =
-                        (live_handles > 0) ? callback_aggressive : callback_normal;
-                    callback_drain_worker_->set_interval(next_interval);
-                }
+                const std::size_t live_handles = active_handle_count();
+                const std::chrono::milliseconds next_interval =
+                    (live_handles > 0) ? callback_aggressive : callback_normal;
+                self.set_interval(next_interval);
             },
             callback_normal);
     }
@@ -9330,6 +9329,7 @@ public:
     /// `is_reclaim_worker_running()` below, which read this cache's own
     /// worker handles.
     void stop_event_drain() {
+        std::lock_guard<std::mutex> worker_lock(drain_worker_mutex_);
         if (callback_drain_worker_) {
             callback_drain_worker_->stop();
             callback_drain_worker_.reset();
@@ -9343,6 +9343,7 @@ public:
     /// Check if either background drain worker (reclaim or callback) is
     /// running. Returns true if at least one is active.
     bool is_event_drain_running() const noexcept {
+        std::lock_guard<std::mutex> worker_lock(drain_worker_mutex_);
         return reclaim_drain_worker_ != nullptr || callback_drain_worker_ != nullptr;
     }
 
@@ -9353,6 +9354,7 @@ public:
     /// reclamation is not happening — operators should call
     /// start_event_drain() to start both workers.
     bool is_reclaim_worker_running() const noexcept {
+        std::lock_guard<std::mutex> worker_lock(drain_worker_mutex_);
         return reclaim_drain_worker_ != nullptr;
     }
 
@@ -9364,6 +9366,7 @@ public:
     /// processed — operators should call start_event_drain() to start
     /// both workers.
     bool is_callback_worker_running() const noexcept {
+        std::lock_guard<std::mutex> worker_lock(drain_worker_mutex_);
         return callback_drain_worker_ != nullptr;
     }
 
@@ -10852,6 +10855,17 @@ private:
     /// user callbacks may stretch this worker's tick latency without
     /// affecting reclamation (which runs on reclaim_drain_worker_).
     std::unique_ptr<detail::periodic_worker> callback_drain_worker_;
+
+    /// Guards reclaim_drain_worker_ and callback_drain_worker_.
+    ///
+    /// These handles are read by observation APIs (is_event_drain_running()
+    /// and friends, called from diagnostics/tests on arbitrary threads) while
+    /// start_event_drain()/stop_event_drain() create or reset them. The worker
+    /// tasks themselves never touch the handles: they use the
+    /// periodic_worker::self_task_tag constructor and re-anchor their own
+    /// cadence through the reference they are handed, so the handle is only
+    /// ever observed from the constructor/destructor thread and this lock.
+    mutable std::mutex drain_worker_mutex_;
 
     /// Optional background rehash balancer. Periodically
     /// sweeps all hash-table segments to advance incremental rehash and

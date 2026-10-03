@@ -120,11 +120,25 @@ fi
 #   ASAN_OPTIONS=detect_leaks=1 ./scripts/test.sh asan
 case "$PROFILE" in
     asan|asan-ubsan)
-        # detect_leaks=0 because MinGW LSan is unavailable; on Linux flip to 1.
+        # ASan embeds LeakSanitizer on Linux, so leak checking is on there;
+        # on MinGW LSan is unavailable, so detect_leaks=0.
         # abort_on_error=1 so ASan violations fail the test process.
         # halt_on_error=0 lets the first violation print a full report
         # before aborting (better stack traces).
-        export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:abort_on_error=1:halt_on_error=0:print_stacktrace=1}"
+        if [[ -d /clang64/bin ]]; then
+            _lru_asan_default="detect_leaks=0:abort_on_error=1:halt_on_error=0:print_stacktrace=1"
+        else
+            _lru_asan_default="detect_leaks=1:abort_on_error=1:halt_on_error=0:print_stacktrace=1"
+        fi
+        export ASAN_OPTIONS="${ASAN_OPTIONS:-${_lru_asan_default}}"
+        unset _lru_asan_default
+        # Embedded LSan reads LSAN_OPTIONS too; point it at the suppressions
+        # for the library's deliberate process-lifetime allocations (see the
+        # file header). Without this, every run reports one "leak" per cache
+        # instance created by the tests and drowns out real findings.
+        if [[ -f "${SCRIPT_DIR}/lsan.supp" ]]; then
+            export LSAN_OPTIONS="${LSAN_OPTIONS:-suppressions=${SCRIPT_DIR}/lsan.supp}"
+        fi
         ;;
     tsan)
         # halt_on_error=0 so TSan continues and reports all races in a run.
@@ -141,7 +155,9 @@ case "$PROFILE" in
     lsan)
         # exitcode=23 is the conventional LSan failure exit code (distinct
         # from gtest's 1). report_objects=1 lists each leaked object.
-        export LSAN_OPTIONS="${LSAN_OPTIONS:-exitcode=23:report_objects=1}"
+        # The suppressions file whitelists the library's process-lifetime
+        # allocations (see scripts/lsan.supp).
+        export LSAN_OPTIONS="${LSAN_OPTIONS:-exitcode=23:report_objects=1:suppressions=${SCRIPT_DIR}/lsan.supp}"
         ;;
 esac
 
@@ -204,7 +220,12 @@ if [[ $rc -ne 0 ]]; then
     # Surface which sanitizer (if any) was active to help interpret the exit code.
     case "$PROFILE" in
         asan)       echo "[test.sh] ASan was active; exit 1 = memory error." >&2 ;;
-        tsan)       echo "[test.sh] TSan was active; exit 66 = data race / deadlock." >&2 ;;
+        tsan)       echo "[test.sh] TSan was active; exit 66 = data race / deadlock." >&2
+                    echo "[test.sh] NOTE: if the run aborted before any test started with" >&2
+                    echo "[test.sh]       'unable to disable ASLR', the host has high-entropy" >&2
+                    echo "[test.sh]       ASLR (vm.mmap_rnd_bits > 28) and blocks the" >&2
+                    echo "[test.sh]       personality(2) syscall. Lower the entropy" >&2
+                    echo "[test.sh]       (sysctl vm.mmap_rnd_bits=28) or run under 'setarch -R'." >&2 ;;
         ubsan)      echo "[test.sh] UBSan was active; exit 1 = undefined behavior." >&2 ;;
         lsan)       echo "[test.sh] LSan was active; exit 23 = memory leak detected." >&2 ;;
         asan-ubsan) echo "[test.sh] ASan+UBSan was active; exit 1 = memory error or UB." >&2 ;;

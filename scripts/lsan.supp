@@ -1,0 +1,19 @@
+# LeakSanitizer suppressions for the LRU cache library.
+#
+# The library deliberately allocates a small number of process-lifetime objects
+# and never frees them. That is a correctness requirement, not an oversight: a
+# read_handle may outlive the cache that issued it (the documented
+# shutdown_and_wait() path gives up waiting, warns, and destroys the cache
+# anyway), and it dereferences the handle-release notifier to test
+# `cache_alive` without touching cache-owned memory. Freeing the notifier at
+# cache destruction would make that test dangle. The per-shard hazptr/EBR
+# domains follow the same policy for the same reason.
+#
+# LeakSanitizer cannot see that intent — once the cache is gone the notifier is
+# unreachable — so these allocations are listed here. Keep this file in sync
+# with the `deliberately NEVER freed` sites in the headers; anything else that
+# shows up as a leak is a real bug and must not be added.
+#
+# Format: leak:<substring of the demangled allocating function name>.
+
+leak:init_production_features
